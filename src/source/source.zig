@@ -1,6 +1,7 @@
 const std = @import("std");
 const event = @import("event.zig");
 const cfg = @import("config.zig");
+const netx = @import("netx");
 
 pub const SourceError = error{
     InvalidConfiguration,
@@ -27,6 +28,7 @@ pub const SourceDescriptor = struct {
 /// arguments.
 pub const InitContext = struct {
     allocator: std.mem.Allocator,
+    runtime: *netx.runtime.IoRuntime,
     log: ?*const Logger = null,
     metrics: ?*const Metrics = null,
 };
@@ -82,6 +84,7 @@ pub const Lifecycle = struct {
     start_stream: *const fn (context: *anyopaque, allocator: std.mem.Allocator) SourceError!?event.EventStream,
     poll_batch: ?*const fn (context: *anyopaque, allocator: std.mem.Allocator) SourceError!?event.EventBatch = null,
     shutdown: *const fn (context: *anyopaque, allocator: std.mem.Allocator) void,
+    ready_hint: ?*const fn (context: *anyopaque) bool = null,
 };
 
 pub const Source = struct {
@@ -102,6 +105,11 @@ pub const Source = struct {
 
     pub fn shutdown(self: *const Source, allocator: std.mem.Allocator) void {
         self.lifecycle.shutdown(self.context, allocator);
+    }
+
+    pub fn readyHint(self: *const Source) bool {
+        const func = self.lifecycle.ready_hint orelse return true;
+        return func(self.context);
     }
 };
 

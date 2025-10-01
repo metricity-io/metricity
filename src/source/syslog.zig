@@ -3,6 +3,124 @@ const src = @import("source.zig");
 const cfg = @import("config.zig");
 const event = @import("event.zig");
 const buffer = @import("buffer.zig");
+const netx = @import("netx");
+const netx_transport = netx.transport;
+const netx_options = netx.options;
+const netx_udp = netx.udp;
+const netx_tcp = netx.tcp;
+const netx_runtime = netx.runtime;
+const parser = @import("syslog/parser.zig");
+const frame = @import("syslog/frame.zig");
+
+const TransportManager = struct {
+    pub const Error = error{
+        StartFailure,
+        PollFailure,
+    };
+
+    runtime: *netx_runtime.IoRuntime,
+    transport: ?netx_transport.Transport = null,
+
+    fn init(
+        ctx: src.InitContext,
+        descriptor: src.SourceDescriptor,
+        config: cfg.SyslogConfig,
+    ) Error!TransportManager {
+        _ = descriptor;
+
+        var manager = TransportManager{
+            .runtime = ctx.runtime,
+            .transport = null,
+        };
+
+        switch (config.transport) {
+            .udp => {
+                const transport_instance = createUdpTransport(ctx.allocator, ctx.runtime, config) catch {
+                    return Error.StartFailure;
+                };
+                manager.transport = transport_instance;
+            },
+            .tcp => {
+                const transport_instance = createTcpTransport(ctx.allocator, ctx.runtime, config) catch {
+                    return Error.StartFailure;
+                };
+                manager.transport = transport_instance;
+            },
+        }
+
+        return manager;
+    }
+
+    fn start(self: *TransportManager, state: *SyslogState) Error!void {
+        _ = state;
+        if (self.transport) |*t| {
+            t.start() catch {
+                return Error.StartFailure;
+            };
+        }
+    }
+
+    fn poll(self: *TransportManager, allocator: std.mem.Allocator) Error!?netx_transport.Message {
+        self.runtime.tick() catch {
+            return Error.PollFailure;
+        };
+
+        if (self.transport) |*t| {
+            return t.poll(allocator) catch {
+                return Error.PollFailure;
+            };
+        }
+        return null;
+    }
+
+    fn shutdown(self: *TransportManager, state: *SyslogState) void {
+        _ = state;
+        if (self.transport) |*t| {
+            t.shutdown();
+            self.transport = null;
+        }
+    }
+};
+
+fn createUdpTransport(
+    allocator: std.mem.Allocator,
+    runtime: *netx_runtime.IoRuntime,
+    config: cfg.SyslogConfig,
+) netx_transport.TransportError!netx_transport.Transport {
+    const limits = netx_options.Limits{
+        .read_buffer_bytes = config.read_buffer_bytes,
+        .message_size_limit = config.message_size_limit,
+    };
+
+    const udp_opts = netx_options.UdpOptions{
+        .address = config.address,
+        .limits = limits,
+    };
+
+    return netx_udp.create(allocator, runtime.loopHandle(), udp_opts);
+}
+
+fn createTcpTransport(
+    allocator: std.mem.Allocator,
+    runtime: *netx_runtime.IoRuntime,
+    config: cfg.SyslogConfig,
+) netx_transport.TransportError!netx_transport.Transport {
+    const limits = netx_options.Limits{
+        .read_buffer_bytes = config.read_buffer_bytes,
+        .message_size_limit = config.message_size_limit,
+    };
+
+    const tcp_opts = netx_options.TcpOptions{
+        .address = config.address,
+        .limits = limits,
+        .max_connections = config.tcp_max_connections,
+        .keepalive_seconds = config.tcp_keepalive_seconds,
+        .high_watermark = config.tcp_high_watermark,
+        .low_watermark = config.tcp_low_watermark,
+    };
+
+    return netx_tcp.create(allocator, runtime.loopHandle(), tcp_opts);
+}
 
 /// Skeleton implementation of a syslog source. The final version will ingest
 /// messages via UDP/TCP sockets, decode RFC3164/RFC5424 payloads, and expose
@@ -24,6 +142,8 @@ const SyslogState = struct {
     log: ?*const src.Logger,
     metrics: ?*const src.Metrics,
     stream_closed: bool = false,
+    transport: TransportManager,
+    framer: frame.Framer,
 };
 
 const BatchAckContext = struct {
@@ -47,6 +167,7 @@ const metrics = struct {
     const dropped = "sources_syslog_events_dropped_total";
     const rejected = "sources_syslog_events_rejected_total";
     const emitted = "sources_syslog_events_emitted_total";
+    const truncated = "sources_syslog_events_truncated_total";
     const queue_depth = "sources_syslog_buffer_depth";
     const ack_success = "sources_syslog_batch_ack_success_total";
     const ack_retryable = "sources_syslog_batch_ack_retryable_total";
@@ -104,6 +225,9 @@ fn create(ctx: src.InitContext, config: *const cfg.SourceConfig) src.SourceError
     const state = ctx.allocator.create(SyslogState) catch return src.SourceError.StartupFailed;
     errdefer ctx.allocator.destroy(state);
 
+    const transport_manager = TransportManager.init(ctx, descriptor, syslog_cfg) catch
+        return src.SourceError.StartupFailed;
+
     state.* = .{
         .allocator = ctx.allocator,
         .descriptor = descriptor,
@@ -111,12 +235,25 @@ fn create(ctx: src.InitContext, config: *const cfg.SourceConfig) src.SourceError
         .buffer = undefined,
         .log = ctx.log,
         .metrics = ctx.metrics,
+        .transport = transport_manager,
+        .framer = frame.Framer.init(ctx.allocator, .auto, syslog_cfg.message_size_limit),
     };
+    errdefer state.framer.deinit();
 
     const buffer_instance = EventBuffer.init(ctx.allocator, syslog_cfg.max_batch_size, .reject) catch
         return src.SourceError.StartupFailed;
     state.buffer = buffer_instance;
     errdefer state.buffer.deinit();
+
+    state.transport.start(state) catch |err| {
+        state.buffer.deinit();
+        state.allocator.destroy(state);
+        logError(state, "syslog source {s}: failed to start transport", .{descriptor.name});
+        return switch (err) {
+            TransportManager.Error.StartFailure => src.SourceError.StartupFailed,
+            TransportManager.Error.PollFailure => src.SourceError.StartupFailed,
+        };
+    };
 
     return src.Source{
         .descriptor = descriptor,
@@ -125,6 +262,7 @@ fn create(ctx: src.InitContext, config: *const cfg.SourceConfig) src.SourceError
             .start_stream = startStream,
             .poll_batch = pollBatch,
             .shutdown = shutdown,
+            .ready_hint = readyHint,
         },
         .context = state,
     };
@@ -146,6 +284,8 @@ fn streamNext(context: *anyopaque, allocator: std.mem.Allocator) event.StreamErr
     const state = asState(context);
     if (state.stream_closed) return event.StreamError.EndOfStream;
 
+    pumpTransport(state, allocator);
+
     const result = drainBatch(state, allocator) catch {
         return event.StreamError.Backpressure;
     };
@@ -160,6 +300,7 @@ fn streamFinish(context: *anyopaque, allocator: std.mem.Allocator) void {
 
 fn pollBatch(context: *anyopaque, allocator: std.mem.Allocator) src.SourceError!?event.EventBatch {
     const state = asState(context);
+    pumpTransport(state, allocator);
     const result = drainBatch(state, allocator) catch {
         return src.SourceError.Backpressure;
     };
@@ -169,8 +310,16 @@ fn pollBatch(context: *anyopaque, allocator: std.mem.Allocator) src.SourceError!
 fn shutdown(context: *anyopaque, allocator: std.mem.Allocator) void {
     _ = allocator;
     const state = asState(context);
+    state.transport.shutdown(state);
     state.buffer.deinit();
+    state.framer.deinit();
     state.allocator.destroy(state);
+}
+
+fn readyHint(context: *anyopaque) bool {
+    const state = asState(context);
+    if (!state.buffer.isEmpty()) return true;
+    return state.framer.hasBufferedData();
 }
 
 fn asState(ptr: *anyopaque) *SyslogState {
@@ -214,6 +363,86 @@ fn enqueueEvent(state: *SyslogState, managed: event.ManagedEvent) src.SourceErro
     }
 
     recordQueueDepth(state);
+}
+
+fn pumpTransport(state: *SyslogState, allocator: std.mem.Allocator) void {
+    while (true) {
+        const maybe_message = state.transport.poll(allocator) catch |err| {
+            logError(state, "syslog source {s}: transport poll failed ({s})", .{ state.descriptor.name, @errorName(err) });
+            return;
+        };
+        const message = maybe_message orelse break;
+
+        const chunk_finalizer = message.finalizer;
+
+        state.framer.push(message.bytes) catch {
+            if (chunk_finalizer) |finalizer| finalizer.run();
+            recordReject(state, 1);
+            logError(state, "syslog source {s}: failed to buffer tcp chunk", .{state.descriptor.name});
+            continue;
+        };
+
+        while (true) {
+            const extracted = state.framer.next() catch |err| {
+                recordReject(state, 1);
+                logWarn(state, "syslog source {s}: dropped invalid frame ({s})", .{ state.descriptor.name, @errorName(err) });
+                continue;
+            };
+
+            const frame_result = extracted orelse break;
+
+            const peer_copy = state.allocator.alloc(u8, message.metadata.peer_address.len) catch {
+                state.allocator.free(frame_result.payload);
+                recordReject(state, 1);
+                logError(state, "syslog source {s}: failed to copy peer address", .{state.descriptor.name});
+                continue;
+            };
+            if (message.metadata.peer_address.len != 0) {
+                @memcpy(peer_copy, message.metadata.peer_address);
+            }
+
+            const allocation = netx_transport.IoAllocation.create(state.allocator, frame_result.payload, peer_copy) catch {
+                state.allocator.free(frame_result.payload);
+                state.allocator.free(peer_copy);
+                recordReject(state, 1);
+                logError(state, "syslog source {s}: failed to allocate frame wrappers", .{state.descriptor.name});
+                continue;
+            };
+
+            const framed_message = netx_transport.Message{
+                .bytes = allocation.payload,
+                .metadata = .{
+                    .protocol = message.metadata.protocol,
+                    .peer_address = allocation.peer,
+                    .truncated = frame_result.truncated,
+                },
+                .finalizer = netx_transport.IoAllocation.finalizer(allocation),
+            };
+
+            if (framed_message.metadata.truncated) {
+                recordTruncated(state, 1);
+            }
+
+            const parsed = parser.parseMessage(allocator, state.config, framed_message) catch |err| {
+                if (framed_message.finalizer) |finalizer| {
+                    finalizer.run();
+                }
+                recordReject(state, 1);
+                logWarn(state, "syslog source {s}: failed to parse message ({s})", .{ state.descriptor.name, @errorName(err) });
+                continue;
+            };
+
+            enqueueEvent(state, parsed.managed) catch |err| {
+                switch (err) {
+                    src.SourceError.Backpressure => {},
+                    else => logError(state, "syslog source {s}: failed to enqueue parsed event ({s})", .{ state.descriptor.name, @errorName(err) }),
+                }
+                continue;
+            };
+        }
+
+        if (chunk_finalizer) |finalizer| finalizer.run();
+    }
 }
 
 fn drainBatch(state: *SyslogState, allocator: std.mem.Allocator) DrainError!?event.EventBatch {
@@ -294,6 +523,13 @@ fn recordReject(state: *SyslogState, count: usize) void {
     }
 }
 
+fn recordTruncated(state: *SyslogState, count: usize) void {
+    if (state.metrics) |metrics_sink| {
+        const delta: u64 = @intCast(count);
+        metrics_sink.incrCounter(metrics.truncated, delta);
+    }
+}
+
 fn recordEmitted(state: *SyslogState, count: usize) void {
     if (state.metrics) |metrics_sink| {
         const delta: u64 = @intCast(count);
@@ -322,15 +558,18 @@ fn logError(state: *SyslogState, comptime fmt: []const u8, args: anytype) void {
 
 test "syslog pollBatch drains buffer" {
     const allocator = std.testing.allocator;
+    var runtime = try netx_runtime.IoRuntime.initDefault();
+    defer runtime.deinit();
     const ctx = src.InitContext{
         .allocator = allocator,
+        .runtime = &runtime,
         .log = null,
         .metrics = null,
     };
 
     var source_config = cfg.SourceConfig{
         .id = "syslog_test",
-        .payload = .{ .syslog = .{ .address = "127.0.0.1:514" } },
+        .payload = .{ .syslog = .{ .address = "127.0.0.1:5514" } },
     };
 
     var source_instance = try create(ctx, &source_config);
@@ -358,15 +597,18 @@ test "syslog pollBatch drains buffer" {
 
 test "syslog ack runs managed event finalizers" {
     const allocator = std.testing.allocator;
+    var runtime = try netx_runtime.IoRuntime.initDefault();
+    defer runtime.deinit();
     const ctx = src.InitContext{
         .allocator = allocator,
+        .runtime = &runtime,
         .log = null,
         .metrics = null,
     };
 
     var source_config = cfg.SourceConfig{
         .id = "syslog_finalizer",
-        .payload = .{ .syslog = .{ .address = "127.0.0.1:514" } },
+        .payload = .{ .syslog = .{ .address = "127.0.0.1:5514" } },
     };
 
     var source_instance = try create(ctx, &source_config);
@@ -440,8 +682,11 @@ test "syslog enqueue differentiates reject and drop metrics" {
         .record_gauge_fn = MetricsHarness.gauge,
     };
 
+    var runtime = try netx_runtime.IoRuntime.initDefault();
+    defer runtime.deinit();
     const ctx = src.InitContext{
         .allocator = allocator,
+        .runtime = &runtime,
         .log = log,
         .metrics = &metrics_obj,
     };
@@ -449,7 +694,7 @@ test "syslog enqueue differentiates reject and drop metrics" {
     var source_config = cfg.SourceConfig{
         .id = "syslog_metrics",
         .payload = .{ .syslog = .{
-            .address = "127.0.0.1:514",
+            .address = "127.0.0.1:5514",
             .max_batch_size = 1,
         } },
     };
@@ -533,15 +778,18 @@ test "syslog enqueue differentiates reject and drop metrics" {
 
 test "syslog startStream reuses batch draining semantics" {
     const allocator = std.testing.allocator;
+    var runtime = try netx_runtime.IoRuntime.initDefault();
+    defer runtime.deinit();
     const ctx = src.InitContext{
         .allocator = allocator,
+        .runtime = &runtime,
         .log = null,
         .metrics = null,
     };
 
     var source_config = cfg.SourceConfig{
         .id = "syslog_stream",
-        .payload = .{ .syslog = .{ .address = "127.0.0.1:514" } },
+        .payload = .{ .syslog = .{ .address = "127.0.0.1:5514" } },
     };
 
     var source_instance = try create(ctx, &source_config);
@@ -573,4 +821,184 @@ test "syslog startStream reuses batch draining semantics" {
 
     stream.finish(allocator);
     try std.testing.expectError(event.StreamError.EndOfStream, stream.next(allocator));
+}
+
+fn testFindField(fields: []const event.Field, name: []const u8) ?event.Field {
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.name, name)) return field;
+    }
+    return null;
+}
+
+test "parser handles rfc5424 message" {
+    const allocator = std.testing.allocator;
+    const config = cfg.SyslogConfig{
+        .address = "127.0.0.1:5514",
+        .transport = .udp,
+        .parser = .rfc5424,
+    };
+
+    const message = netx_transport.Message{
+        .bytes = "<34>1 2023-10-10T12:30:45Z host app 123 ID47 [exampleSDID@32473 iut=\"3\" eventSource=\"Application\" eventID=\"1011\"] Test message",
+        .metadata = .{},
+        .finalizer = null,
+    };
+
+    var result = try parser.parseMessage(allocator, config, message);
+    defer result.managed.finalizer.run();
+
+    const log = result.managed.event.payload.log;
+    try std.testing.expectEqualStrings("Test message", log.message);
+
+    const metadata = result.managed.event.metadata;
+    try std.testing.expect(!metadata.payload_truncated);
+    try std.testing.expect(metadata.transport == null);
+
+    const facility_field = testFindField(log.fields, "syslog_facility") orelse return std.testing.expect(false);
+    try std.testing.expectEqual(@as(i64, 4), facility_field.value.integer);
+
+    const severity_field = testFindField(log.fields, "syslog_severity") orelse return std.testing.expect(false);
+    try std.testing.expectEqual(@as(i64, 2), severity_field.value.integer);
+
+    const structured_field = testFindField(log.fields, "syslog_structured_data") orelse return std.testing.expect(false);
+    try std.testing.expect(std.mem.indexOf(u8, structured_field.value.string, "eventID=\"1011\"") != null);
+}
+
+test "parser auto parses rfc3164" {
+    const allocator = std.testing.allocator;
+    const config = cfg.SyslogConfig{
+        .address = "127.0.0.1:5514",
+        .transport = .udp,
+        .parser = .auto,
+    };
+
+    const message = netx_transport.Message{
+        .bytes = "<13>Oct 11 22:14:15 mymachine su: 'su root' failed for lonvick on /dev/pts/8",
+        .metadata = .{},
+        .finalizer = null,
+    };
+
+    var result = try parser.parseMessage(allocator, config, message);
+    defer result.managed.finalizer.run();
+
+    const log = result.managed.event.payload.log;
+    try std.testing.expectEqualStrings("'su root' failed for lonvick on /dev/pts/8", log.message);
+
+    const metadata = result.managed.event.metadata;
+    try std.testing.expect(!metadata.payload_truncated);
+    try std.testing.expect(metadata.transport == null);
+
+    const app_field = testFindField(log.fields, "syslog_app_name") orelse return std.testing.expect(false);
+    try std.testing.expectEqualStrings("su", app_field.value.string);
+
+    const host_field = testFindField(log.fields, "syslog_hostname") orelse return std.testing.expect(false);
+    try std.testing.expectEqualStrings("mymachine", host_field.value.string);
+}
+
+test "pumpTransport propagates truncation metadata and metrics" {
+    const allocator = std.testing.allocator;
+    var runtime = try netx_runtime.IoRuntime.initDefault();
+    defer runtime.deinit();
+
+    const MetricsHarness = struct {
+        truncated: usize = 0,
+
+        fn incr(context: *anyopaque, name: []const u8, value: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (std.mem.eql(u8, name, metrics.truncated)) {
+                self.truncated += value;
+            }
+        }
+
+        fn gauge(_: *anyopaque, _: []const u8, _: i64) void {}
+    };
+
+    var harness = MetricsHarness{};
+    const metrics_obj = src.Metrics{
+        .context = @ptrCast(&harness),
+        .incr_counter_fn = MetricsHarness.incr,
+        .record_gauge_fn = MetricsHarness.gauge,
+    };
+
+    const config = cfg.SyslogConfig{
+        .address = "127.0.0.1:5514",
+        .max_batch_size = 4,
+    };
+
+    const FakeTransport = struct {
+        message: ?netx_transport.Message,
+
+        fn get(context: *anyopaque) *@This() {
+            const aligned: *align(@alignOf(@This())) anyopaque = @alignCast(context);
+            return @ptrCast(aligned);
+        }
+
+        fn start(_: *anyopaque) netx_transport.TransportError!void {
+            return;
+        }
+
+        fn poll(context: *anyopaque, arena: std.mem.Allocator) netx_transport.TransportError!?netx_transport.Message {
+            _ = arena;
+            const self = get(context);
+            const payload = self.message orelse return null;
+            self.message = null;
+            return payload;
+        }
+
+        fn shutdown(context: *anyopaque) void {
+            const self = get(context);
+            self.message = null;
+        }
+    };
+
+    const message = netx_transport.Message{
+        .bytes = "<13>Oct 11 22:14:15 mymachine app: truncated payload",
+        .metadata = .{
+            .peer_address = "10.0.0.1:5514",
+            .protocol = "tcp",
+            .truncated = true,
+        },
+        .finalizer = null,
+    };
+
+    var fake_ctx = FakeTransport{ .message = message };
+    const fake_vtable = netx_transport.VTable{
+        .start = FakeTransport.start,
+        .poll = FakeTransport.poll,
+        .shutdown = FakeTransport.shutdown,
+    };
+    const transport_instance = netx_transport.Transport.init(&fake_ctx, &fake_vtable);
+
+    const manager = TransportManager{
+        .runtime = &runtime,
+        .transport = transport_instance,
+    };
+
+    var state = SyslogState{
+        .allocator = allocator,
+        .descriptor = .{ .type = .syslog, .name = "syslog_trunc" },
+        .config = config,
+        .buffer = undefined,
+        .log = null,
+        .metrics = &metrics_obj,
+        .stream_closed = false,
+        .transport = manager,
+        .framer = frame.Framer.init(allocator, .auto, config.message_size_limit),
+    };
+    state.buffer = try EventBuffer.init(allocator, config.max_batch_size, .reject);
+    defer state.buffer.deinit();
+    defer state.framer.deinit();
+
+    pumpTransport(&state, allocator);
+
+    const managed = state.buffer.pop() orelse return std.testing.expect(false);
+    defer managed.finalizer.run();
+
+    try std.testing.expect(managed.event.metadata.payload_truncated);
+    const transport_meta = managed.event.metadata.transport orelse return std.testing.expect(false);
+    try std.testing.expect(transport_meta == .socket);
+    try std.testing.expectEqualStrings("10.0.0.1:5514", transport_meta.socket.peer_address);
+    try std.testing.expectEqualStrings("tcp", transport_meta.socket.protocol);
+
+    try std.testing.expectEqual(@as(usize, 1), harness.truncated);
 }

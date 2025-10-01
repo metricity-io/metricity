@@ -36,6 +36,8 @@ pub const EventMetadata = struct {
     source_id: ?[]const u8 = null,
     /// Transport-specific metadata (socket address, file offset, etc.).
     transport: ?TransportMetadata = null,
+    /// Indicates that the incoming payload was truncated due to source limits.
+    payload_truncated: bool = false,
 };
 
 pub const TransportMetadata = union(enum) {

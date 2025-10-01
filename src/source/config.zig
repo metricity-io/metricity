@@ -36,6 +36,11 @@ pub const SyslogConfig = struct {
     parser: SyslogParserMode = .auto,
     max_batch_size: usize = 256,
     read_buffer_bytes: usize = 64 * 1024,
+    tcp_max_connections: usize = 64,
+    tcp_keepalive_seconds: ?u32 = null,
+    message_size_limit: usize = 64 * 1024,
+    tcp_high_watermark: usize = 256 * 1024,
+    tcp_low_watermark: usize = 128 * 1024,
 };
 
 pub const TomlValue = union(enum) {
@@ -122,6 +127,11 @@ pub fn parseSourceConfig(
                 "parser",
                 "max_batch_size",
                 "read_buffer_bytes",
+                "tcp_max_connections",
+                "tcp_keepalive_seconds",
+                "message_size_limit",
+                "tcp_high_watermark",
+                "tcp_low_watermark",
             };
             try ensureKnownKeys(table.*, &allowed);
 
@@ -151,6 +161,38 @@ pub fn parseSourceConfig(
                 config.read_buffer_bytes = casted;
             }
 
+            if (try table.getInteger("tcp_max_connections")) |tcp_max_connections| {
+                if (tcp_max_connections <= 0) return ParseError.InvalidValue;
+                const casted = std.math.cast(usize, tcp_max_connections) orelse return ParseError.InvalidValue;
+                config.tcp_max_connections = casted;
+            }
+
+            if (try table.getInteger("tcp_keepalive_seconds")) |tcp_keepalive_seconds| {
+                if (tcp_keepalive_seconds <= 0) return ParseError.InvalidValue;
+                const casted = std.math.cast(u32, tcp_keepalive_seconds) orelse return ParseError.InvalidValue;
+                config.tcp_keepalive_seconds = casted;
+            }
+
+            if (try table.getInteger("message_size_limit")) |message_size_limit| {
+                if (message_size_limit <= 0) return ParseError.InvalidValue;
+                const casted = std.math.cast(usize, message_size_limit) orelse return ParseError.InvalidValue;
+                config.message_size_limit = casted;
+            }
+
+            if (try table.getInteger("tcp_high_watermark")) |tcp_high_watermark| {
+                if (tcp_high_watermark <= 0) return ParseError.InvalidValue;
+                const casted = std.math.cast(usize, tcp_high_watermark) orelse return ParseError.InvalidValue;
+                config.tcp_high_watermark = casted;
+            }
+
+            if (try table.getInteger("tcp_low_watermark")) |tcp_low_watermark| {
+                if (tcp_low_watermark <= 0) return ParseError.InvalidValue;
+                const casted = std.math.cast(usize, tcp_low_watermark) orelse return ParseError.InvalidValue;
+                config.tcp_low_watermark = casted;
+            }
+
+            if (config.tcp_low_watermark > config.tcp_high_watermark) return ParseError.InvalidValue;
+
             _ = allocator; // reserved for future allocations.
             return SourceConfig{
                 .id = id,
@@ -169,6 +211,11 @@ test "parse syslog config success" {
             .{ .key = "parser", .value = TomlValue{ .string = "rfc5424" } },
             .{ .key = "max_batch_size", .value = TomlValue{ .integer = 512 } },
             .{ .key = "read_buffer_bytes", .value = TomlValue{ .integer = 131072 } },
+            .{ .key = "tcp_max_connections", .value = TomlValue{ .integer = 32 } },
+            .{ .key = "tcp_keepalive_seconds", .value = TomlValue{ .integer = 45 } },
+            .{ .key = "message_size_limit", .value = TomlValue{ .integer = 262144 } },
+            .{ .key = "tcp_high_watermark", .value = TomlValue{ .integer = 600000 } },
+            .{ .key = "tcp_low_watermark", .value = TomlValue{ .integer = 200000 } },
         },
     };
 
@@ -182,6 +229,11 @@ test "parse syslog config success" {
             try std.testing.expectEqual(SyslogParserMode.rfc5424, syslog_cfg.parser);
             try std.testing.expectEqual(@as(usize, 512), syslog_cfg.max_batch_size);
             try std.testing.expectEqual(@as(usize, 131072), syslog_cfg.read_buffer_bytes);
+            try std.testing.expectEqual(@as(usize, 32), syslog_cfg.tcp_max_connections);
+            try std.testing.expectEqual(@as(?u32, 45), syslog_cfg.tcp_keepalive_seconds);
+            try std.testing.expectEqual(@as(usize, 262144), syslog_cfg.message_size_limit);
+            try std.testing.expectEqual(@as(usize, 600000), syslog_cfg.tcp_high_watermark);
+            try std.testing.expectEqual(@as(usize, 200000), syslog_cfg.tcp_low_watermark);
         },
     }
 }
@@ -202,6 +254,11 @@ test "parse syslog config applies defaults" {
             try std.testing.expectEqual(SyslogParserMode.auto, syslog_cfg.parser);
             try std.testing.expectEqual(@as(usize, 256), syslog_cfg.max_batch_size);
             try std.testing.expectEqual(@as(usize, 64 * 1024), syslog_cfg.read_buffer_bytes);
+            try std.testing.expectEqual(@as(usize, 64), syslog_cfg.tcp_max_connections);
+            try std.testing.expectEqual(@as(?u32, null), syslog_cfg.tcp_keepalive_seconds);
+            try std.testing.expectEqual(@as(usize, 64 * 1024), syslog_cfg.message_size_limit);
+            try std.testing.expectEqual(@as(usize, 256 * 1024), syslog_cfg.tcp_high_watermark);
+            try std.testing.expectEqual(@as(usize, 128 * 1024), syslog_cfg.tcp_low_watermark);
         },
     }
 }
@@ -238,6 +295,55 @@ test "parse source config rejects invalid values" {
     };
 
     try std.testing.expectError(ParseError.InvalidValue, parseSourceConfig(std.testing.allocator, "syslog_invalid", &table));
+}
+
+test "parse syslog config rejects non-positive tcp_max_connections" {
+    const table = TomlTable{
+        .entries = &[_]TomlKeyValue{
+            .{ .key = "type", .value = TomlValue{ .string = "syslog" } },
+            .{ .key = "address", .value = TomlValue{ .string = "127.0.0.1:514" } },
+            .{ .key = "tcp_max_connections", .value = TomlValue{ .integer = 0 } },
+        },
+    };
+
+    try std.testing.expectError(ParseError.InvalidValue, parseSourceConfig(std.testing.allocator, "syslog_tcp", &table));
+}
+
+test "parse syslog config rejects non-positive tcp_keepalive_seconds" {
+    const table = TomlTable{
+        .entries = &[_]TomlKeyValue{
+            .{ .key = "type", .value = TomlValue{ .string = "syslog" } },
+            .{ .key = "address", .value = TomlValue{ .string = "127.0.0.1:514" } },
+            .{ .key = "tcp_keepalive_seconds", .value = TomlValue{ .integer = -5 } },
+        },
+    };
+
+    try std.testing.expectError(ParseError.InvalidValue, parseSourceConfig(std.testing.allocator, "syslog_keepalive", &table));
+}
+
+test "parse syslog config rejects non-positive message_size_limit" {
+    const table = TomlTable{
+        .entries = &[_]TomlKeyValue{
+            .{ .key = "type", .value = TomlValue{ .string = "syslog" } },
+            .{ .key = "address", .value = TomlValue{ .string = "127.0.0.1:514" } },
+            .{ .key = "message_size_limit", .value = TomlValue{ .integer = 0 } },
+        },
+    };
+
+    try std.testing.expectError(ParseError.InvalidValue, parseSourceConfig(std.testing.allocator, "syslog_limit", &table));
+}
+
+test "parse syslog config rejects watermarks order" {
+    const table = TomlTable{
+        .entries = &[_]TomlKeyValue{
+            .{ .key = "type", .value = TomlValue{ .string = "syslog" } },
+            .{ .key = "address", .value = TomlValue{ .string = "127.0.0.1:514" } },
+            .{ .key = "tcp_high_watermark", .value = TomlValue{ .integer = 1000 } },
+            .{ .key = "tcp_low_watermark", .value = TomlValue{ .integer = 2000 } },
+        },
+    };
+
+    try std.testing.expectError(ParseError.InvalidValue, parseSourceConfig(std.testing.allocator, "syslog_wm", &table));
 }
 
 test "parse source config rejects unsupported type" {
