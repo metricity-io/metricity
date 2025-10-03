@@ -33,6 +33,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    const source_module = b.createModule(.{
+        .root_source_file = b.path("src/source/mod.zig"),
+        .target = target,
+    });
+
     const libxev_dep = b.dependency("libxev", .{
         .target = target,
         .optimize = optimize,
@@ -50,9 +55,7 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
-        .imports = &.{
-            .{ .name = "netx", .module = netx_module },
-        },
+        .imports = &.{ .{ .name = "netx", .module = netx_module }, .{ .name = "source", .module = source_module } },
     });
 
     // Here we define an executable. An executable needs to have a root module
@@ -150,12 +153,51 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    const bench_queries_module = b.createModule(.{
+        .root_source_file = b.path("benchmarks/queries.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "metricity", .module = mod },
+            .{ .name = "netx", .module = netx_module },
+            .{ .name = "source", .module = source_module },
+        },
+    });
+
+    const bench_queries_tests = b.addTest(.{
+        .root_module = bench_queries_module,
+    });
+
+    const run_bench_queries_tests = b.addRunArtifact(bench_queries_tests);
+
+    const netx_udp_test_module = b.createModule(.{
+        .root_source_file = b.path("src/netx/udp.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "xev", .module = libxev_dep.module("xev") } },
+    });
+    const netx_udp_tests = b.addTest(.{ .root_module = netx_udp_test_module });
+    const run_netx_udp_tests = b.addRunArtifact(netx_udp_tests);
+
+    const netx_tcp_test_module = b.createModule(.{
+        .root_source_file = b.path("src/netx/tcp.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "xev", .module = libxev_dep.module("xev") } },
+    });
+    const netx_tcp_tests = b.addTest(.{ .root_module = netx_tcp_test_module });
+    const run_netx_tcp_tests = b.addRunArtifact(netx_tcp_tests);
+
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_bench_queries_tests.step);
+    test_step.dependOn(&run_netx_udp_tests.step);
+    test_step.dependOn(&run_netx_tcp_tests.step);
 
     const bench_module = b.createModule(.{
         .root_source_file = b.path("benchmarks/runner.zig"),

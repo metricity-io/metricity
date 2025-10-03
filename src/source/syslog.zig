@@ -61,10 +61,7 @@ const TransportManager = struct {
     }
 
     fn poll(self: *TransportManager, allocator: std.mem.Allocator) Error!?netx_transport.Message {
-        self.runtime.tick() catch {
-            return Error.PollFailure;
-        };
-
+        _ = self.runtime.tick() catch {};
         if (self.transport) |*t| {
             return t.poll(allocator) catch {
                 return Error.PollFailure;
@@ -365,6 +362,69 @@ fn enqueueEvent(state: *SyslogState, managed: event.ManagedEvent) src.SourceErro
     recordQueueDepth(state);
 }
 
+fn processFramerResult(
+    state: *SyslogState,
+    allocator: std.mem.Allocator,
+    base_metadata: netx_transport.Metadata,
+    frame_result: frame.FramerResult,
+    assume_truncated: bool,
+) void {
+    const truncated = frame_result.truncated or assume_truncated;
+
+    const peer_copy = state.allocator.alloc(u8, base_metadata.peer_address.len) catch {
+        state.allocator.free(frame_result.payload);
+        recordReject(state, 1);
+        logError(state, "syslog source {s}: failed to copy peer address", .{state.descriptor.name});
+        return;
+    };
+    var peer_owned = true;
+    defer if (peer_owned) state.allocator.free(peer_copy);
+
+    if (base_metadata.peer_address.len != 0) {
+        @memcpy(peer_copy, base_metadata.peer_address);
+    }
+
+    const allocation = netx_transport.IoAllocation.create(
+        state.allocator,
+        frame_result.payload,
+        peer_copy,
+    ) catch {
+        state.allocator.free(frame_result.payload);
+        recordReject(state, 1);
+        logError(state, "syslog source {s}: failed to allocate frame wrappers", .{state.descriptor.name});
+        return;
+    };
+    peer_owned = false;
+
+    const framed_message = netx_transport.Message{
+        .bytes = allocation.payload,
+        .metadata = .{
+            .protocol = base_metadata.protocol,
+            .peer_address = allocation.peer,
+            .truncated = truncated,
+        },
+        .finalizer = netx_transport.IoAllocation.finalizer(allocation),
+    };
+
+    if (framed_message.metadata.truncated) {
+        recordTruncated(state, 1);
+    }
+
+    const parsed = parser.parseMessage(allocator, state.config, framed_message) catch |err| {
+        if (framed_message.finalizer) |finalizer| finalizer.run();
+        recordReject(state, 1);
+        logWarn(state, "syslog source {s}: failed to parse message ({s})", .{ state.descriptor.name, @errorName(err) });
+        return;
+    };
+
+    enqueueEvent(state, parsed.managed) catch |err| {
+        switch (err) {
+            src.SourceError.Backpressure => {},
+            else => logError(state, "syslog source {s}: failed to enqueue parsed event ({s})", .{ state.descriptor.name, @errorName(err) }),
+        }
+    };
+}
+
 fn pumpTransport(state: *SyslogState, allocator: std.mem.Allocator) void {
     while (true) {
         const maybe_message = state.transport.poll(allocator) catch |err| {
@@ -390,55 +450,19 @@ fn pumpTransport(state: *SyslogState, allocator: std.mem.Allocator) void {
             };
 
             const frame_result = extracted orelse break;
+            processFramerResult(state, allocator, message.metadata, frame_result, false);
+        }
 
-            const peer_copy = state.allocator.alloc(u8, message.metadata.peer_address.len) catch {
-                state.allocator.free(frame_result.payload);
+        if (message.metadata.truncated and state.framer.hasBufferedData()) {
+            const drained = state.framer.drainBuffered(true) catch |err| {
                 recordReject(state, 1);
-                logError(state, "syslog source {s}: failed to copy peer address", .{state.descriptor.name});
-                continue;
+                logWarn(state, "syslog source {s}: failed to drain truncated frame ({s})", .{ state.descriptor.name, @errorName(err) });
+                if (chunk_finalizer) |finalizer| finalizer.run();
+                break;
             };
-            if (message.metadata.peer_address.len != 0) {
-                @memcpy(peer_copy, message.metadata.peer_address);
+            if (drained) |frame_result| {
+                processFramerResult(state, allocator, message.metadata, frame_result, true);
             }
-
-            const allocation = netx_transport.IoAllocation.create(state.allocator, frame_result.payload, peer_copy) catch {
-                state.allocator.free(frame_result.payload);
-                state.allocator.free(peer_copy);
-                recordReject(state, 1);
-                logError(state, "syslog source {s}: failed to allocate frame wrappers", .{state.descriptor.name});
-                continue;
-            };
-
-            const framed_message = netx_transport.Message{
-                .bytes = allocation.payload,
-                .metadata = .{
-                    .protocol = message.metadata.protocol,
-                    .peer_address = allocation.peer,
-                    .truncated = frame_result.truncated,
-                },
-                .finalizer = netx_transport.IoAllocation.finalizer(allocation),
-            };
-
-            if (framed_message.metadata.truncated) {
-                recordTruncated(state, 1);
-            }
-
-            const parsed = parser.parseMessage(allocator, state.config, framed_message) catch |err| {
-                if (framed_message.finalizer) |finalizer| {
-                    finalizer.run();
-                }
-                recordReject(state, 1);
-                logWarn(state, "syslog source {s}: failed to parse message ({s})", .{ state.descriptor.name, @errorName(err) });
-                continue;
-            };
-
-            enqueueEvent(state, parsed.managed) catch |err| {
-                switch (err) {
-                    src.SourceError.Backpressure => {},
-                    else => logError(state, "syslog source {s}: failed to enqueue parsed event ({s})", .{ state.descriptor.name, @errorName(err) }),
-                }
-                continue;
-            };
         }
 
         if (chunk_finalizer) |finalizer| finalizer.run();

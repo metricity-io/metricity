@@ -44,14 +44,14 @@ const UdpContext = struct {
         socket_util.configureReuseAddrPort(socket.fd);
 
         if (socket.bind(address)) |_| {} else |err| {
-            posix.close(socket.fd) catch {};
+            socket_util.closeSocket(socket.fd);
             allocator.destroy(ctx);
             std.log.err("udp bind error: {s}", .{@errorName(err)});
             return transport.TransportError.StartupFailed;
         }
 
         const scratch = allocator.alloc(u8, opts.limits.read_buffer_bytes) catch {
-            posix.close(socket.fd) catch {};
+            socket_util.closeSocket(socket.fd);
             allocator.destroy(ctx);
             return transport.TransportError.StartupFailed;
         };
@@ -88,7 +88,7 @@ const UdpContext = struct {
     fn deinit(self: *UdpContext) void {
         self.pending.deinit();
         self.allocator.free(self.scratch);
-        posix.close(self.socket.fd) catch {};
+        socket_util.closeSocket(self.socket.fd);
         self.allocator.destroy(self);
     }
 

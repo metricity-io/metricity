@@ -13,6 +13,7 @@ const ConnectionList = array_list.Managed(*Connection);
 const ProcessError = error{
     ConnectionClosed,
     Fatal,
+    OutOfMemory,
 };
 
 const TcpContext = struct {
@@ -55,21 +56,22 @@ const TcpContext = struct {
         socket_util.configureReuseAddr(socket.fd);
 
         if (socket.bind(address)) |_| {} else |err| {
-            posix.close(socket.fd) catch {};
+            socket_util.closeSocket(socket.fd);
             allocator.destroy(ctx);
             std.log.err("tcp bind error: {s}", .{@errorName(err)});
             return transport.TransportError.StartupFailed;
         }
 
-        if (socket.listen(@intCast(posix.SOMAXCONN))) |_| {} else |err| {
-            posix.close(socket.fd) catch {};
+        const backlog: u31 = 128;
+        if (socket.listen(backlog)) |_| {} else |err| {
+            socket_util.closeSocket(socket.fd);
             allocator.destroy(ctx);
             std.log.err("tcp listen error: {s}", .{@errorName(err)});
             return transport.TransportError.StartupFailed;
         }
 
         const scratch = allocator.alloc(u8, opts.limits.read_buffer_bytes) catch {
-            posix.close(socket.fd) catch {};
+            socket_util.closeSocket(socket.fd);
             allocator.destroy(ctx);
             return transport.TransportError.StartupFailed;
         };
@@ -100,7 +102,7 @@ const TcpContext = struct {
         self.pending.deinit();
         self.connections.deinit();
         self.allocator.free(self.scratch);
-        posix.close(self.listener.fd) catch {};
+        socket_util.closeSocket(self.listener.fd);
         self.allocator.destroy(self);
     }
 
@@ -260,7 +262,7 @@ const TcpContext = struct {
     fn shutdownConnections(self: *TcpContext) void {
         self.shutting_down = true;
         while (self.connections.items.len > 0) {
-            const conn = self.connections.pop();
+            const conn = self.connections.pop().?;
             conn.deinit();
         }
     }
@@ -286,7 +288,7 @@ const Connection = struct {
     }
 
     fn deinit(self: *Connection) void {
-        posix.close(self.fd) catch {};
+        socket_util.closeSocket(self.fd);
         self.ring.deinit();
         self.parent.allocator.free(self.peer_address);
         self.parent.allocator.destroy(self);
@@ -315,6 +317,11 @@ fn pollCallback(
                 return .disarm;
             },
             error.Fatal => {
+                ctx.removeConnection(conn);
+                conn.deinit();
+                return .disarm;
+            },
+            error.OutOfMemory => {
                 ctx.removeConnection(conn);
                 conn.deinit();
                 return .disarm;
@@ -368,7 +375,7 @@ fn acceptCallback(
 
 fn closeSocketImmediate(socket: xev.TCP) void {
     const fd = socket.fd;
-    posix.close(fd) catch {};
+    socket_util.closeSocket(fd);
 }
 
 fn ring_bufferCleanup(ring: ring_buffer.RingBuffer, allocator: std.mem.Allocator) void {
@@ -378,7 +385,9 @@ fn ring_bufferCleanup(ring: ring_buffer.RingBuffer, allocator: std.mem.Allocator
 }
 
 fn tcpStart(context: *anyopaque) transport.TransportError!void {
-    _ = context;
+    const ctx = getContext(context);
+    ctx.accept_completion = .{};
+    ctx.listener.accept(ctx.loop, &ctx.accept_completion, TcpContext, ctx, acceptCallback);
     return;
 }
 
@@ -398,6 +407,34 @@ fn getContext(ptr: *anyopaque) *TcpContext {
     const aligned: *align(@alignOf(TcpContext)) anyopaque = @alignCast(ptr);
     return @ptrCast(aligned);
 }
+
+pub fn create(
+    allocator: std.mem.Allocator,
+    loop_handle: *xev.Loop,
+    opts: options.TcpOptions,
+) transport.TransportError!transport.Transport {
+    const limits = options.applyBufferDefaults(opts.limits);
+    const normalized = options.TcpOptions{
+        .address = opts.address,
+        .limits = limits,
+        .max_connections = opts.max_connections,
+        .keepalive_seconds = opts.keepalive_seconds,
+        .high_watermark = opts.high_watermark,
+        .low_watermark = opts.low_watermark,
+    };
+
+    const ctx = try TcpContext.init(allocator, loop_handle, normalized);
+    errdefer ctx.deinit();
+
+    const transport_instance = transport.Transport.init(ctx, &tcp_vtable);
+    return transport_instance;
+}
+
+const tcp_vtable = transport.VTable{
+    .start = tcpStart,
+    .poll = tcpPoll,
+    .shutdown = tcpShutdown,
+};
 
 test "flushBufferedChunks splits payload into capped messages" {
     const allocator = std.testing.allocator;

@@ -150,6 +150,20 @@ pub const Framer = struct {
     pub fn hasBufferedData(self: *const Framer) bool {
         return self.buffer.items.len != 0;
     }
+
+    pub fn drainBuffered(self: *Framer, assume_truncated: bool) FramerError!?FramerResult {
+        if (self.buffer.items.len == 0) return null;
+
+        const payload_len = self.buffer.items.len;
+        const take = @min(payload_len, self.message_limit);
+        const payload = try self.allocator.alloc(u8, take);
+        @memcpy(payload, self.buffer.items[0..take]);
+        const truncated = assume_truncated or payload_len > self.message_limit;
+
+        self.buffer.clearRetainingCapacity();
+        self.active_mode = .auto;
+        return FramerResult{ .payload = payload, .truncated = truncated };
+    }
 };
 
 pub fn extractLf(buffer: []const u8) ?ExtractResult {

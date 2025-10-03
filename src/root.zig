@@ -1,7 +1,17 @@
 //! By convention, root.zig is the root source file when making a library.
 const std = @import("std");
+const builtin = @import("builtin");
+const netx = @import("netx");
 pub const sql = @import("sql/mod.zig");
 pub const source = @import("source/mod.zig");
+
+comptime {
+    if (builtin.is_test) {
+        std.testing.refAllDecls(sql);
+        std.testing.refAllDecls(source);
+        std.testing.refAllDeclsRecursive(netx);
+    }
+}
 
 
 pub fn bufferedPrint() !void {
