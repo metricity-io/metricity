@@ -30,8 +30,7 @@ pub fn run(env: Environment, options: cli.RunOptions) Error!void {
     try owned.pipeline.validate(env.allocator);
 
     var pipeline = try pipeline_mod.Pipeline.init(env.allocator, &owned.pipeline, .{});
-    defer pipeline.deinit();
-    defer pipeline.shutdown() catch {};
+    defer pipeline.deinit(); // deinit triggers shutdown if start succeeded
 
     interrupt_requested.store(false, atomic_order.seq_cst);
     installSignalHandlers();
