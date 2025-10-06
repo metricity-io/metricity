@@ -1,4 +1,6 @@
 const std = @import("std");
+const net = std.net;
+const posix = std.posix;
 const src = @import("source.zig");
 const cfg = @import("config.zig");
 const event = @import("event.zig");
@@ -129,6 +131,203 @@ pub fn factory() src.SourceFactory {
     };
 }
 
+const TimeSource = *const fn () i128;
+
+fn defaultTimeSource() i128 {
+    return std.time.nanoTimestamp();
+}
+
+const RateLimiter = struct {
+    tokens: f64,
+    capacity: f64,
+    rate_per_sec: f64,
+    last_ns: i128,
+
+    fn init(now_ns: i128, rate_per_sec: usize, burst: usize) RateLimiter {
+        const capacity = @as(f64, @floatFromInt(burst));
+        return .{
+            .tokens = capacity,
+            .capacity = capacity,
+            .rate_per_sec = @as(f64, @floatFromInt(rate_per_sec)),
+            .last_ns = now_ns,
+        };
+    }
+
+    fn allow(self: *RateLimiter, now_ns: i128) bool {
+        var elapsed: i128 = now_ns - self.last_ns;
+        if (elapsed < 0) elapsed = 0;
+        const elapsed_float = @as(f64, @floatFromInt(@as(u128, @intCast(elapsed))));
+        const ns_per_second = @as(f64, @floatFromInt(std.time.ns_per_s));
+        const replenished = self.rate_per_sec * (elapsed_float / ns_per_second);
+        self.tokens = @min(self.capacity, self.tokens + replenished);
+        self.last_ns = now_ns;
+        if (self.tokens >= 1.0) {
+            self.tokens -= 1.0;
+            return true;
+        }
+        return false;
+    }
+};
+
+const SyslogAcl = struct {
+    const Rule = union(enum) {
+        ipv4: struct {
+            network: [4]u8,
+            prefix: u6,
+        },
+        ipv6: struct {
+            network: [16]u8,
+            prefix: u8,
+        },
+    };
+
+    allocator: ?std.mem.Allocator,
+    rules: []const Rule,
+
+    const Error = error{
+        InvalidEntry,
+        OutOfMemory,
+    };
+
+    pub fn allowAll() SyslogAcl {
+        return .{ .allocator = null, .rules = &[_]Rule{} };
+    }
+
+    pub fn init(allocator: std.mem.Allocator, entries: []const []const u8) Error!SyslogAcl {
+        if (entries.len == 0) return allowAll();
+
+        var list = std.ArrayListUnmanaged(Rule){};
+        errdefer list.deinit(allocator);
+
+        for (entries) |entry| {
+            const rule = try parseRule(entry);
+            try list.append(allocator, rule);
+        }
+
+        const slice = try list.toOwnedSlice(allocator);
+        return .{ .allocator = allocator, .rules = slice };
+    }
+
+    pub fn deinit(self: *SyslogAcl) void {
+        if (self.allocator) |alloc| {
+            alloc.free(self.rules);
+        }
+        self.rules = &[_]Rule{};
+        self.allocator = null;
+    }
+
+    pub fn isEnabled(self: *const SyslogAcl) bool {
+        return self.rules.len != 0;
+    }
+
+    pub fn allows(self: *const SyslogAcl, address: net.Address) bool {
+        if (!self.isEnabled()) return true;
+        for (self.rules) |rule| {
+            if (ruleMatches(rule, address)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn parseRule(text: []const u8) Error!Rule {
+        const trimmed = std.mem.trim(u8, text, " \t");
+        if (trimmed.len == 0) return Error.InvalidEntry;
+
+        const slash = std.mem.indexOfScalar(u8, trimmed, '/');
+        const addr_slice = if (slash) |idx| std.mem.trim(u8, trimmed[0..idx], " \t") else trimmed;
+
+        var prefix_value: ?usize = null;
+        if (slash) |idx| {
+            const prefix_str = std.mem.trim(u8, trimmed[idx + 1 ..], " \t");
+            if (prefix_str.len == 0) return Error.InvalidEntry;
+            const parsed = std.fmt.parseUnsigned(u16, prefix_str, 10) catch return Error.InvalidEntry;
+            prefix_value = parsed;
+        }
+
+        if (net.Ip6Address.parse(addr_slice, 0)) |ip6| {
+            const prefix_bits: usize = prefix_value orelse 128;
+            if (prefix_bits > 128) return Error.InvalidEntry;
+            var network = ip6.sa.addr;
+            maskBytes(network[0..], prefix_bits);
+            return Rule{ .ipv6 = .{ .network = network, .prefix = @intCast(prefix_bits) } };
+        } else |_| {}
+
+        if (net.Ip4Address.parse(addr_slice, 0)) |ip4| {
+            const prefix_bits: usize = prefix_value orelse 32;
+            if (prefix_bits > 32) return Error.InvalidEntry;
+            var network = ipv4Bytes(ip4);
+            maskBytes(network[0..], prefix_bits);
+            return Rule{ .ipv4 = .{ .network = network, .prefix = @intCast(prefix_bits) } };
+        } else |_| {}
+
+        return Error.InvalidEntry;
+    }
+
+    fn ruleMatches(rule: Rule, address: net.Address) bool {
+        return switch (rule) {
+            .ipv4 => |config| {
+                if (address.any.family != posix.AF.INET) return false;
+                var addr_bytes = ipv4Bytes(address.in);
+                return matchBytes(addr_bytes[0..], config.network[0..], config.prefix);
+            },
+            .ipv6 => |config| {
+                if (address.any.family != posix.AF.INET6) return false;
+                return matchBytes(address.in6.sa.addr[0..], config.network[0..], config.prefix);
+            },
+        };
+    }
+
+    fn ipv4Bytes(address: net.Ip4Address) [4]u8 {
+        const ptr: *const [4]u8 = @ptrCast(@alignCast(&address.sa.addr));
+        return ptr.*;
+    }
+
+    fn maskBytes(bytes: []u8, prefix: usize) void {
+        var remaining = prefix;
+        var index: usize = 0;
+        while (index < bytes.len) : (index += 1) {
+            if (remaining >= 8) {
+                remaining -= 8;
+                continue;
+            }
+            if (remaining == 0) {
+                bytes[index] = 0;
+                continue;
+            }
+            const rem: u4 = @intCast(remaining);
+            const shift: u3 = @intCast(8 - rem);
+            const mask: u8 = @as(u8, 0xFF) << shift;
+            bytes[index] &= mask;
+            remaining = 0;
+        }
+    }
+
+    fn matchBytes(addr: []const u8, network: []const u8, prefix: usize) bool {
+        if (prefix == 0) return true;
+        var remaining = prefix;
+        var index: usize = 0;
+        while (index < network.len and remaining > 0) : (index += 1) {
+            if (remaining >= 8) {
+                if (addr[index] != network[index]) return false;
+                remaining -= 8;
+                continue;
+            }
+            const rem: u4 = @intCast(remaining);
+            const shift: u3 = @intCast(8 - rem);
+            const mask: u8 = @as(u8, 0xFF) << shift;
+            return (addr[index] & mask) == (network[index] & mask);
+        }
+        return true;
+    }
+};
+
+const PeerParseError = error{
+    MissingPeer,
+    InvalidAddress,
+    InvalidPort,
+};
+
 const EventBuffer = buffer.BoundedBuffer(event.ManagedEvent);
 
 const SyslogState = struct {
@@ -141,6 +340,9 @@ const SyslogState = struct {
     stream_closed: bool = false,
     transport: TransportManager,
     framer: frame.Framer,
+    acl: SyslogAcl,
+    rate_limiter: ?RateLimiter = null,
+    time_source: TimeSource = defaultTimeSource,
 };
 
 const BatchAckContext = struct {
@@ -219,11 +421,36 @@ fn create(ctx: src.InitContext, config: *const cfg.SourceConfig) src.SourceError
         .name = config.id,
     };
 
-    const state = ctx.allocator.create(SyslogState) catch return src.SourceError.StartupFailed;
+    const acl_init = SyslogAcl.init(ctx.allocator, syslog_cfg.allowed_peers) catch {
+        if (ctx.log) |logger| {
+            logger.errorf(
+                "syslog source {s}: invalid ACL configuration",
+                .{descriptor.name},
+            );
+        }
+        return src.SourceError.StartupFailed;
+    };
+
+    const time_source: TimeSource = defaultTimeSource;
+    const now_ns = time_source();
+    const rate_limiter_value = if (syslog_cfg.rate_limit_per_sec) |rate| blk: {
+        const burst = syslog_cfg.rate_limit_burst orelse rate;
+        break :blk RateLimiter.init(now_ns, rate, burst);
+    } else null;
+
+    const state = ctx.allocator.create(SyslogState) catch {
+        var acl_copy = acl_init;
+        acl_copy.deinit();
+        return src.SourceError.StartupFailed;
+    };
     errdefer ctx.allocator.destroy(state);
 
-    const transport_manager = TransportManager.init(ctx, descriptor, syslog_cfg) catch
+    const transport_manager = TransportManager.init(ctx, descriptor, syslog_cfg) catch {
+        var acl_copy = acl_init;
+        acl_copy.deinit();
+        ctx.allocator.destroy(state);
         return src.SourceError.StartupFailed;
+    };
 
     state.* = .{
         .allocator = ctx.allocator,
@@ -234,7 +461,11 @@ fn create(ctx: src.InitContext, config: *const cfg.SourceConfig) src.SourceError
         .metrics = ctx.metrics,
         .transport = transport_manager,
         .framer = frame.Framer.init(ctx.allocator, .auto, syslog_cfg.message_size_limit),
+        .acl = acl_init,
+        .rate_limiter = rate_limiter_value,
+        .time_source = time_source,
     };
+    errdefer state.acl.deinit();
     errdefer state.framer.deinit();
 
     const buffer_instance = EventBuffer.init(ctx.allocator, syslog_cfg.max_batch_size, .reject) catch
@@ -243,8 +474,6 @@ fn create(ctx: src.InitContext, config: *const cfg.SourceConfig) src.SourceError
     errdefer state.buffer.deinit();
 
     state.transport.start(state) catch |err| {
-        state.buffer.deinit();
-        state.allocator.destroy(state);
         logError(state, "syslog source {s}: failed to start transport", .{descriptor.name});
         return switch (err) {
             TransportManager.Error.StartFailure => src.SourceError.StartupFailed,
@@ -308,6 +537,7 @@ fn shutdown(context: *anyopaque, allocator: std.mem.Allocator) void {
     _ = allocator;
     const state = asState(context);
     state.transport.shutdown(state);
+    state.acl.deinit();
     state.buffer.deinit();
     state.framer.deinit();
     state.allocator.destroy(state);
@@ -322,6 +552,14 @@ fn readyHint(context: *anyopaque) bool {
 fn asState(ptr: *anyopaque) *SyslogState {
     const aligned: *align(@alignOf(SyslogState)) anyopaque = @alignCast(ptr);
     return @ptrCast(aligned);
+}
+
+fn parsePeerAddress(metadata: netx_transport.Metadata) PeerParseError!net.Address {
+    if (metadata.peer_address.len == 0) return PeerParseError.MissingPeer;
+    return net.Address.parseIpAndPort(metadata.peer_address) catch |err| switch (err) {
+        error.InvalidAddress => return PeerParseError.InvalidAddress,
+        error.InvalidPort => return PeerParseError.InvalidPort,
+    };
 }
 
 fn enqueueEvent(state: *SyslogState, managed: event.ManagedEvent) src.SourceError!void {
@@ -434,6 +672,44 @@ fn pumpTransport(state: *SyslogState, allocator: std.mem.Allocator) void {
         const message = maybe_message orelse break;
 
         const chunk_finalizer = message.finalizer;
+
+        if (state.acl.isEnabled()) {
+            const peer = parsePeerAddress(message.metadata) catch |err| {
+                if (chunk_finalizer) |finalizer| finalizer.run();
+                recordReject(state, 1);
+                logWarn(
+                    state,
+                    "syslog source {s}: rejected message with invalid peer ({s})",
+                    .{ state.descriptor.name, @errorName(err) },
+                );
+                continue;
+            };
+
+            if (!state.acl.allows(peer)) {
+                if (chunk_finalizer) |finalizer| finalizer.run();
+                recordReject(state, 1);
+                logWarn(
+                    state,
+                    "syslog source {s}: dropped packet from disallowed peer {s}",
+                    .{ state.descriptor.name, message.metadata.peer_address },
+                );
+                continue;
+            }
+        }
+
+        if (state.rate_limiter) |*limiter| {
+            const now = state.time_source();
+            if (!limiter.allow(now)) {
+                if (chunk_finalizer) |finalizer| finalizer.run();
+                recordReject(state, 1);
+                logWarn(
+                    state,
+                    "syslog source {s}: rate limit exceeded (peer {s})",
+                    .{ state.descriptor.name, message.metadata.peer_address },
+                );
+                continue;
+            }
+        }
 
         state.framer.push(message.bytes) catch {
             if (chunk_finalizer) |finalizer| finalizer.run();
@@ -1008,10 +1284,14 @@ test "pumpTransport propagates truncation metadata and metrics" {
         .stream_closed = false,
         .transport = manager,
         .framer = frame.Framer.init(allocator, .auto, config.message_size_limit),
+        .acl = SyslogAcl.allowAll(),
+        .rate_limiter = null,
+        .time_source = defaultTimeSource,
     };
     state.buffer = try EventBuffer.init(allocator, config.max_batch_size, .reject);
     defer state.buffer.deinit();
     defer state.framer.deinit();
+    defer state.acl.deinit();
 
     pumpTransport(&state, allocator);
 
@@ -1025,4 +1305,197 @@ test "pumpTransport propagates truncation metadata and metrics" {
     try std.testing.expectEqualStrings("tcp", transport_meta.socket.protocol);
 
     try std.testing.expectEqual(@as(usize, 1), harness.truncated);
+}
+
+test "pumpTransport enforces ACL" {
+    const allocator = std.testing.allocator;
+    var runtime = try netx_runtime.IoRuntime.initDefault();
+    defer runtime.deinit();
+
+    const config = cfg.SyslogConfig{
+        .address = "127.0.0.1:5514",
+        .max_batch_size = 4,
+        .allowed_peers = &[_][]const u8{"10.0.0.0/24"},
+    };
+
+    const FakeTransport = struct {
+        message: ?netx_transport.Message,
+
+        fn get(context: *anyopaque) *@This() {
+            const aligned: *align(@alignOf(@This())) anyopaque = @alignCast(context);
+            return @ptrCast(aligned);
+        }
+
+        fn start(_: *anyopaque) netx_transport.TransportError!void {
+            return;
+        }
+
+        fn poll(context: *anyopaque, allocator_: std.mem.Allocator) netx_transport.TransportError!?netx_transport.Message {
+            _ = allocator_;
+            const self = get(context);
+            const payload = self.message orelse return null;
+            self.message = null;
+            return payload;
+        }
+
+        fn shutdown(context: *anyopaque) void {
+            const self = get(context);
+            self.message = null;
+        }
+    };
+
+    const message = netx_transport.Message{
+        .bytes = "<13>Oct 11 22:14:15 mymachine app: dropped",
+        .metadata = .{
+            .peer_address = "203.0.113.5:5514",
+            .protocol = "udp",
+            .truncated = false,
+        },
+        .finalizer = null,
+    };
+
+    var fake_ctx = FakeTransport{ .message = message };
+    const fake_vtable = netx_transport.VTable{
+        .start = FakeTransport.start,
+        .poll = FakeTransport.poll,
+        .shutdown = FakeTransport.shutdown,
+    };
+    const transport_instance = netx_transport.Transport.init(&fake_ctx, &fake_vtable);
+
+    const manager = TransportManager{
+        .runtime = &runtime,
+        .transport = transport_instance,
+    };
+
+    const acl = try SyslogAcl.init(allocator, config.allowed_peers);
+
+    var state = SyslogState{
+        .allocator = allocator,
+        .descriptor = .{ .type = .syslog, .name = "syslog_acl" },
+        .config = config,
+        .buffer = undefined,
+        .log = null,
+        .metrics = null,
+        .stream_closed = false,
+        .transport = manager,
+        .framer = frame.Framer.init(allocator, .auto, config.message_size_limit),
+        .acl = acl,
+        .rate_limiter = null,
+        .time_source = defaultTimeSource,
+    };
+    defer state.framer.deinit();
+    defer state.acl.deinit();
+
+    state.buffer = try EventBuffer.init(allocator, config.max_batch_size, .reject);
+    defer state.buffer.deinit();
+
+    pumpTransport(&state, allocator);
+
+    try std.testing.expect(state.buffer.isEmpty());
+    try std.testing.expect(!state.framer.hasBufferedData());
+}
+
+test "pumpTransport enforces rate limiter" {
+    const allocator = std.testing.allocator;
+    var runtime = try netx_runtime.IoRuntime.initDefault();
+    defer runtime.deinit();
+
+    const config = cfg.SyslogConfig{
+        .address = "127.0.0.1:5514",
+        .max_batch_size = 4,
+        .rate_limit_per_sec = 1,
+        .rate_limit_burst = 1,
+    };
+
+    const TimeStub = struct {
+        fn now() i128 {
+            return 0;
+        }
+    };
+
+    var messages = [_]netx_transport.Message{
+        .{
+            .bytes = "<13>Oct 11 22:14:15 mymachine app: first",
+            .metadata = .{
+                .peer_address = "10.0.0.1:5514",
+                .protocol = "udp",
+                .truncated = false,
+            },
+            .finalizer = null,
+        },
+        .{
+            .bytes = "<13>Oct 11 22:14:15 mymachine app: second",
+            .metadata = .{
+                .peer_address = "10.0.0.1:5514",
+                .protocol = "udp",
+                .truncated = false,
+            },
+            .finalizer = null,
+        },
+    };
+
+    const FakeTransport = struct {
+        messages: []const netx_transport.Message,
+        index: usize = 0,
+
+        fn get(context: *anyopaque) *@This() {
+            const aligned: *align(@alignOf(@This())) anyopaque = @alignCast(context);
+            return @ptrCast(aligned);
+        }
+
+        fn start(_: *anyopaque) netx_transport.TransportError!void {
+            return;
+        }
+
+        fn poll(context: *anyopaque, allocator_: std.mem.Allocator) netx_transport.TransportError!?netx_transport.Message {
+            _ = allocator_;
+            const self = get(context);
+            if (self.index >= self.messages.len) return null;
+            const msg = self.messages[self.index];
+            get(context).index += 1;
+            return msg;
+        }
+
+        fn shutdown(_: *anyopaque) void {}
+    };
+
+    var fake_ctx = FakeTransport{ .messages = messages[0..] };
+    const fake_vtable = netx_transport.VTable{
+        .start = FakeTransport.start,
+        .poll = FakeTransport.poll,
+        .shutdown = FakeTransport.shutdown,
+    };
+    const transport_instance = netx_transport.Transport.init(&fake_ctx, &fake_vtable);
+
+    const manager = TransportManager{
+        .runtime = &runtime,
+        .transport = transport_instance,
+    };
+
+    var state = SyslogState{
+        .allocator = allocator,
+        .descriptor = .{ .type = .syslog, .name = "syslog_rate" },
+        .config = config,
+        .buffer = undefined,
+        .log = null,
+        .metrics = null,
+        .stream_closed = false,
+        .transport = manager,
+        .framer = frame.Framer.init(allocator, .auto, config.message_size_limit),
+        .acl = SyslogAcl.allowAll(),
+        .rate_limiter = RateLimiter.init(TimeStub.now(), 1, 1),
+        .time_source = TimeStub.now,
+    };
+    defer state.framer.deinit();
+    defer state.acl.deinit();
+
+    state.buffer = try EventBuffer.init(allocator, config.max_batch_size, .reject);
+    defer state.buffer.deinit();
+
+    pumpTransport(&state, allocator);
+
+    const maybe_first = state.buffer.pop() orelse return std.testing.expect(false);
+    defer maybe_first.finalizer.run();
+    try std.testing.expect(state.buffer.pop() == null);
+    try std.testing.expectEqual(@as(usize, 0), state.buffer.len());
 }

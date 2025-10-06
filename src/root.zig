@@ -2,17 +2,24 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const netx = @import("netx");
+pub const testing = @import("testing/mod.zig");
 pub const sql = @import("sql/mod.zig");
-pub const source = @import("source/mod.zig");
+pub const source = @import("source");
+pub const collector = @import("collector");
+pub const config = @import("config/mod.zig");
+pub const pipeline = @import("pipeline/mod.zig");
+pub const config_parser = @import("config/parser.zig");
 
 comptime {
     if (builtin.is_test) {
         std.testing.refAllDecls(sql);
         std.testing.refAllDecls(source);
+        std.testing.refAllDecls(config);
+        std.testing.refAllDecls(pipeline);
         std.testing.refAllDeclsRecursive(netx);
+        std.testing.refAllDeclsRecursive(testing);
     }
 }
-
 
 pub fn bufferedPrint() !void {
     // Stdout is for the actual output of your application, for example if you
@@ -29,6 +36,14 @@ pub fn bufferedPrint() !void {
 
 pub fn add(a: i32, b: i32) i32 {
     return a + b;
+}
+
+pub fn fuzz(
+    context: anytype,
+    comptime testOne: fn (context: @TypeOf(context), input: []const u8) anyerror!void,
+    options: std.testing.FuzzInputOptions,
+) anyerror!void {
+    return testing.fuzz.run(context, testOne, options, testing.fuzz.Config{});
 }
 
 test "basic add functionality" {

@@ -37,6 +37,16 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/source/mod.zig"),
         .target = target,
     });
+    source_module.addImport("netx", netx_module);
+
+    const collector_module = b.createModule(.{
+        .root_source_file = b.path("src/collector/mod.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "source", .module = source_module },
+            .{ .name = "netx", .module = netx_module },
+        },
+    });
 
     const libxev_dep = b.dependency("libxev", .{
         .target = target,
@@ -55,7 +65,20 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
-        .imports = &.{ .{ .name = "netx", .module = netx_module }, .{ .name = "source", .module = source_module } },
+        .imports = &.{
+            .{ .name = "netx", .module = netx_module },
+            .{ .name = "source", .module = source_module },
+            .{ .name = "collector", .module = collector_module },
+        },
+    });
+
+    const testing_module = b.createModule(.{
+        .root_source_file = b.path("src/testing/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "metricity", .module = mod },
+        },
     });
 
     // Here we define an executable. An executable needs to have a root module
@@ -97,6 +120,8 @@ pub fn build(b: *std.Build) void {
                 // importing modules from different packages).
                 .{ .name = "metricity", .module = mod },
                 .{ .name = "netx", .module = netx_module },
+                .{ .name = "collector", .module = collector_module },
+                .{ .name = "testing", .module = testing_module },
             },
         }),
     });
@@ -174,7 +199,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/netx/udp.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "xev", .module = libxev_dep.module("xev") } },
+        .imports = &.{
+            .{ .name = "xev", .module = libxev_dep.module("xev") },
+        },
     });
     const netx_udp_tests = b.addTest(.{ .root_module = netx_udp_test_module });
     const run_netx_udp_tests = b.addRunArtifact(netx_udp_tests);
@@ -183,11 +210,12 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/netx/tcp.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "xev", .module = libxev_dep.module("xev") } },
+        .imports = &.{
+            .{ .name = "xev", .module = libxev_dep.module("xev") },
+        },
     });
     const netx_tcp_tests = b.addTest(.{ .root_module = netx_tcp_test_module });
     const run_netx_tcp_tests = b.addRunArtifact(netx_tcp_tests);
-
 
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will

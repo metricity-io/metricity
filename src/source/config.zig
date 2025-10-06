@@ -41,12 +41,16 @@ pub const SyslogConfig = struct {
     message_size_limit: usize = 64 * 1024,
     tcp_high_watermark: usize = 256 * 1024,
     tcp_low_watermark: usize = 128 * 1024,
+    allowed_peers: []const []const u8 = &[_][]const u8{},
+    rate_limit_per_sec: ?usize = null,
+    rate_limit_burst: ?usize = null,
 };
 
 pub const TomlValue = union(enum) {
     string: []const u8,
     integer: i64,
     bool: bool,
+    string_array: []const []const u8,
 };
 
 pub const TomlKeyValue = struct {
@@ -78,6 +82,14 @@ pub const TomlTable = struct {
         const value = self.get(key) orelse return null;
         return switch (value) {
             .integer => |n| n,
+            else => ParseError.InvalidType,
+        };
+    }
+
+    pub fn getStringArray(self: TomlTable, key: []const u8) ParseError!?[]const []const u8 {
+        const value = self.get(key) orelse return null;
+        return switch (value) {
+            .string_array => |entries| entries,
             else => ParseError.InvalidType,
         };
     }
@@ -132,6 +144,9 @@ pub fn parseSourceConfig(
                 "message_size_limit",
                 "tcp_high_watermark",
                 "tcp_low_watermark",
+                "allowed_peers",
+                "rate_limit_per_sec",
+                "rate_limit_burst",
             };
             try ensureKnownKeys(table.*, &allowed);
 
@@ -192,6 +207,26 @@ pub fn parseSourceConfig(
             }
 
             if (config.tcp_low_watermark > config.tcp_high_watermark) return ParseError.InvalidValue;
+
+            if (try table.getStringArray("allowed_peers")) |peers| {
+                config.allowed_peers = peers;
+            }
+
+            if (try table.getInteger("rate_limit_per_sec")) |rate_limit| {
+                if (rate_limit <= 0) return ParseError.InvalidValue;
+                const casted = std.math.cast(usize, rate_limit) orelse return ParseError.InvalidValue;
+                config.rate_limit_per_sec = casted;
+            }
+
+            if (try table.getInteger("rate_limit_burst")) |burst| {
+                if (burst <= 0) return ParseError.InvalidValue;
+                const casted = std.math.cast(usize, burst) orelse return ParseError.InvalidValue;
+                config.rate_limit_burst = casted;
+            }
+
+            if (config.rate_limit_burst != null and config.rate_limit_per_sec == null) {
+                return ParseError.InvalidValue;
+            }
 
             _ = allocator; // reserved for future allocations.
             return SourceConfig{

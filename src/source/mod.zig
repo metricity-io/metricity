@@ -2,8 +2,19 @@ const std = @import("std");
 
 pub const event = @import("event.zig");
 pub const config = @import("config.zig");
-pub const source = @import("source.zig");
-pub const SourceError = source.SourceError;
+pub const buffer = @import("buffer.zig");
+const source_impl = @import("source.zig");
+pub const source = source_impl;
+pub const SourceError = source_impl.SourceError;
+pub const SourceType = source_impl.SourceType;
+pub const SourceDescriptor = source_impl.SourceDescriptor;
+pub const Source = source_impl.Source;
+pub const SourceFactory = source_impl.SourceFactory;
+pub const InitContext = source_impl.InitContext;
+pub const Logger = source_impl.Logger;
+pub const Metrics = source_impl.Metrics;
+pub const Capabilities = source_impl.Capabilities;
+pub const Lifecycle = source_impl.Lifecycle;
 const syslog = @import("syslog.zig");
 
 const builtin_factories = &[_]source.SourceFactory{
@@ -35,7 +46,6 @@ pub const Registry = struct {
 pub fn status() []const u8 {
     return "source module initialized";
 }
-
 
 test "builtin registry exposes syslog factory" {
     const registry = Registry.builtin();

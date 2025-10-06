@@ -5,3 +5,4 @@ pub const semantics = @import("semantics.zig");
 pub const codegen = @import("codegen.zig");
 pub const formatter = @import("formatter.zig");
 pub const operators = @import("operators.zig");
+pub const runtime = @import("runtime.zig");
