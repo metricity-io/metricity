@@ -9,6 +9,7 @@ const console_sink = @import("../sink/console.zig");
 const event_mod = source_mod.event;
 const graph_mod = @import("graph.zig");
 const channel_mod = @import("channel.zig");
+const metrics_mod = @import("metrics.zig");
 
 const EventChannel = channel_mod.Channel(EventMessage);
 const SinkChannel = channel_mod.Channel(SinkMessage);
@@ -33,6 +34,7 @@ pub const Error = collector_mod.CollectorError || sql_mod.runtime.Error || sql_m
 pub const Options = struct {
     collector: collector_mod.CollectorOptions = .{},
     sink_builder: ?SinkBuilder = null,
+    metrics: ?*const source_mod.Metrics = null,
 };
 
 /// Callback used to materialise sinks for each configured sink node.
@@ -52,6 +54,7 @@ pub const Pipeline = struct {
     started: bool = false,
     shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     worker_allocator: std.mem.Allocator = std.heap.c_allocator,
+    metrics: metrics_mod.PipelineMetrics,
 
     /// Constructs the pipeline, materialising the collector, topology graph and node
     /// runtimes. No external side-effects (threads, IO) are triggered yet.
@@ -75,14 +78,15 @@ pub const Pipeline = struct {
         const nodes = try allocator.alloc(NodeRuntime, graph.nodes.len);
         errdefer allocator.free(nodes);
 
-        var pipeline = Pipeline{
-            .allocator = allocator,
-            .collector = collector,
-            .collector_configs = collector_configs,
-            .graph = graph,
-            .nodes = nodes,
-            .sink_builder = options.sink_builder orelse defaultSinkBuilder,
-        };
+    var pipeline = Pipeline{
+        .allocator = allocator,
+        .collector = collector,
+        .collector_configs = collector_configs,
+        .graph = graph,
+        .nodes = nodes,
+        .sink_builder = options.sink_builder orelse defaultSinkBuilder,
+        .metrics = metrics_mod.PipelineMetrics.init(options.metrics),
+    };
 
         try pipeline.buildSourceLookup();
         try pipeline.initNodes(cfg);
@@ -195,7 +199,7 @@ pub const Pipeline = struct {
         const events = batch.batch.events;
         const ack_token = batch.batch.ack;
 
-        const batch_ctx = try BatchContext.create(self.worker_allocator, ack_token, events.len);
+        const batch_ctx = try BatchContext.create(self.worker_allocator, &self.metrics, ack_token, events.len);
         errdefer batch_ctx.forceRelease();
 
         if (events.len == 0) {
@@ -239,7 +243,6 @@ pub const Pipeline = struct {
             },
             .sink => |*sink| {
                 var row = eventToRow(ctx.batchAllocator(), event) catch |err| {
-                    ctx.releaseFailure();
                     return err;
                 };
                 ctx.acquire();
@@ -348,10 +351,17 @@ const TransformRuntime = struct {
     arena: *std.heap.ArenaAllocator,
     program: sql_mod.runtime.Program,
     config: *const config_mod.TransformNode,
+    channel_metrics: metrics_mod.ChannelMetrics,
 
     fn init(pipeline: *Pipeline, config: *const config_mod.TransformNode) Error!TransformRuntime {
         const exec = config.executionSettings();
-        var channel = try EventChannel.init(pipeline.worker_allocator, exec.queue);
+        var channel_metrics = try pipeline.metrics.createChannelMetrics(
+            pipeline.allocator,
+            .{ .name = config.id(), .kind = .transform },
+        );
+        errdefer channel_metrics.deinit();
+
+        var channel = try EventChannel.init(pipeline.worker_allocator, exec.queue, channel_metrics.observer());
         errdefer channel.deinit();
 
         var arena = try pipeline.allocator.create(std.heap.ArenaAllocator);
@@ -379,6 +389,7 @@ const TransformRuntime = struct {
             .arena = arena,
             .program = program,
             .config = config,
+            .channel_metrics = channel_metrics,
         };
     }
 
@@ -420,6 +431,7 @@ const TransformRuntime = struct {
         pipeline.allocator.destroy(self.arena);
         self.channel.deinit();
         pipeline.allocator.free(self.workers);
+        self.channel_metrics.deinit();
     }
 };
 
@@ -495,10 +507,17 @@ const SinkRuntime = struct {
     workers: []SinkWorker,
     batch_capacity: usize,
     config: *const config_mod.SinkNode,
+    channel_metrics: metrics_mod.ChannelMetrics,
 
     fn init(pipeline: *Pipeline, config: *const config_mod.SinkNode) Error!SinkRuntime {
         const exec = config.executionSettings();
-        var channel = try SinkChannel.init(pipeline.worker_allocator, exec.queue);
+        var channel_metrics = try pipeline.metrics.createChannelMetrics(
+            pipeline.allocator,
+            .{ .name = config.id(), .kind = .sink },
+        );
+        errdefer channel_metrics.deinit();
+
+        var channel = try SinkChannel.init(pipeline.worker_allocator, exec.queue, channel_metrics.observer());
         errdefer channel.deinit();
 
         const workers = try pipeline.allocator.alloc(SinkWorker, exec.parallelism);
@@ -511,6 +530,7 @@ const SinkRuntime = struct {
             .workers = workers,
             .batch_capacity = computeBatchCapacity(exec.queue),
             .config = config,
+            .channel_metrics = channel_metrics,
         };
     }
 
@@ -551,6 +571,7 @@ const SinkRuntime = struct {
     fn deinit(self: *SinkRuntime, pipeline: *Pipeline) void {
         self.channel.deinit();
         pipeline.allocator.free(self.workers);
+        self.channel_metrics.deinit();
     }
 };
 
@@ -623,69 +644,57 @@ fn sinkWorkerMain(context: *SinkWorkerContext) void {
 
 fn retryPushEvent(channel: *EventChannel, pipeline: *Pipeline, message: *EventMessage) void {
     var local = message.*;
-    while (true) {
-        if (pipeline.shutting_down.load(atomic_order.seq_cst)) {
+    if (pipeline.shutting_down.load(atomic_order.seq_cst)) {
+        local.context.releaseFailure();
+        return;
+    }
+
+    const outcome = channel.pushBlocking(local) catch |err| switch (err) {
+        channel_mod.PushError.Closed => {
             local.context.releaseFailure();
             return;
-        }
-        const outcome = channel.push(local) catch |err| switch (err) {
-            channel_mod.PushError.WouldBlock => {
-                std.Thread.sleep(backoff_ns);
-                continue;
-            },
-            channel_mod.PushError.Closed => {
-                local.context.releaseFailure();
-                return;
-            },
-        };
+        },
+        channel_mod.PushError.WouldBlock => unreachable,
+    };
 
-        switch (outcome) {
-            .stored => return,
-            .dropped_newest => {
-                local.context.releaseFailure();
-                return;
-            },
-            .dropped_oldest => |evicted| {
-                evicted.context.releaseFailure();
-                continue;
-            },
-        }
+    switch (outcome) {
+        .stored => return,
+        .dropped_newest => {
+            local.context.releaseFailure();
+        },
+        .dropped_oldest => |evicted| {
+            evicted.context.releaseFailure();
+        },
     }
 }
 
 fn retryPushSink(channel: *SinkChannel, pipeline: *Pipeline, message: *SinkMessage) void {
     var local = message.*;
-    while (true) {
-        if (pipeline.shutting_down.load(atomic_order.seq_cst)) {
+    if (pipeline.shutting_down.load(atomic_order.seq_cst)) {
+        local.row.deinit();
+        local.context.releaseFailure();
+        return;
+    }
+
+    const outcome = channel.pushBlocking(local) catch |err| switch (err) {
+        channel_mod.PushError.Closed => {
             local.row.deinit();
             local.context.releaseFailure();
             return;
-        }
-        const outcome = channel.push(local) catch |err| switch (err) {
-            channel_mod.PushError.WouldBlock => {
-                std.Thread.sleep(backoff_ns);
-                continue;
-            },
-            channel_mod.PushError.Closed => {
-                local.row.deinit();
-                local.context.releaseFailure();
-                return;
-            },
-        };
+        },
+        channel_mod.PushError.WouldBlock => unreachable,
+    };
 
-        switch (outcome) {
-            .stored => return,
-            .dropped_newest => {
-                local.row.deinit();
-                local.context.releaseFailure();
-                return;
-            },
-            .dropped_oldest => |evicted| {
-                evicted.row.deinit();
-                evicted.context.releaseFailure();
-                continue;
-            },
-        }
+    switch (outcome) {
+        .stored => return,
+        .dropped_newest => {
+            local.row.deinit();
+            local.context.releaseFailure();
+        },
+        .dropped_oldest => |evicted| {
+            evicted.row.deinit();
+            evicted.context.releaseFailure();
+        },
     }
 }
 
@@ -696,8 +705,15 @@ const BatchContext = struct {
     ack: event_mod.AckToken,
     remaining: std.atomic.Value(usize),
     failed: std.atomic.Value(bool),
+    metrics: *const metrics_mod.PipelineMetrics,
+    start_time: i128,
 
-    fn create(allocator: std.mem.Allocator, ack: event_mod.AckToken, total_events: usize) !*BatchContext {
+    fn create(
+        allocator: std.mem.Allocator,
+        metrics: *const metrics_mod.PipelineMetrics,
+        ack: event_mod.AckToken,
+        total_events: usize,
+    ) !*BatchContext {
         const arena = try allocator.create(std.heap.ArenaAllocator);
         errdefer allocator.destroy(arena);
 
@@ -716,6 +732,8 @@ const BatchContext = struct {
             .ack = ack,
             .remaining = std.atomic.Value(usize).init(total_events),
             .failed = std.atomic.Value(bool).init(false),
+            .metrics = metrics,
+            .start_time = std.time.nanoTimestamp(),
         };
         return ctx;
     }
@@ -737,6 +755,18 @@ const BatchContext = struct {
                     _ = self.ack.success() catch {};
                 }
             }
+            const final_status: event_mod.AckStatus = if (self.failed.load(atomic_order.seq_cst) or !success)
+                event_mod.AckStatus.retryable_failure
+            else
+                event_mod.AckStatus.success;
+            const now = std.time.nanoTimestamp();
+            const raw_latency = now - self.start_time;
+            const latency_u64: u64 = if (raw_latency >= 0)
+                @intCast(raw_latency)
+            else
+                @intCast(-raw_latency);
+            self.metrics.recordAck(final_status);
+            self.metrics.recordAckLatency(latency_u64);
             self.destroy();
         }
     }
@@ -1086,4 +1116,196 @@ test "pipeline fan-out to multiple sinks" {
 
     try pipeline.shutdown();
     CountingSink.reset();
+}
+
+test "forwardEventToNode surfaces allocation failure without double release" {
+    const allocator = testing.allocator;
+
+    var pipeline = Pipeline{
+        .allocator = allocator,
+        .collector = undefined,
+        .collector_configs = &[_]source_cfg.SourceConfig{},
+        .graph = undefined,
+        .nodes = undefined,
+        .source_lookup = .{},
+        .sink_builder = defaultSinkBuilder,
+        .started = false,
+        .shutting_down = std.atomic.Value(bool).init(false),
+        .worker_allocator = allocator,
+        .metrics = metrics_mod.PipelineMetrics.init(null),
+    };
+
+    var nodes = [_]NodeRuntime{
+        .{
+            .kind = .sink,
+            .downstream = &[_]usize{},
+            .data = .{ .sink = undefined },
+        },
+    };
+    pipeline.nodes = &nodes;
+
+    const Recorder = struct {
+        status: ?event_mod.AckStatus = null,
+        calls: usize = 0,
+
+        fn complete(context: *anyopaque, status: event_mod.AckStatus) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.status = status;
+            self.calls += 1;
+        }
+    };
+
+    var recorder = Recorder{};
+    var handle = event_mod.AckHandle.init(&recorder, Recorder.complete);
+    const token = event_mod.AckToken.init(&handle);
+
+    var batch_ctx = try BatchContext.create(pipeline.worker_allocator, &pipeline.metrics, token, 1);
+    errdefer batch_ctx.forceRelease();
+
+    var fail_storage: [1]u8 = undefined;
+    var failing_allocator = std.heap.FixedBufferAllocator.init(fail_storage[0..0]);
+    batch_ctx.arena.deinit();
+    batch_ctx.arena.* = std.heap.ArenaAllocator.init(failing_allocator.allocator());
+    batch_ctx.thread_safe.* = .{ .child_allocator = batch_ctx.arena.allocator() };
+
+    var event_ctx = try EventContext.create(pipeline.worker_allocator, batch_ctx);
+
+    const event = event_mod.Event{
+        .metadata = .{},
+        .payload = .{ .log = .{ .message = "msg", .fields = &[_]event_mod.Field{} } },
+    };
+
+    try testing.expectError(error.OutOfMemory, pipeline.forwardEventToNode(0, &event, event_ctx));
+    event_ctx.releaseFailure();
+
+    try testing.expectEqual(@as(usize, 1), recorder.calls);
+    const status = recorder.status orelse unreachable;
+    try testing.expectEqual(event_mod.AckStatus.retryable_failure, status);
+}
+
+test "retryPushEvent treats drop_oldest as stored" {
+    const allocator = testing.allocator;
+
+    var pipeline = Pipeline{
+        .allocator = allocator,
+        .collector = undefined,
+        .collector_configs = &[_]source_cfg.SourceConfig{},
+        .graph = undefined,
+        .nodes = undefined,
+        .source_lookup = .{},
+        .sink_builder = defaultSinkBuilder,
+        .started = false,
+        .shutting_down = std.atomic.Value(bool).init(false),
+        .worker_allocator = allocator,
+        .metrics = metrics_mod.PipelineMetrics.init(null),
+    };
+
+    var channel = try EventChannel.init(allocator, .{ .capacity = 1, .strategy = .drop_oldest }, null);
+    defer channel.deinit();
+
+    const Recorder = struct {
+        status: ?event_mod.AckStatus = null,
+        calls: usize = 0,
+
+        fn complete(context: *anyopaque, status: event_mod.AckStatus) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.status = status;
+            self.calls += 1;
+        }
+    };
+
+    var recorder = Recorder{};
+    var handle = event_mod.AckHandle.init(&recorder, Recorder.complete);
+    const token = event_mod.AckToken.init(&handle);
+
+    var batch_ctx = try BatchContext.create(allocator, &pipeline.metrics, token, 2);
+    errdefer batch_ctx.forceRelease();
+
+    var ctx_old = try EventContext.create(allocator, batch_ctx);
+    errdefer ctx_old.releaseFailure();
+    var ctx_new = try EventContext.create(allocator, batch_ctx);
+    errdefer ctx_new.releaseFailure();
+
+    const event = event_mod.Event{
+        .metadata = .{},
+        .payload = .{ .log = .{ .message = "drop", .fields = &[_]event_mod.Field{} } },
+    };
+
+    ctx_old.acquire();
+    var message_old = EventMessage{ .event = &event, .context = ctx_old };
+    retryPushEvent(&channel, &pipeline, &message_old);
+
+    ctx_new.acquire();
+    var message_new = EventMessage{ .event = &event, .context = ctx_new };
+    retryPushEvent(&channel, &pipeline, &message_new);
+
+    const popped = channel.pop() orelse unreachable;
+    try testing.expect(popped.context == ctx_new);
+
+    popped.context.releaseSuccess();
+    ctx_old.releaseFailure();
+    ctx_new.releaseSuccess();
+
+    try testing.expectEqual(@as(usize, 1), recorder.calls);
+    const status = recorder.status orelse unreachable;
+    try testing.expectEqual(event_mod.AckStatus.retryable_failure, status);
+}
+
+test "batch context records ack metrics" {
+    const allocator = testing.allocator;
+
+    const Recorder = struct {
+        success: u64 = 0,
+        retryable: u64 = 0,
+        permanent: u64 = 0,
+        latency_total: u64 = 0,
+        latency_count: u64 = 0,
+
+        fn incr(context: *anyopaque, name: []const u8, value: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (std.mem.eql(u8, name, "pipeline_ack_success_total")) {
+                self.success += value;
+                return;
+            }
+            if (std.mem.eql(u8, name, "pipeline_ack_retryable_total")) {
+                self.retryable += value;
+                return;
+            }
+            if (std.mem.eql(u8, name, "pipeline_ack_permanent_total")) {
+                self.permanent += value;
+                return;
+            }
+            if (std.mem.eql(u8, name, "pipeline_ack_latency_ns_total")) {
+                self.latency_total += value;
+                return;
+            }
+            if (std.mem.eql(u8, name, "pipeline_ack_latency_events_total")) {
+                self.latency_count += value;
+                return;
+            }
+        }
+    };
+
+    var recorder = Recorder{};
+    const metrics_sink = source_mod.Metrics{
+        .context = &recorder,
+        .incr_counter_fn = Recorder.incr,
+        .record_gauge_fn = null,
+    };
+
+    var pipeline_metrics = metrics_mod.PipelineMetrics.init(&metrics_sink);
+
+    var success_ctx = try BatchContext.create(allocator, &pipeline_metrics, event_mod.AckToken.none(), 1);
+    std.Thread.sleep(1 * std.time.ns_per_ms);
+    success_ctx.complete(true);
+
+    var failure_ctx = try BatchContext.create(allocator, &pipeline_metrics, event_mod.AckToken.none(), 1);
+    std.Thread.sleep(1 * std.time.ns_per_ms);
+    failure_ctx.complete(false);
+
+    try testing.expectEqual(@as(u64, 1), recorder.success);
+    try testing.expectEqual(@as(u64, 1), recorder.retryable);
+    try testing.expectEqual(@as(u64, 0), recorder.permanent);
+    try testing.expectEqual(@as(u64, 2), recorder.latency_count);
+    try testing.expect(recorder.latency_total >= recorder.latency_count);
 }

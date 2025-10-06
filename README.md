@@ -62,8 +62,26 @@ body.
 The console sink prints each transformed row as a single JSON-like line to either STDOUT or STDERR.
 This makes it easy to inspect the pipeline output or redirect it for further processing.
 
+### Metrics
+
+When `pipeline.Options.metrics` is set to a `source.Metrics` sink, the pipeline exports the
+following telemetry:
+
+- `pipeline_channel_depth_<kind>_<node>` — queue depth gauge for each transform/sink channel.
+- `pipeline_channel_capacity_<kind>_<node>` — gauge with the configured channel capacity.
+- `pipeline_channel_drop_oldest_total_<kind>_<node>` — counter of events evicted under
+  `drop_oldest`.
+- `pipeline_channel_drop_newest_total_<kind>_<node>` — counter of events dropped under
+  `drop_newest`.
+- `pipeline_channel_push_block_ns_total_<kind>_<node>` — total nanoseconds producers spent
+  waiting for capacity.
+- `pipeline_channel_push_block_events_total_<kind>_<node>` — number of blocking occurrences.
+- `pipeline_ack_success_total`, `pipeline_ack_retryable_total`, `pipeline_ack_permanent_total` —
+  acknowledgement outcome counters.
+- `pipeline_ack_latency_ns_total` and `pipeline_ack_latency_events_total` — cumulative latency and
+  event count for batch acknowledgements.
+
 ## Signals and shutdown
 
 `metricity run` installs handlers for `SIGINT` and `SIGTERM`. Press `Ctrl+C` to stop the runtime
 gracefully; the collector and sinks are flushed before the process exits.
-
