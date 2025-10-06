@@ -81,6 +81,20 @@ pub const SourceHandle = struct {
     consecutive_empty_polls: usize = 0,
 };
 
+const PollStatus = enum {
+    idle,
+    yielded,
+    empty,
+    finished,
+    backpressure,
+};
+
+const PollResult = struct {
+    status: PollStatus,
+    batch: ?event.EventBatch = null,
+    attempted: bool,
+};
+
 /// Batch returned by the collector, pairing the originating descriptor with events
 /// and acknowledgement token.
 pub const PolledBatch = struct {
@@ -286,91 +300,24 @@ pub const Collector = struct {
             }
             handle.ready_skip_count = 0;
 
-            var attempted_poll = false;
+            const result = try self.tryPoll(handle, allocator);
 
-            if (handle.stream) |*stream_handle| {
-                attempted_poll = true;
-                const batch = stream_handle.next(allocator) catch |err| switch (err) {
-                    error.EndOfStream => stream_done: {
-                        stream_handle.finish(allocator);
-                        handle.stream = null;
-                        logInfo(self.options, "collector stream finished for {s}", .{handle.descriptor.name});
-                        break :stream_done null;
-                    },
-                    error.Backpressure => {
-                        recordBackpressure(self);
-                        logWarn(
-                            self.options,
-                            "collector stream backpressure for {s}",
-                            .{handle.descriptor.name},
-                        );
-                        return CollectorError.Backpressure;
-                    },
-                    error.TransportFailure, error.DecodeFailure => {
-                        recordPollError(self);
-                        logError(
-                            self.options,
-                            "collector stream failure for {s}: {s}",
-                            .{ handle.descriptor.name, @errorName(err) },
-                        );
-                        return CollectorError.PollFailed;
-                    },
-                };
-
-                if (batch) |value| {
+            switch (result.status) {
+                .yielded => {
+                    const batch = result.batch orelse unreachable;
                     handle.consecutive_empty_polls = 0;
-                    recordBatchMetrics(self, value.events.len);
+                    recordBatchMetrics(self, batch.events.len);
                     self.next_index = (index + 1) % total;
                     return PolledBatch{
                         .descriptor = handle.descriptor,
-                        .batch = value,
+                        .batch = batch,
                     };
-                }
+                },
+                .backpressure => return CollectorError.Backpressure,
+                else => {},
             }
 
-            if (handle.supports_batching) {
-                attempted_poll = true;
-                const batch = handle.instance.pollBatch(allocator) catch |err| switch (err) {
-                    source.SourceError.Backpressure => {
-                        recordBackpressure(self);
-                        logWarn(
-                            self.options,
-                            "collector batch backpressure for {s}",
-                            .{handle.descriptor.name},
-                        );
-                        return CollectorError.Backpressure;
-                    },
-                    source.SourceError.OperationNotSupported => {
-                        logError(
-                            self.options,
-                            "collector invalid configuration: batch polling unsupported for {s}",
-                            .{handle.descriptor.name},
-                        );
-                        return CollectorError.InvalidConfiguration;
-                    },
-                    else => {
-                        recordPollError(self);
-                        logError(
-                            self.options,
-                            "collector batch failure for {s}: {s}",
-                            .{ handle.descriptor.name, @errorName(err) },
-                        );
-                        return CollectorError.PollFailed;
-                    },
-                };
-
-                if (batch) |value| {
-                    handle.consecutive_empty_polls = 0;
-                    recordBatchMetrics(self, value.events.len);
-                    self.next_index = (index + 1) % total;
-                    return PolledBatch{
-                        .descriptor = handle.descriptor,
-                        .batch = value,
-                    };
-                }
-            }
-
-            if (attempted_poll) {
+            if (result.attempted and result.status != .yielded and result.status != .backpressure) {
                 if (handle.consecutive_empty_polls < math.maxInt(usize)) {
                     handle.consecutive_empty_polls += 1;
                 }
@@ -382,6 +329,82 @@ pub const Collector = struct {
 
         self.next_index = index;
         return null;
+    }
+
+    fn tryPoll(self: *Collector, handle: *SourceHandle, allocator: std.mem.Allocator) CollectorError!PollResult {
+        if (handle.stream) |*stream_handle| {
+            const batch = stream_handle.next(allocator) catch |err| switch (err) {
+                error.EndOfStream => {
+                    stream_handle.finish(allocator);
+                    handle.stream = null;
+                    logInfo(self.options, "collector stream finished for {s}", .{handle.descriptor.name});
+                    return PollResult{ .status = .finished, .batch = null, .attempted = true };
+                },
+                error.Backpressure => {
+                    recordBackpressure(self);
+                    logWarn(
+                        self.options,
+                        "collector stream backpressure for {s}",
+                        .{handle.descriptor.name},
+                    );
+                    return PollResult{ .status = .backpressure, .batch = null, .attempted = true };
+                },
+                error.TransportFailure, error.DecodeFailure => {
+                    recordPollError(self);
+                    logError(
+                        self.options,
+                        "collector stream failure for {s}: {s}",
+                        .{ handle.descriptor.name, @errorName(err) },
+                    );
+                    return CollectorError.PollFailed;
+                },
+            };
+
+            if (batch) |value| {
+                return PollResult{ .status = .yielded, .batch = value, .attempted = true };
+            }
+
+            return PollResult{ .status = .empty, .batch = null, .attempted = true };
+        }
+
+        if (handle.supports_batching) {
+            const batch = handle.instance.pollBatch(allocator) catch |err| switch (err) {
+                source.SourceError.Backpressure => {
+                    recordBackpressure(self);
+                    logWarn(
+                        self.options,
+                        "collector batch backpressure for {s}",
+                        .{handle.descriptor.name},
+                    );
+                    return PollResult{ .status = .backpressure, .batch = null, .attempted = true };
+                },
+                source.SourceError.OperationNotSupported => {
+                    logError(
+                        self.options,
+                        "collector invalid configuration: batch polling unsupported for {s}",
+                        .{handle.descriptor.name},
+                    );
+                    return CollectorError.InvalidConfiguration;
+                },
+                else => {
+                    recordPollError(self);
+                    logError(
+                        self.options,
+                        "collector batch failure for {s}: {s}",
+                        .{ handle.descriptor.name, @errorName(err) },
+                    );
+                    return CollectorError.PollFailed;
+                },
+            };
+
+            if (batch) |value| {
+                return PollResult{ .status = .yielded, .batch = value, .attempted = true };
+            }
+
+            return PollResult{ .status = .empty, .batch = null, .attempted = true };
+        }
+
+        return PollResult{ .status = .idle, .batch = null, .attempted = false };
     }
 
     /// Shuts down all sources and resets collector bookkeeping.
@@ -880,4 +903,271 @@ test "collector forces poll after exhausting ready hint budget" {
 
     try collector.shutdown(testing.allocator);
     try testing.expectEqual(@as(usize, 1), source_harness.shutdowns);
+}
+
+test "collector surfaces stream backpressure error" {
+    const testing = std.testing;
+
+    const MetricsHarness = struct {
+        backpressure: usize = 0,
+
+        fn incrCounter(context: *anyopaque, name: []const u8, value: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (std.mem.eql(u8, name, collector_metrics.backpressure)) {
+                self.backpressure += @as(usize, @intCast(value));
+            }
+        }
+    };
+
+    const Mock = struct {
+        pub const Harness = struct {
+            shutdowns: usize = 0,
+            finish_calls: usize = 0,
+            next_calls: usize = 0,
+        };
+
+        pub var harness: ?*Harness = null;
+
+        const State = struct {
+            allocator: std.mem.Allocator,
+            descriptor: source.SourceDescriptor,
+            harness: *Harness,
+        };
+
+        pub fn factory() source.SourceFactory {
+            return .{ .type = .syslog, .create = create };
+        }
+
+        fn create(ctx: source.InitContext, config: *const cfg.SourceConfig) source.SourceError!source.Source {
+            const h = harness orelse return source.SourceError.InvalidConfiguration;
+
+            const descriptor = source.SourceDescriptor{
+                .type = .syslog,
+                .name = config.id,
+            };
+
+            const state = ctx.allocator.create(State) catch return source.SourceError.StartupFailed;
+            state.* = .{
+                .allocator = ctx.allocator,
+                .descriptor = descriptor,
+                .harness = h,
+            };
+
+            return source.Source{
+                .descriptor = descriptor,
+                .capabilities = .{ .streaming = true, .batching = false },
+                .lifecycle = .{
+                    .start_stream = startStream,
+                    .poll_batch = null,
+                    .shutdown = shutdown,
+                    .ready_hint = readyHint,
+                },
+                .context = state,
+            };
+        }
+
+        fn asState(ptr: *anyopaque) *State {
+            const aligned: *align(@alignOf(State)) anyopaque = @alignCast(ptr);
+            return @ptrCast(aligned);
+        }
+
+        fn startStream(context: *anyopaque, allocator: std.mem.Allocator) source.SourceError!?event.EventStream {
+            const state = asState(context);
+            _ = allocator;
+            return event.EventStream{
+                .context = state,
+                .next_fn = streamNext,
+                .finish_fn = streamFinish,
+            };
+        }
+
+        fn streamNext(context: *anyopaque, allocator: std.mem.Allocator) event.StreamError!?event.EventBatch {
+            _ = allocator;
+            const state = asState(context);
+            state.harness.next_calls += 1;
+            return error.Backpressure;
+        }
+
+        fn streamFinish(context: *anyopaque, allocator: std.mem.Allocator) void {
+            _ = allocator;
+            const state = asState(context);
+            state.harness.finish_calls += 1;
+        }
+
+        fn shutdown(context: *anyopaque, allocator: std.mem.Allocator) void {
+            const state = asState(context);
+            state.harness.shutdowns += 1;
+            state.allocator.destroy(state);
+            _ = allocator;
+        }
+
+        fn readyHint(context: *anyopaque) bool {
+            _ = context;
+            return true;
+        }
+    };
+
+    var source_harness = Mock.Harness{};
+    Mock.harness = &source_harness;
+    defer Mock.harness = null;
+
+    var metrics_harness = MetricsHarness{};
+    var metrics_impl = source.Metrics{
+        .context = &metrics_harness,
+        .incr_counter_fn = MetricsHarness.incrCounter,
+        .record_gauge_fn = null,
+    };
+
+    const config = cfg.SourceConfig{
+        .id = "stream_backpressure",
+        .payload = .{ .syslog = cfg.SyslogConfig{ .address = "127.0.0.1:514" } },
+    };
+
+    const registry = source.Registry{ .factories = &[_]source.SourceFactory{Mock.factory()} };
+    const options = CollectorOptions{ .registry = registry, .metrics = &metrics_impl };
+
+    var collector = try Collector.init(testing.allocator, &.{config}, options);
+    defer collector.deinit();
+
+    try collector.start(testing.allocator);
+
+    try testing.expectError(CollectorError.Backpressure, collector.poll(testing.allocator));
+    try testing.expectEqual(@as(usize, 1), metrics_harness.backpressure);
+    try testing.expectEqual(@as(usize, 0), source_harness.finish_calls);
+    try testing.expectEqual(@as(usize, 1), source_harness.next_calls);
+
+    try collector.shutdown(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), source_harness.shutdowns);
+}
+
+test "collector releases stream after end of stream" {
+    const testing = std.testing;
+
+    const Mock = struct {
+        pub const Harness = struct {
+            finish_calls: usize = 0,
+            shutdowns: usize = 0,
+        };
+
+        pub var harness: ?*Harness = null;
+
+        const State = struct {
+            allocator: std.mem.Allocator,
+            descriptor: source.SourceDescriptor,
+            harness: *Harness,
+            emitted: bool = false,
+            event_storage: [1]event.Event,
+        };
+
+        pub fn factory() source.SourceFactory {
+            return .{ .type = .syslog, .create = create };
+        }
+
+        fn create(ctx: source.InitContext, config: *const cfg.SourceConfig) source.SourceError!source.Source {
+            const h = harness orelse return source.SourceError.InvalidConfiguration;
+
+            const descriptor = source.SourceDescriptor{
+                .type = .syslog,
+                .name = config.id,
+            };
+
+            const state = ctx.allocator.create(State) catch return source.SourceError.StartupFailed;
+            state.* = .{
+                .allocator = ctx.allocator,
+                .descriptor = descriptor,
+                .harness = h,
+                .event_storage = .{event.Event{
+                    .metadata = .{ .source_id = config.id },
+                    .payload = .{ .log = .{ .message = "payload", .fields = &[_]event.Field{} } },
+                }},
+            };
+
+            return source.Source{
+                .descriptor = descriptor,
+                .capabilities = .{ .streaming = true, .batching = false },
+                .lifecycle = .{
+                    .start_stream = startStream,
+                    .poll_batch = null,
+                    .shutdown = shutdown,
+                    .ready_hint = readyHint,
+                },
+                .context = state,
+            };
+        }
+
+        fn asState(ptr: *anyopaque) *State {
+            const aligned: *align(@alignOf(State)) anyopaque = @alignCast(ptr);
+            return @ptrCast(aligned);
+        }
+
+        fn startStream(context: *anyopaque, allocator: std.mem.Allocator) source.SourceError!?event.EventStream {
+            const state = asState(context);
+            _ = allocator;
+            return event.EventStream{
+                .context = state,
+                .next_fn = streamNext,
+                .finish_fn = streamFinish,
+            };
+        }
+
+        fn streamNext(context: *anyopaque, allocator: std.mem.Allocator) event.StreamError!?event.EventBatch {
+            _ = allocator;
+            const state = asState(context);
+            if (state.emitted) {
+                return error.EndOfStream;
+            }
+            state.emitted = true;
+            return event.EventBatch{
+                .events = state.event_storage[0..1],
+                .ack = event.AckToken.none(),
+            };
+        }
+
+        fn streamFinish(context: *anyopaque, allocator: std.mem.Allocator) void {
+            _ = allocator;
+            const state = asState(context);
+            state.harness.finish_calls += 1;
+        }
+
+        fn shutdown(context: *anyopaque, allocator: std.mem.Allocator) void {
+            const state = asState(context);
+            state.harness.shutdowns += 1;
+            state.allocator.destroy(state);
+            _ = allocator;
+        }
+
+        fn readyHint(context: *anyopaque) bool {
+            _ = context;
+            return true;
+        }
+    };
+
+    var harness = Mock.Harness{};
+    Mock.harness = &harness;
+    defer Mock.harness = null;
+
+    const config = cfg.SourceConfig{
+        .id = "stream_end",
+        .payload = .{ .syslog = cfg.SyslogConfig{ .address = "127.0.0.1:514" } },
+    };
+
+    const registry = source.Registry{ .factories = &[_]source.SourceFactory{Mock.factory()} };
+    const options = CollectorOptions{ .registry = registry };
+
+    var collector = try Collector.init(testing.allocator, &.{config}, options);
+    defer collector.deinit();
+
+    try collector.start(testing.allocator);
+
+    const first = try collector.poll(testing.allocator);
+    try testing.expect(first != null);
+    try testing.expectEqual(@as(usize, 1), collector.status().streaming_sources);
+
+    const second = try collector.poll(testing.allocator);
+    try testing.expect(second == null);
+    try testing.expectEqual(@as(usize, 0), collector.status().streaming_sources);
+    try testing.expectEqual(@as(usize, 1), harness.finish_calls);
+
+    try collector.shutdown(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), harness.shutdowns);
 }
