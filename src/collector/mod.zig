@@ -20,12 +20,37 @@ pub const CollectorError = error{
     Unimplemented,
 };
 
+const Clock = struct {
+    context: ?*anyopaque = null,
+    now_fn: *const fn (context: ?*anyopaque) u128,
+
+    pub fn monotonic() Clock {
+        return .{ .context = null, .now_fn = defaultNow };
+    }
+
+    pub fn now(self: Clock) u128 {
+        return self.now_fn(self.context);
+    }
+
+    fn defaultNow(_: ?*anyopaque) u128 {
+        const value = std.time.nanoTimestamp();
+        if (value <= 0) return 0;
+        return @as(u128, @intCast(value));
+    }
+};
+
+pub const RestartOptions = struct {
+    clock: ?Clock = null,
+    rng_seed: ?u64 = null,
+};
+
 /// Customisation hooks allowing embedders to provide alternative source registry,
 /// logging and metrics plumbing.
 pub const CollectorOptions = struct {
     registry: source.Registry = source.Registry.builtin(),
     log: ?*const source.Logger = null,
     metrics: ?*const source.Metrics = null,
+    restart: RestartOptions = .{},
 };
 
 /// Metric identifiers emitted by the collector when metrics plumbing is enabled.
@@ -35,11 +60,102 @@ const collector_metrics = struct {
     const poll_errors = "collector_poll_errors_total";
     const backpressure = "collector_backpressure_total";
     const active_sources = "collector_active_sources";
+    const failed_sources = "collector_failed_sources";
     const ready_skips = "collector_ready_skips_total";
     const empty_polls = "collector_empty_polls_total";
+    const restart_failures = "collector_restart_failures_total";
+    const restart_quarantine = "collector_restart_quarantine";
 };
 
 const max_ready_skip_cycles: usize = 8;
+
+const FailurePermanence = enum { transient, permanent };
+
+const FailureSeverity = enum { warn, err };
+
+const FailureKind = enum {
+    start_invalid_configuration,
+    start_unsupported,
+    start_not_implemented,
+    start_startup_failed,
+    start_backpressure,
+    start_unknown,
+    poll_transport_failure,
+    poll_decode_failure,
+    poll_invalid_configuration,
+    poll_backpressure,
+    poll_unknown,
+};
+
+const LifecycleFailure = struct {
+    collector_error: CollectorError,
+    permanence: FailurePermanence,
+    restartable: bool,
+    severity: FailureSeverity,
+    kind: FailureKind,
+};
+
+const BackoffJitter = enum { full, plusminus, decorrelated };
+
+const BackoffPolicy = struct {
+    min_ns: u64,
+    max_ns: u64,
+    multiplier_num: u32,
+    multiplier_den: u32,
+    jitter: BackoffJitter,
+    jitter_ratio_ppm: u32 = 0,
+};
+
+const BackoffState = struct {
+    current_ns: u64 = 0,
+    prev_ns: u64 = 0,
+    resume_at_ns: u128 = 0,
+    attempts: u32 = 0,
+};
+
+const FailureBudgetPolicy = struct {
+    window_ns: u64,
+    limit: u8,
+    hold_ns: u64,
+};
+
+const max_tracked_failures: u8 = 16;
+const failure_ring_capacity: usize = max_tracked_failures;
+
+const FailureBudgetState = struct {
+    entries: [max_tracked_failures]u128 = undefined,
+    head: u8 = 0,
+    count: u8 = 0,
+    hold_until_ns: u128 = 0,
+};
+
+const RestartPolicy = struct {
+    backoff: BackoffPolicy,
+    budget: FailureBudgetPolicy,
+};
+
+const RestartState = struct {
+    backoff: BackoffState = .{},
+    budget: FailureBudgetState = .{},
+    pending_restart: bool = false,
+    last_failure_kind: ?FailureKind = null,
+    last_failure_permanence: ?FailurePermanence = null,
+};
+
+const syslog_restart_policy = RestartPolicy{
+    .backoff = .{
+        .min_ns = 500 * std.time.ns_per_ms,
+        .max_ns = 30 * std.time.ns_per_s,
+        .multiplier_num = 18,
+        .multiplier_den = 10,
+        .jitter = .full,
+    },
+    .budget = .{
+        .window_ns = 60 * std.time.ns_per_s,
+        .limit = 8,
+        .hold_ns = 60 * std.time.ns_per_s,
+    },
+};
 
 /// Structured logging helper used for informational messages.
 fn logInfo(options: CollectorOptions, comptime fmt: []const u8, args: anytype) void {
@@ -63,6 +179,23 @@ fn logError(options: CollectorOptions, comptime fmt: []const u8, args: anytype) 
     }
 }
 
+fn logFailure(
+    options: CollectorOptions,
+    severity: FailureSeverity,
+    permanence: FailurePermanence,
+    comptime fmt: []const u8,
+    args: anytype,
+) void {
+    if (options.log) |logger| {
+        const message = "[permanence={s}] " ++ fmt;
+        const prefixed_args = .{@tagName(permanence)} ++ args;
+        switch (severity) {
+            .warn => logger.warnf(message, prefixed_args),
+            .err => logger.errorf(message, prefixed_args),
+        }
+    }
+}
+
 /// Convenience helper for incrementing numeric metrics.
 fn recordCounter(options: CollectorOptions, name: []const u8, value: u64) void {
     if (options.metrics) |metrics_sink| {
@@ -79,6 +212,8 @@ pub const SourceHandle = struct {
     shutting_down: bool = false,
     ready_skip_count: usize = 0,
     consecutive_empty_polls: usize = 0,
+    restart_policy: RestartPolicy,
+    restart_state: RestartState = .{},
 };
 
 const PollStatus = enum {
@@ -116,6 +251,8 @@ pub const Collector = struct {
     allocator: std.mem.Allocator,
     runtime: netx.runtime.IoRuntime,
     options: CollectorOptions,
+    clock: Clock,
+    prng: std.Random.DefaultPrng,
     sources: std.ArrayListUnmanaged(SourceHandle) = .{},
     next_index: usize = 0,
     started: bool = false,
@@ -131,10 +268,16 @@ pub const Collector = struct {
             .allocator = allocator,
             .runtime = undefined,
             .options = options,
+            .clock = options.restart.clock orelse Clock.monotonic(),
+            .prng = undefined,
             .sources = .{},
             .next_index = 0,
             .started = false,
         };
+
+        const seed_salt = @intFromPtr(&collector);
+        const seed = options.restart.rng_seed orelse deriveSeed(collector.clock, seed_salt);
+        collector.prng = std.Random.DefaultPrng.init(seed);
 
         collector.runtime = netx.runtime.IoRuntime.initDefault() catch {
             return CollectorError.InitializationFailed;
@@ -170,6 +313,7 @@ pub const Collector = struct {
                 .stream = null,
                 .supports_batching = instance.lifecycle.poll_batch != null,
                 .shutting_down = false,
+                .restart_policy = selectRestartPolicy(instance.descriptor),
             };
 
             collector.sources.append(allocator, handle) catch {
@@ -193,10 +337,13 @@ pub const Collector = struct {
     pub fn start(self: *Collector, allocator: std.mem.Allocator) CollectorError!void {
         if (self.started) return;
 
+        var fatal_error: ?CollectorError = null;
+
         for (self.sources.items) |*handle| {
             if (handle.shutting_down) {
                 logError(self.options, "collector start aborted: source {s} already shutdown", .{handle.descriptor.name});
-                return CollectorError.StartFailed;
+                if (fatal_error == null) fatal_error = CollectorError.StartFailed;
+                continue;
             }
 
             const capabilities = handle.instance.capabilities;
@@ -206,17 +353,47 @@ pub const Collector = struct {
                     "collector start aborted: source {s} exposes neither streaming nor batching",
                     .{handle.descriptor.name},
                 );
-                return CollectorError.InvalidConfiguration;
+                handle.shutting_down = true;
+                if (fatal_error == null) fatal_error = CollectorError.InvalidConfiguration;
+                continue;
             }
 
             handle.stream = null;
             if (capabilities.streaming) {
-                const maybe_stream = handle.instance.startStream(allocator) catch |err| {
-                    return mapStartError(self, handle.descriptor, err);
+                var start_failed = false;
+                const maybe_stream = handle.instance.startStream(allocator) catch |err| blk: {
+                    start_failed = true;
+                    const failure = classifyStartError(err);
+                    if (failure.kind == .start_backpressure) {
+                        recordBackpressure(self);
+                    }
+                    logFailure(
+                        self.options,
+                        failure.severity,
+                        failure.permanence,
+                        "collector start failure for {s}: {s}",
+                        .{ handle.descriptor.name, @errorName(err) },
+                    );
+
+                    const now = self.clock.now();
+                    if (failure.restartable and failure.permanence == .transient) {
+                        self.handleTransientFailure(handle, failure, now);
+                    } else {
+                        self.handlePermanentFailure(handle, failure);
+                    }
+
+                    if (failure.permanence == .permanent or failure.collector_error == CollectorError.Backpressure) {
+                        if (fatal_error == null) fatal_error = failure.collector_error;
+                    }
+
+                    break :blk null;
                 };
+
+                if (start_failed) continue;
 
                 if (maybe_stream) |stream| {
                     handle.stream = stream;
+                    observeSuccess(&handle.restart_state);
                     logInfo(self.options, "collector started stream for {s}", .{handle.descriptor.name});
                 } else if (!handle.supports_batching) {
                     logError(
@@ -224,8 +401,9 @@ pub const Collector = struct {
                         "collector start aborted: source {s} did not expose stream",
                         .{handle.descriptor.name},
                     );
-                    return CollectorError.StartFailed;
+                    if (fatal_error == null) fatal_error = CollectorError.StartFailed;
                 } else {
+                    observeSuccess(&handle.restart_state);
                     logInfo(
                         self.options,
                         "collector using batch polling for {s}",
@@ -233,13 +411,19 @@ pub const Collector = struct {
                     );
                 }
             } else if (handle.supports_batching) {
+                observeSuccess(&handle.restart_state);
                 logInfo(self.options, "collector using batch-only mode for {s}", .{handle.descriptor.name});
             }
         }
 
+        self.refreshQuarantineGauge();
+        updateActiveSourcesGauge(self);
+        if (fatal_error) |err| {
+            return err;
+        }
+
         self.started = true;
         self.next_index = 0;
-        updateActiveSourcesGauge(self);
         logInfo(self.options, "collector started ({d} sources)", .{self.sources.items.len});
     }
 
@@ -262,6 +446,120 @@ pub const Collector = struct {
         };
     }
 
+    fn nextRandom(self: *Collector) u64 {
+        return self.prng.random().int(u64);
+    }
+
+    fn handleTransientFailure(
+        self: *Collector,
+        handle: *SourceHandle,
+        failure: LifecycleFailure,
+        now: u128,
+    ) void {
+        noteFailure(&handle.restart_state, failure);
+        _ = recordFailureEvent(&handle.restart_state.budget, handle.restart_policy.budget, now);
+        scheduleRestart(&handle.restart_state, handle.restart_policy, now, self.nextRandom());
+        recordCounter(self.options, collector_metrics.restart_failures, 1);
+        self.refreshQuarantineGauge();
+    }
+
+    fn handlePermanentFailure(self: *Collector, handle: *SourceHandle, failure: LifecycleFailure) void {
+        noteFailure(&handle.restart_state, failure);
+        handle.restart_state.pending_restart = false;
+        handle.shutting_down = true;
+        recordCounter(self.options, collector_metrics.restart_failures, 1);
+        updateActiveSourcesGauge(self);
+        self.refreshQuarantineGauge();
+    }
+
+    fn refreshQuarantineGauge(self: *Collector) void {
+        if (self.options.metrics) |metrics_sink| {
+            const now = self.clock.now();
+            var quarantined: usize = 0;
+            for (self.sources.items) |handle| {
+                if (isUnderQuarantine(&handle.restart_state.budget, now)) quarantined += 1;
+            }
+            if (math.cast(i64, quarantined)) |value| {
+                metrics_sink.recordGauge(collector_metrics.restart_quarantine, value);
+            }
+        }
+    }
+
+    fn attemptHandleRestart(
+        self: *Collector,
+        handle: *SourceHandle,
+        allocator: std.mem.Allocator,
+        now: u128,
+    ) void {
+        if (!handle.instance.capabilities.streaming) {
+            observeSuccess(&handle.restart_state);
+            handle.restart_state.pending_restart = false;
+            self.refreshQuarantineGauge();
+            return;
+        }
+
+        if (handle.stream) |*stream_handle| {
+            stream_handle.finish(allocator);
+            handle.stream = null;
+        }
+
+        var restart_failed = false;
+        const maybe_stream = handle.instance.startStream(allocator) catch |err| {
+            restart_failed = true;
+            const failure = classifyStartError(err);
+            if (failure.kind == .start_backpressure) {
+                recordBackpressure(self);
+            }
+            logFailure(
+                self.options,
+                failure.severity,
+                failure.permanence,
+                "collector restart failure for {s}: {s}",
+                .{ handle.descriptor.name, @errorName(err) },
+            );
+
+            if (failure.restartable and failure.permanence == .transient) {
+                self.handleTransientFailure(handle, failure, now);
+            } else {
+                self.handlePermanentFailure(handle, failure);
+            }
+
+            return;
+        };
+
+        if (restart_failed) return;
+
+        if (maybe_stream) |stream| {
+            handle.stream = stream;
+            observeSuccess(&handle.restart_state);
+            handle.restart_state.pending_restart = false;
+            self.refreshQuarantineGauge();
+            logInfo(self.options, "collector restarted stream for {s}", .{handle.descriptor.name});
+            return;
+        }
+
+        if (!handle.supports_batching) {
+            logError(
+                self.options,
+                "collector restart aborted: source {s} did not expose stream",
+                .{handle.descriptor.name},
+            );
+            self.handlePermanentFailure(handle, .{
+                .collector_error = CollectorError.StartFailed,
+                .permanence = .permanent,
+                .restartable = false,
+                .severity = .err,
+                .kind = .start_unknown,
+            });
+            return;
+        }
+
+        observeSuccess(&handle.restart_state);
+        handle.restart_state.pending_restart = false;
+        self.refreshQuarantineGauge();
+        logInfo(self.options, "collector restart using batch polling for {s}", .{handle.descriptor.name});
+    }
+
     /// Attempts to fetch the next available batch from any active source. The
     /// round-robin schedule is preserved across calls.
     pub fn poll(self: *Collector, allocator: std.mem.Allocator) CollectorError!?PolledBatch {
@@ -269,6 +567,8 @@ pub const Collector = struct {
 
         const total = self.sources.items.len;
         if (total == 0) return null;
+
+        self.refreshQuarantineGauge();
 
         var index = if (self.next_index < total) self.next_index else 0;
         var examined: usize = 0;
@@ -279,6 +579,23 @@ pub const Collector = struct {
             if (handle.shutting_down) {
                 index = (index + 1) % total;
                 continue;
+            }
+
+            const now = self.clock.now();
+
+            if (isUnderQuarantine(&handle.restart_state.budget, now)) {
+                index = (index + 1) % total;
+                continue;
+            }
+
+            if (handle.restart_state.pending_restart) {
+                if (now >= handle.restart_state.backoff.resume_at_ns) {
+                    self.attemptHandleRestart(handle, allocator, now);
+                }
+                if (handle.restart_state.pending_restart) {
+                    index = (index + 1) % total;
+                    continue;
+                }
             }
 
             const ready = handle.instance.readyHint();
@@ -300,7 +617,7 @@ pub const Collector = struct {
             }
             handle.ready_skip_count = 0;
 
-            const result = try self.tryPoll(handle, allocator);
+            const result = try self.tryPoll(handle, allocator, now);
 
             switch (result.status) {
                 .yielded => {
@@ -331,36 +648,69 @@ pub const Collector = struct {
         return null;
     }
 
-    fn tryPoll(self: *Collector, handle: *SourceHandle, allocator: std.mem.Allocator) CollectorError!PollResult {
+    fn tryPoll(
+        self: *Collector,
+        handle: *SourceHandle,
+        allocator: std.mem.Allocator,
+        now: u128,
+    ) CollectorError!PollResult {
         if (handle.stream) |*stream_handle| {
             const batch = stream_handle.next(allocator) catch |err| switch (err) {
                 error.EndOfStream => {
                     stream_handle.finish(allocator);
                     handle.stream = null;
+                    observeSuccess(&handle.restart_state);
+                    self.refreshQuarantineGauge();
                     logInfo(self.options, "collector stream finished for {s}", .{handle.descriptor.name});
                     return PollResult{ .status = .finished, .batch = null, .attempted = true };
                 },
-                error.Backpressure => {
-                    recordBackpressure(self);
-                    logWarn(
-                        self.options,
-                        "collector stream backpressure for {s}",
-                        .{handle.descriptor.name},
-                    );
-                    return PollResult{ .status = .backpressure, .batch = null, .attempted = true };
-                },
-                error.TransportFailure, error.DecodeFailure => {
-                    recordPollError(self);
-                    logError(
-                        self.options,
-                        "collector stream failure for {s}: {s}",
-                        .{ handle.descriptor.name, @errorName(err) },
-                    );
-                    return CollectorError.PollFailed;
+                else => {
+                    const failure = classifyStreamPollError(err);
+                    switch (failure.kind) {
+                        .poll_backpressure => {
+                            recordBackpressure(self);
+                            logFailure(
+                                self.options,
+                                failure.severity,
+                                failure.permanence,
+                                "collector stream backpressure for {s}",
+                                .{handle.descriptor.name},
+                            );
+                            return PollResult{ .status = .backpressure, .batch = null, .attempted = true };
+                        },
+                        else => {
+                            recordPollError(self);
+                            logFailure(
+                                self.options,
+                                failure.severity,
+                                failure.permanence,
+                                "collector stream failure for {s}: {s}",
+                                .{ handle.descriptor.name, @errorName(err) },
+                            );
+
+                            if (failure.restartable and failure.permanence == .transient) {
+                                stream_handle.finish(allocator);
+                                handle.stream = null;
+                                self.handleTransientFailure(handle, failure, now);
+                                return PollResult{ .status = .idle, .batch = null, .attempted = false };
+                            }
+
+                            if (failure.permanence == .permanent) {
+                                stream_handle.finish(allocator);
+                                handle.stream = null;
+                                self.handlePermanentFailure(handle, failure);
+                                return failure.collector_error;
+                            }
+
+                            return PollResult{ .status = .idle, .batch = null, .attempted = false };
+                        },
+                    }
                 },
             };
 
             if (batch) |value| {
+                observeSuccess(&handle.restart_state);
+                self.refreshQuarantineGauge();
                 return PollResult{ .status = .yielded, .batch = value, .attempted = true };
             }
 
@@ -368,36 +718,59 @@ pub const Collector = struct {
         }
 
         if (handle.supports_batching) {
-            const batch = handle.instance.pollBatch(allocator) catch |err| switch (err) {
-                source.SourceError.Backpressure => {
-                    recordBackpressure(self);
-                    logWarn(
-                        self.options,
-                        "collector batch backpressure for {s}",
-                        .{handle.descriptor.name},
-                    );
-                    return PollResult{ .status = .backpressure, .batch = null, .attempted = true };
-                },
-                source.SourceError.OperationNotSupported => {
-                    logError(
-                        self.options,
-                        "collector invalid configuration: batch polling unsupported for {s}",
-                        .{handle.descriptor.name},
-                    );
-                    return CollectorError.InvalidConfiguration;
-                },
-                else => {
-                    recordPollError(self);
-                    logError(
-                        self.options,
-                        "collector batch failure for {s}: {s}",
-                        .{ handle.descriptor.name, @errorName(err) },
-                    );
-                    return CollectorError.PollFailed;
-                },
+            const batch = handle.instance.pollBatch(allocator) catch |err| {
+                const failure = classifyBatchPollError(err);
+                switch (failure.kind) {
+                    .poll_backpressure => {
+                        recordBackpressure(self);
+                        logFailure(
+                            self.options,
+                            failure.severity,
+                            failure.permanence,
+                            "collector batch backpressure for {s}",
+                            .{handle.descriptor.name},
+                        );
+                        return PollResult{ .status = .backpressure, .batch = null, .attempted = true };
+                    },
+                    .poll_invalid_configuration => {
+                        logFailure(
+                            self.options,
+                            failure.severity,
+                            failure.permanence,
+                            "collector invalid configuration during batch poll for {s}: {s}",
+                            .{ handle.descriptor.name, @errorName(err) },
+                        );
+                        self.handlePermanentFailure(handle, failure);
+                        return failure.collector_error;
+                    },
+                    else => {
+                        recordPollError(self);
+                        logFailure(
+                            self.options,
+                            failure.severity,
+                            failure.permanence,
+                            "collector batch failure for {s}: {s}",
+                            .{ handle.descriptor.name, @errorName(err) },
+                        );
+
+                        if (failure.restartable and failure.permanence == .transient) {
+                            self.handleTransientFailure(handle, failure, now);
+                            return PollResult{ .status = .idle, .batch = null, .attempted = false };
+                        }
+
+                        if (failure.permanence == .permanent) {
+                            self.handlePermanentFailure(handle, failure);
+                            return failure.collector_error;
+                        }
+
+                        return PollResult{ .status = .idle, .batch = null, .attempted = false };
+                    },
+                }
             };
 
             if (batch) |value| {
+                observeSuccess(&handle.restart_state);
+                self.refreshQuarantineGauge();
                 return PollResult{ .status = .yielded, .batch = value, .attempted = true };
             }
 
@@ -433,33 +806,299 @@ fn destroySourceHandles(collector: *Collector, allocator: std.mem.Allocator) voi
     }
 }
 
-fn mapStartError(self: *Collector, descriptor: source.SourceDescriptor, err: source.SourceError) CollectorError {
-    switch (err) {
-        error.Backpressure => {
-            recordBackpressure(self);
-            logWarn(self.options, "collector start backpressure for {s}", .{descriptor.name});
-            return CollectorError.Backpressure;
-        },
-        else => {
-            logError(
-                self.options,
-                "collector start failed for {s}: {s}",
-                .{ descriptor.name, @errorName(err) },
-            );
-            return CollectorError.StartFailed;
-        },
+fn selectRestartPolicy(descriptor: source.SourceDescriptor) RestartPolicy {
+    return switch (descriptor.type) {
+        .syslog => syslog_restart_policy,
+    };
+}
+
+fn deriveSeed(clock: Clock, salt: usize) u64 {
+    var seed: u64 = @truncate(clock.now());
+    seed ^= @truncate(salt);
+    if (seed == 0) seed = 0x6d5f_ea2c_8c4a_f3b1;
+    return seed;
+}
+
+fn mulDiv(value: u64, num: u32, den: u32) u64 {
+    std.debug.assert(den != 0);
+    const numerator = @as(u128, value) * num;
+    const quotient = numerator / den;
+    if (quotient > std.math.maxInt(u64)) return std.math.maxInt(u64);
+    return @as(u64, @intCast(quotient));
+}
+
+fn nextBackoffInterval(policy: BackoffPolicy, state: *BackoffState) u64 {
+    if (state.current_ns == 0) {
+        state.current_ns = policy.min_ns;
+        state.prev_ns = state.current_ns;
+        state.attempts = 1;
+        return state.current_ns;
     }
+
+    var grown = mulDiv(state.current_ns, policy.multiplier_num, policy.multiplier_den);
+    if (grown < policy.min_ns) grown = policy.min_ns;
+    if (grown > policy.max_ns) grown = policy.max_ns;
+    state.prev_ns = state.current_ns;
+    state.current_ns = grown;
+    if (state.attempts < std.math.maxInt(u32)) state.attempts += 1;
+    return state.current_ns;
+}
+
+fn jitterDelay(policy: BackoffPolicy, state: *BackoffState, random_value: u64) u64 {
+    const base = state.current_ns;
+    if (base == 0) return 0;
+
+    return switch (policy.jitter) {
+        .full => {
+            const range = @as(u128, base) + 1;
+            return @as(u64, @intCast(@as(u128, random_value) % range));
+        },
+        .plusminus => {
+            if (policy.jitter_ratio_ppm == 0) return base;
+            const ratio = policy.jitter_ratio_ppm;
+            const span = (@as(u128, base) * ratio) / 1_000_000;
+            if (span == 0) return base;
+            const total = span * 2 + 1;
+            const sample = @as(u128, random_value) % total;
+            const offset = @as(i128, @intCast(sample)) - @as(i128, @intCast(span));
+            const adjusted = @as(i128, @intCast(base)) + offset;
+            if (adjusted <= 0) return 0;
+            const positive = @as(u128, @intCast(adjusted));
+            if (positive > policy.max_ns) return policy.max_ns;
+            return @as(u64, @intCast(positive));
+        },
+        .decorrelated => {
+            const prev = if (state.prev_ns == 0) policy.min_ns else state.prev_ns;
+            const candidate = mulDiv(prev, policy.multiplier_num, policy.multiplier_den);
+            const hi = if (candidate > policy.max_ns) policy.max_ns else candidate;
+            const lo = if (hi < policy.min_ns) hi else policy.min_ns;
+            const span = @as(u128, hi - lo) + 1;
+            const sample = @as(u128, random_value) % span;
+            return @as(u64, @intCast(@as(u128, lo) + sample));
+        },
+    };
+}
+
+fn resetBackoff(state: *BackoffState) void {
+    state.* = .{};
+}
+
+fn pruneFailureEntries(state: *FailureBudgetState, policy: FailureBudgetPolicy, now: u128) void {
+    if (state.count == 0) return;
+    const window = @as(u128, policy.window_ns);
+    while (state.count > 0) {
+        const oldest_index_u8: u8 = if (state.head >= state.count)
+            state.head - state.count
+        else
+            state.head + max_tracked_failures - state.count;
+        const oldest_index = @as(usize, @intCast(oldest_index_u8));
+        const ts = state.entries[oldest_index];
+        const delta = if (now >= ts) now - ts else ts - now;
+        if (delta > window) {
+            state.count -= 1;
+            continue;
+        }
+        break;
+    }
+}
+
+fn recordFailureEvent(state: *FailureBudgetState, policy: FailureBudgetPolicy, now: u128) bool {
+    pruneFailureEntries(state, policy, now);
+
+    state.entries[@as(usize, @intCast(state.head))] = now;
+    const next_head = (@as(usize, @intCast(state.head)) + 1) % failure_ring_capacity;
+    state.head = @as(u8, @intCast(next_head));
+    if (state.count < max_tracked_failures) {
+        state.count += 1;
+    }
+
+    if (state.count >= policy.limit and policy.limit != 0) {
+        state.hold_until_ns = now + @as(u128, policy.hold_ns);
+        return true;
+    }
+    return false;
+}
+
+fn clearFailureBudget(state: *FailureBudgetState) void {
+    state.* = .{};
+}
+
+fn isUnderQuarantine(state: *const FailureBudgetState, now: u128) bool {
+    return state.hold_until_ns != 0 and now < state.hold_until_ns;
+}
+
+fn scheduleRestart(
+    state: *RestartState,
+    policy: RestartPolicy,
+    now: u128,
+    random_value: u64,
+) void {
+    if (isUnderQuarantine(&state.budget, now)) {
+        state.backoff.current_ns = policy.backoff.max_ns;
+        state.backoff.prev_ns = policy.backoff.max_ns;
+        state.backoff.resume_at_ns = state.budget.hold_until_ns;
+        state.pending_restart = true;
+        return;
+    }
+
+    _ = nextBackoffInterval(policy.backoff, &state.backoff);
+    const jitter = jitterDelay(policy.backoff, &state.backoff, random_value);
+    var resume_at = now + @as(u128, jitter);
+    if (isUnderQuarantine(&state.budget, resume_at)) {
+        if (resume_at < state.budget.hold_until_ns) {
+            resume_at = state.budget.hold_until_ns;
+        }
+        state.backoff.current_ns = policy.backoff.max_ns;
+        state.backoff.prev_ns = policy.backoff.max_ns;
+    }
+    state.backoff.resume_at_ns = resume_at;
+    state.pending_restart = true;
+}
+
+fn noteFailure(state: *RestartState, failure: LifecycleFailure) void {
+    state.last_failure_kind = failure.kind;
+    state.last_failure_permanence = failure.permanence;
+}
+
+fn observeSuccess(state: *RestartState) void {
+    resetBackoff(&state.backoff);
+    clearFailureBudget(&state.budget);
+    state.pending_restart = false;
+    state.last_failure_kind = null;
+    state.last_failure_permanence = null;
+}
+fn classifyStartError(err: source.SourceError) LifecycleFailure {
+    return switch (err) {
+        error.InvalidConfiguration => .{
+            .collector_error = CollectorError.InvalidConfiguration,
+            .permanence = .permanent,
+            .restartable = false,
+            .severity = .err,
+            .kind = .start_invalid_configuration,
+        },
+        error.OperationNotSupported => .{
+            .collector_error = CollectorError.InvalidConfiguration,
+            .permanence = .permanent,
+            .restartable = false,
+            .severity = .err,
+            .kind = .start_unsupported,
+        },
+        error.NotImplemented => .{
+            .collector_error = CollectorError.Unimplemented,
+            .permanence = .permanent,
+            .restartable = false,
+            .severity = .err,
+            .kind = .start_not_implemented,
+        },
+        error.Backpressure => .{
+            .collector_error = CollectorError.Backpressure,
+            .permanence = .transient,
+            .restartable = true,
+            .severity = .warn,
+            .kind = .start_backpressure,
+        },
+        error.StartupFailed => .{
+            .collector_error = CollectorError.StartFailed,
+            .permanence = .transient,
+            .restartable = true,
+            .severity = .err,
+            .kind = .start_startup_failed,
+        },
+        error.ShutdownFailed => .{
+            .collector_error = CollectorError.ShutdownFailed,
+            .permanence = .permanent,
+            .restartable = false,
+            .severity = .err,
+            .kind = .start_unknown,
+        },
+    };
+}
+
+fn classifyStreamPollError(err: event.StreamError) LifecycleFailure {
+    return switch (err) {
+        error.TransportFailure => .{
+            .collector_error = CollectorError.PollFailed,
+            .permanence = .transient,
+            .restartable = true,
+            .severity = .err,
+            .kind = .poll_transport_failure,
+        },
+        error.DecodeFailure => .{
+            .collector_error = CollectorError.PollFailed,
+            .permanence = .transient,
+            .restartable = false,
+            .severity = .warn,
+            .kind = .poll_decode_failure,
+        },
+        error.Backpressure => .{
+            .collector_error = CollectorError.Backpressure,
+            .permanence = .transient,
+            .restartable = false,
+            .severity = .warn,
+            .kind = .poll_backpressure,
+        },
+        else => unreachable,
+    };
+}
+
+fn classifyBatchPollError(err: source.SourceError) LifecycleFailure {
+    return switch (err) {
+        error.Backpressure => .{
+            .collector_error = CollectorError.Backpressure,
+            .permanence = .transient,
+            .restartable = false,
+            .severity = .warn,
+            .kind = .poll_backpressure,
+        },
+        error.InvalidConfiguration, error.OperationNotSupported => .{
+            .collector_error = CollectorError.InvalidConfiguration,
+            .permanence = .permanent,
+            .restartable = false,
+            .severity = .err,
+            .kind = .poll_invalid_configuration,
+        },
+        else => .{
+            .collector_error = CollectorError.PollFailed,
+            .permanence = .transient,
+            .restartable = true,
+            .severity = .err,
+            .kind = .poll_unknown,
+        },
+    };
+}
+
+fn mapStartError(self: *Collector, descriptor: source.SourceDescriptor, err: source.SourceError) CollectorError {
+    const failure = classifyStartError(err);
+    if (failure.kind == .start_backpressure) {
+        recordBackpressure(self);
+    }
+    logFailure(
+        self.options,
+        failure.severity,
+        failure.permanence,
+        "collector start failure for {s}: {s}",
+        .{ descriptor.name, @errorName(err) },
+    );
+    return failure.collector_error;
 }
 
 fn updateActiveSourcesGauge(self: *Collector) void {
     if (self.options.metrics) |metrics_sink| {
         var active: usize = 0;
+        var failed: usize = 0;
         for (self.sources.items) |handle| {
-            if (!handle.shutting_down) active += 1;
+            if (!handle.shutting_down) {
+                active += 1;
+            } else {
+                failed += 1;
+            }
         }
 
         if (math.cast(i64, active)) |value| {
             metrics_sink.recordGauge(collector_metrics.active_sources, value);
+        }
+        if (math.cast(i64, failed)) |value| {
+            metrics_sink.recordGauge(collector_metrics.failed_sources, value);
         }
     }
 }
@@ -485,6 +1124,16 @@ fn recordReadySkip(self: *Collector) void {
 fn recordEmptyPoll(self: *Collector) void {
     recordCounter(self.options, collector_metrics.empty_polls, 1);
 }
+
+const TestClock = struct {
+    now_ns: u128,
+
+    fn now(context: ?*anyopaque) u128 {
+        const aligned: *align(@alignOf(TestClock)) anyopaque = @alignCast(context.?);
+        const self: *TestClock = @ptrCast(aligned);
+        return self.now_ns;
+    }
+};
 
 test "collector init fails without matching factory" {
     const testing = std.testing;
@@ -1170,4 +1819,324 @@ test "collector releases stream after end of stream" {
 
     try collector.shutdown(testing.allocator);
     try testing.expectEqual(@as(usize, 1), harness.shutdowns);
+}
+
+test "collector restarts source after transient startup failure" {
+    const testing = std.testing;
+
+    const Mock = struct {
+        const SourceCtx = struct {
+            allocator: std.mem.Allocator,
+            descriptor: source.SourceDescriptor,
+        };
+
+        const StreamState = struct {
+            allocator: std.mem.Allocator,
+            emitted: bool = false,
+            event_storage: [1]event.Event,
+        };
+
+        pub var start_attempts: usize = 0;
+
+        pub fn reset() void {
+            start_attempts = 0;
+        }
+
+        pub fn factory() source.SourceFactory {
+            return .{ .type = .syslog, .create = create };
+        }
+
+        fn create(ctx: source.InitContext, config: *const cfg.SourceConfig) source.SourceError!source.Source {
+            const descriptor = source.SourceDescriptor{ .type = .syslog, .name = config.id };
+            const state = try ctx.allocator.create(SourceCtx);
+            state.* = .{ .allocator = ctx.allocator, .descriptor = descriptor };
+
+            return source.Source{
+                .descriptor = descriptor,
+                .capabilities = .{ .streaming = true, .batching = false },
+                .lifecycle = .{
+                    .start_stream = startStream,
+                    .poll_batch = null,
+                    .shutdown = shutdown,
+                    .ready_hint = null,
+                },
+                .context = state,
+            };
+        }
+
+        fn asCtx(ptr: *anyopaque) *SourceCtx {
+            const aligned: *align(@alignOf(SourceCtx)) anyopaque = @alignCast(ptr);
+            return @ptrCast(aligned);
+        }
+
+        fn asStream(ptr: *anyopaque) *StreamState {
+            const aligned: *align(@alignOf(StreamState)) anyopaque = @alignCast(ptr);
+            return @ptrCast(aligned);
+        }
+
+        fn startStream(context: *anyopaque, allocator: std.mem.Allocator) source.SourceError!?event.EventStream {
+            start_attempts += 1;
+            if (start_attempts == 1) {
+                return source.SourceError.StartupFailed;
+            }
+
+            const state = try allocator.create(StreamState);
+            const ctx = asCtx(context);
+            state.* = .{
+                .allocator = allocator,
+                .event_storage = .{event.Event{
+                    .metadata = .{ .source_id = ctx.descriptor.name },
+                    .payload = .{ .log = .{ .message = "restarted", .fields = &[_]event.Field{} } },
+                }},
+            };
+
+            return event.EventStream{
+                .context = state,
+                .next_fn = streamNext,
+                .finish_fn = streamFinish,
+            };
+        }
+
+        fn streamNext(context: *anyopaque, _: std.mem.Allocator) event.StreamError!?event.EventBatch {
+            const state = asStream(context);
+            if (state.emitted) return event.StreamError.EndOfStream;
+            state.emitted = true;
+            return event.EventBatch{ .events = state.event_storage[0..1], .ack = event.AckToken.none() };
+        }
+
+        fn streamFinish(context: *anyopaque, allocator: std.mem.Allocator) void {
+            const state = asStream(context);
+            allocator.destroy(state);
+        }
+
+        fn shutdown(context: *anyopaque, allocator: std.mem.Allocator) void {
+            const state = asCtx(context);
+            allocator.destroy(state);
+        }
+    };
+
+    Mock.reset();
+
+    var clock_state = TestClock{ .now_ns = 0 };
+
+    const config = cfg.SourceConfig{
+        .id = "restart_source",
+        .payload = .{ .syslog = cfg.SyslogConfig{ .address = "127.0.0.1:514" } },
+    };
+
+    const registry = source.Registry{ .factories = &[_]source.SourceFactory{Mock.factory()} };
+    const options = CollectorOptions{
+        .registry = registry,
+        .restart = .{
+            .clock = Clock{ .context = &clock_state, .now_fn = TestClock.now },
+            .rng_seed = 42,
+        },
+    };
+
+    var collector = try Collector.init(testing.allocator, &.{config}, options);
+    defer collector.deinit();
+
+    try collector.start(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), Mock.start_attempts);
+
+    const handle = &collector.sources.items[0];
+    try testing.expect(handle.restart_state.pending_restart);
+
+    const resume_ns = handle.restart_state.backoff.resume_at_ns;
+    if (resume_ns > 0) {
+        clock_state.now_ns = resume_ns - 1;
+        try testing.expect((try collector.poll(testing.allocator)) == null);
+        try testing.expectEqual(@as(usize, 1), Mock.start_attempts);
+    }
+
+    clock_state.now_ns = resume_ns;
+    const maybe_batch = try collector.poll(testing.allocator);
+    try testing.expect(maybe_batch != null);
+    try testing.expectEqual(@as(usize, 2), Mock.start_attempts);
+    try testing.expect(!handle.restart_state.pending_restart);
+    try testing.expect(handle.stream != null);
+    try testing.expectEqual(@as(usize, 1), maybe_batch.?.batch.events.len);
+
+    const drained = try collector.poll(testing.allocator);
+    try testing.expect(drained == null);
+}
+
+test "collector marks permanent start failures as shutdown" {
+    const testing = std.testing;
+
+    const Mock = struct {
+        fn factory() source.SourceFactory {
+            return .{ .type = .syslog, .create = create };
+        }
+
+        fn create(ctx: source.InitContext, config: *const cfg.SourceConfig) source.SourceError!source.Source {
+            const descriptor = source.SourceDescriptor{ .type = .syslog, .name = config.id };
+            const state = try ctx.allocator.create(source.SourceDescriptor);
+            state.* = descriptor;
+            return source.Source{
+                .descriptor = descriptor,
+                .capabilities = .{ .streaming = true, .batching = false },
+                .lifecycle = .{
+                    .start_stream = startStream,
+                    .poll_batch = null,
+                    .shutdown = shutdown,
+                    .ready_hint = null,
+                },
+                .context = state,
+            };
+        }
+
+        fn startStream(context: *anyopaque, allocator: std.mem.Allocator) source.SourceError!?event.EventStream {
+            _ = context;
+            _ = allocator;
+            return source.SourceError.InvalidConfiguration;
+        }
+
+        fn shutdown(context: *anyopaque, allocator: std.mem.Allocator) void {
+            const aligned: *align(@alignOf(source.SourceDescriptor)) anyopaque = @alignCast(context);
+            const descriptor_ptr: *source.SourceDescriptor = @ptrCast(aligned);
+            allocator.destroy(descriptor_ptr);
+        }
+    };
+
+    const config = cfg.SourceConfig{
+        .id = "invalid_source",
+        .payload = .{ .syslog = cfg.SyslogConfig{ .address = "127.0.0.1:514" } },
+    };
+
+    const registry = source.Registry{ .factories = &[_]source.SourceFactory{Mock.factory()} };
+    const options = CollectorOptions{ .registry = registry };
+
+    var collector = try Collector.init(testing.allocator, &.{config}, options);
+    defer collector.deinit();
+
+    try testing.expectError(CollectorError.InvalidConfiguration, collector.start(testing.allocator));
+    const handle = &collector.sources.items[0];
+    try testing.expect(handle.shutting_down);
+    try testing.expect(!handle.restart_state.pending_restart);
+    try testing.expect(!collector.started);
+}
+
+test "collector enforces restart failure budget hold" {
+    const testing = std.testing;
+
+    const Mock = struct {
+        pub var attempts: usize = 0;
+        pub const fail_before_success: usize = 3;
+
+        const SourceCtx = struct {
+            allocator: std.mem.Allocator,
+            descriptor: source.SourceDescriptor,
+        };
+
+        pub fn reset() void {
+            attempts = 0;
+        }
+
+        pub fn factory() source.SourceFactory {
+            return .{ .type = .syslog, .create = create };
+        }
+
+        fn create(ctx: source.InitContext, config: *const cfg.SourceConfig) source.SourceError!source.Source {
+            const descriptor = source.SourceDescriptor{ .type = .syslog, .name = config.id };
+            const state = try ctx.allocator.create(SourceCtx);
+            state.* = .{ .allocator = ctx.allocator, .descriptor = descriptor };
+
+            return source.Source{
+                .descriptor = descriptor,
+                .capabilities = .{ .streaming = true, .batching = false },
+                .lifecycle = .{
+                    .start_stream = startStream,
+                    .poll_batch = null,
+                    .shutdown = shutdown,
+                    .ready_hint = null,
+                },
+                .context = state,
+            };
+        }
+
+        fn asCtx(ptr: *anyopaque) *SourceCtx {
+            const aligned: *align(@alignOf(SourceCtx)) anyopaque = @alignCast(ptr);
+            return @ptrCast(aligned);
+        }
+
+        fn startStream(context: *anyopaque, allocator: std.mem.Allocator) source.SourceError!?event.EventStream {
+            _ = allocator;
+            _ = asCtx(context);
+            attempts += 1;
+            if (attempts <= fail_before_success) {
+                return source.SourceError.StartupFailed;
+            }
+            return null;
+        }
+
+        fn shutdown(context: *anyopaque, allocator: std.mem.Allocator) void {
+            const state = asCtx(context);
+            allocator.destroy(state);
+        }
+    };
+
+    Mock.reset();
+
+    var clock_state = TestClock{ .now_ns = 0 };
+
+    const config = cfg.SourceConfig{
+        .id = "budget_source",
+        .payload = .{ .syslog = cfg.SyslogConfig{ .address = "127.0.0.1:514" } },
+    };
+
+    const registry = source.Registry{ .factories = &[_]source.SourceFactory{Mock.factory()} };
+    const options = CollectorOptions{
+        .registry = registry,
+        .restart = .{
+            .clock = Clock{ .context = &clock_state, .now_fn = TestClock.now },
+            .rng_seed = 7,
+        },
+    };
+
+    var collector = try Collector.init(testing.allocator, &.{config}, options);
+    defer collector.deinit();
+
+    const custom_policy = RestartPolicy{
+        .backoff = .{
+            .min_ns = 1,
+            .max_ns = 10,
+            .multiplier_num = 2,
+            .multiplier_den = 1,
+            .jitter = .full,
+        },
+        .budget = .{
+            .window_ns = 1_000,
+            .limit = 2,
+            .hold_ns = 5_000,
+        },
+    };
+
+    collector.sources.items[0].restart_policy = custom_policy;
+    collector.sources.items[0].restart_state = .{};
+
+    try collector.start(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), Mock.attempts);
+
+    const handle = &collector.sources.items[0];
+    try testing.expect(handle.restart_state.pending_restart);
+
+    const resume_ns = handle.restart_state.backoff.resume_at_ns;
+    clock_state.now_ns = resume_ns;
+
+    try testing.expect((try collector.poll(testing.allocator)) == null);
+    try testing.expectEqual(@as(usize, 2), Mock.attempts);
+    try testing.expect(handle.restart_state.pending_restart);
+    try testing.expect(isUnderQuarantine(&handle.restart_state.budget, resume_ns));
+
+    const expected_hold = resume_ns + custom_policy.budget.hold_ns;
+    try testing.expectEqual(expected_hold, handle.restart_state.budget.hold_until_ns);
+
+    clock_state.now_ns = expected_hold - 1;
+    try testing.expect((try collector.poll(testing.allocator)) == null);
+    try testing.expectEqual(@as(usize, 2), Mock.attempts);
+
+    clock_state.now_ns = expected_hold;
+    try testing.expect((try collector.poll(testing.allocator)) == null);
+    try testing.expectEqual(@as(usize, 3), Mock.attempts);
 }
