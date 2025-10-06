@@ -203,11 +203,17 @@ fn recordCounter(options: CollectorOptions, name: []const u8, value: u64) void {
     }
 }
 
+const ActiveTransport = union(enum) {
+    none,
+    stream: event.EventStream,
+    batch,
+};
+
 /// Carrier struct used internally to track the lifecycle of each configured source.
 pub const SourceHandle = struct {
     descriptor: source.SourceDescriptor,
     instance: source.Source,
-    stream: ?event.EventStream = null,
+    transport: ActiveTransport = .none,
     supports_batching: bool,
     shutting_down: bool = false,
     ready_skip_count: usize = 0,
@@ -215,6 +221,29 @@ pub const SourceHandle = struct {
     restart_policy: RestartPolicy,
     restart_state: RestartState = .{},
 };
+
+fn activateStreamTransport(handle: *SourceHandle, stream: event.EventStream) void {
+    handle.transport = .{ .stream = stream };
+}
+
+fn activateBatchTransport(handle: *SourceHandle) void {
+    handle.transport = .batch;
+}
+
+fn resetTransport(handle: *SourceHandle, allocator: std.mem.Allocator) void {
+    switch (handle.transport) {
+        .stream => |*stream_handle| stream_handle.finish(allocator),
+        else => {},
+    }
+    handle.transport = .none;
+}
+
+fn transportIsStreaming(handle: *const SourceHandle) bool {
+    return switch (handle.transport) {
+        .stream => true,
+        else => false,
+    };
+}
 
 const PollStatus = enum {
     idle,
@@ -310,7 +339,7 @@ pub const Collector = struct {
             const handle = SourceHandle{
                 .descriptor = instance.descriptor,
                 .instance = instance,
-                .stream = null,
+                .transport = .none,
                 .supports_batching = instance.lifecycle.poll_batch != null,
                 .shutting_down = false,
                 .restart_policy = selectRestartPolicy(instance.descriptor),
@@ -358,7 +387,7 @@ pub const Collector = struct {
                 continue;
             }
 
-            handle.stream = null;
+            resetTransport(handle, allocator);
             if (capabilities.streaming) {
                 var start_failed = false;
                 const maybe_stream = handle.instance.startStream(allocator) catch |err| blk: {
@@ -392,7 +421,7 @@ pub const Collector = struct {
                 if (start_failed) continue;
 
                 if (maybe_stream) |stream| {
-                    handle.stream = stream;
+                    activateStreamTransport(handle, stream);
                     observeSuccess(&handle.restart_state);
                     logInfo(self.options, "collector started stream for {s}", .{handle.descriptor.name});
                 } else if (!handle.supports_batching) {
@@ -404,6 +433,7 @@ pub const Collector = struct {
                     if (fatal_error == null) fatal_error = CollectorError.StartFailed;
                 } else {
                     observeSuccess(&handle.restart_state);
+                    activateBatchTransport(handle);
                     logInfo(
                         self.options,
                         "collector using batch polling for {s}",
@@ -412,6 +442,7 @@ pub const Collector = struct {
                 }
             } else if (handle.supports_batching) {
                 observeSuccess(&handle.restart_state);
+                activateBatchTransport(handle);
                 logInfo(self.options, "collector using batch-only mode for {s}", .{handle.descriptor.name});
             }
         }
@@ -433,9 +464,9 @@ pub const Collector = struct {
         var active: usize = 0;
         var streaming: usize = 0;
 
-        for (self.sources.items) |handle| {
+        for (self.sources.items) |*handle| {
             if (!handle.shutting_down) active += 1;
-            if (handle.stream != null) streaming += 1;
+            if (transportIsStreaming(handle)) streaming += 1;
         }
 
         return Status{
@@ -498,10 +529,7 @@ pub const Collector = struct {
             return;
         }
 
-        if (handle.stream) |*stream_handle| {
-            stream_handle.finish(allocator);
-            handle.stream = null;
-        }
+        resetTransport(handle, allocator);
 
         var restart_failed = false;
         const maybe_stream = handle.instance.startStream(allocator) catch |err| {
@@ -530,7 +558,7 @@ pub const Collector = struct {
         if (restart_failed) return;
 
         if (maybe_stream) |stream| {
-            handle.stream = stream;
+            activateStreamTransport(handle, stream);
             observeSuccess(&handle.restart_state);
             handle.restart_state.pending_restart = false;
             self.refreshQuarantineGauge();
@@ -556,6 +584,7 @@ pub const Collector = struct {
 
         observeSuccess(&handle.restart_state);
         handle.restart_state.pending_restart = false;
+        activateBatchTransport(handle);
         self.refreshQuarantineGauge();
         logInfo(self.options, "collector restart using batch polling for {s}", .{handle.descriptor.name});
     }
@@ -654,72 +683,40 @@ pub const Collector = struct {
         allocator: std.mem.Allocator,
         now: u128,
     ) CollectorError!PollResult {
-        if (handle.stream) |*stream_handle| {
-            const batch = stream_handle.next(allocator) catch |err| switch (err) {
-                error.EndOfStream => {
-                    stream_handle.finish(allocator);
-                    handle.stream = null;
-                    observeSuccess(&handle.restart_state);
-                    self.refreshQuarantineGauge();
-                    logInfo(self.options, "collector stream finished for {s}", .{handle.descriptor.name});
-                    return PollResult{ .status = .finished, .batch = null, .attempted = true };
-                },
-                else => {
-                    const failure = classifyStreamPollError(err);
-                    switch (failure.kind) {
-                        .poll_backpressure => {
-                            recordBackpressure(self);
-                            logFailure(
-                                self.options,
-                                failure.severity,
-                                failure.permanence,
-                                "collector stream backpressure for {s}",
-                                .{handle.descriptor.name},
-                            );
-                            return PollResult{ .status = .backpressure, .batch = null, .attempted = true };
-                        },
-                        else => {
-                            recordPollError(self);
-                            logFailure(
-                                self.options,
-                                failure.severity,
-                                failure.permanence,
-                                "collector stream failure for {s}: {s}",
-                                .{ handle.descriptor.name, @errorName(err) },
-                            );
+        switch (handle.transport) {
+            .stream => |*stream_handle| return self.pollStreamTransport(handle, stream_handle, allocator, now),
+            .batch => return self.pollBatchTransport(handle, allocator, now),
+            .none => {
+                if (handle.supports_batching) {
+                    activateBatchTransport(handle);
+                    return self.pollBatchTransport(handle, allocator, now);
+                }
 
-                            if (failure.restartable and failure.permanence == .transient) {
-                                stream_handle.finish(allocator);
-                                handle.stream = null;
-                                self.handleTransientFailure(handle, failure, now);
-                                return PollResult{ .status = .idle, .batch = null, .attempted = false };
-                            }
-
-                            if (failure.permanence == .permanent) {
-                                stream_handle.finish(allocator);
-                                handle.stream = null;
-                                self.handlePermanentFailure(handle, failure);
-                                return failure.collector_error;
-                            }
-
-                            return PollResult{ .status = .idle, .batch = null, .attempted = false };
-                        },
-                    }
-                },
-            };
-
-            if (batch) |value| {
-                observeSuccess(&handle.restart_state);
-                self.refreshQuarantineGauge();
-                return PollResult{ .status = .yielded, .batch = value, .attempted = true };
-            }
-
-            return PollResult{ .status = .empty, .batch = null, .attempted = true };
+                return PollResult{ .status = .idle, .batch = null, .attempted = false };
+            },
         }
+    }
 
-        if (handle.supports_batching) {
-            const batch = handle.instance.pollBatch(allocator) catch |err| {
-                const failure = classifyBatchPollError(err);
+    fn pollStreamTransport(
+        self: *Collector,
+        handle: *SourceHandle,
+        stream_handle: *event.EventStream,
+        allocator: std.mem.Allocator,
+        now: u128,
+    ) CollectorError!PollResult {
+        const batch = stream_handle.next(allocator) catch |err| switch (err) {
+            error.EndOfStream => {
+                resetTransport(handle, allocator);
+                observeSuccess(&handle.restart_state);
+                if (handle.supports_batching) {
+                    activateBatchTransport(handle);
+                }
+                self.refreshQuarantineGauge();
+                logInfo(self.options, "collector stream finished for {s}", .{handle.descriptor.name});
+                return PollResult{ .status = .finished, .batch = null, .attempted = true };
+            },
+            else => {
+                const failure = classifyStreamPollError(err);
                 switch (failure.kind) {
                     .poll_backpressure => {
                         recordBackpressure(self);
@@ -727,21 +724,10 @@ pub const Collector = struct {
                             self.options,
                             failure.severity,
                             failure.permanence,
-                            "collector batch backpressure for {s}",
+                            "collector stream backpressure for {s}",
                             .{handle.descriptor.name},
                         );
                         return PollResult{ .status = .backpressure, .batch = null, .attempted = true };
-                    },
-                    .poll_invalid_configuration => {
-                        logFailure(
-                            self.options,
-                            failure.severity,
-                            failure.permanence,
-                            "collector invalid configuration during batch poll for {s}: {s}",
-                            .{ handle.descriptor.name, @errorName(err) },
-                        );
-                        self.handlePermanentFailure(handle, failure);
-                        return failure.collector_error;
                     },
                     else => {
                         recordPollError(self);
@@ -749,16 +735,18 @@ pub const Collector = struct {
                             self.options,
                             failure.severity,
                             failure.permanence,
-                            "collector batch failure for {s}: {s}",
+                            "collector stream failure for {s}: {s}",
                             .{ handle.descriptor.name, @errorName(err) },
                         );
 
                         if (failure.restartable and failure.permanence == .transient) {
+                            resetTransport(handle, allocator);
                             self.handleTransientFailure(handle, failure, now);
                             return PollResult{ .status = .idle, .batch = null, .attempted = false };
                         }
 
                         if (failure.permanence == .permanent) {
+                            resetTransport(handle, allocator);
                             self.handlePermanentFailure(handle, failure);
                             return failure.collector_error;
                         }
@@ -766,18 +754,82 @@ pub const Collector = struct {
                         return PollResult{ .status = .idle, .batch = null, .attempted = false };
                     },
                 }
-            };
+            },
+        };
 
-            if (batch) |value| {
-                observeSuccess(&handle.restart_state);
-                self.refreshQuarantineGauge();
-                return PollResult{ .status = .yielded, .batch = value, .attempted = true };
-            }
-
-            return PollResult{ .status = .empty, .batch = null, .attempted = true };
+        if (batch) |value| {
+            observeSuccess(&handle.restart_state);
+            self.refreshQuarantineGauge();
+            return PollResult{ .status = .yielded, .batch = value, .attempted = true };
         }
 
-        return PollResult{ .status = .idle, .batch = null, .attempted = false };
+        return PollResult{ .status = .empty, .batch = null, .attempted = true };
+    }
+
+    fn pollBatchTransport(
+        self: *Collector,
+        handle: *SourceHandle,
+        allocator: std.mem.Allocator,
+        now: u128,
+    ) CollectorError!PollResult {
+        std.debug.assert(handle.supports_batching);
+        const batch = handle.instance.pollBatch(allocator) catch |err| {
+            const failure = classifyBatchPollError(err);
+            switch (failure.kind) {
+                .poll_backpressure => {
+                    recordBackpressure(self);
+                    logFailure(
+                        self.options,
+                        failure.severity,
+                        failure.permanence,
+                        "collector batch backpressure for {s}",
+                        .{handle.descriptor.name},
+                    );
+                    return PollResult{ .status = .backpressure, .batch = null, .attempted = true };
+                },
+                .poll_invalid_configuration => {
+                    logFailure(
+                        self.options,
+                        failure.severity,
+                        failure.permanence,
+                        "collector invalid configuration during batch poll for {s}: {s}",
+                        .{ handle.descriptor.name, @errorName(err) },
+                    );
+                    self.handlePermanentFailure(handle, failure);
+                    return failure.collector_error;
+                },
+                else => {
+                    recordPollError(self);
+                    logFailure(
+                        self.options,
+                        failure.severity,
+                        failure.permanence,
+                        "collector batch failure for {s}: {s}",
+                        .{ handle.descriptor.name, @errorName(err) },
+                    );
+
+                    if (failure.restartable and failure.permanence == .transient) {
+                        self.handleTransientFailure(handle, failure, now);
+                        return PollResult{ .status = .idle, .batch = null, .attempted = false };
+                    }
+
+                    if (failure.permanence == .permanent) {
+                        self.handlePermanentFailure(handle, failure);
+                        return failure.collector_error;
+                    }
+
+                    return PollResult{ .status = .idle, .batch = null, .attempted = false };
+                },
+            }
+        };
+
+        if (batch) |value| {
+            observeSuccess(&handle.restart_state);
+            self.refreshQuarantineGauge();
+            return PollResult{ .status = .yielded, .batch = value, .attempted = true };
+        }
+
+        return PollResult{ .status = .empty, .batch = null, .attempted = true };
     }
 
     /// Shuts down all sources and resets collector bookkeeping.
@@ -796,10 +848,7 @@ fn destroySourceHandles(collector: *Collector, allocator: std.mem.Allocator) voi
     for (collector.sources.items) |*handle| {
         if (handle.shutting_down) continue;
 
-        if (handle.stream) |*stream_handle| {
-            stream_handle.finish(allocator);
-            handle.stream = null;
-        }
+        resetTransport(handle, allocator);
 
         handle.instance.shutdown(allocator);
         handle.shutting_down = true;
@@ -1821,6 +1870,172 @@ test "collector releases stream after end of stream" {
     try testing.expectEqual(@as(usize, 1), harness.shutdowns);
 }
 
+test "collector falls back to batch after stream completion" {
+    const testing = std.testing;
+
+    const Mock = struct {
+        pub const Harness = struct {
+            finish_calls: usize = 0,
+            batch_polls: usize = 0,
+            shutdowns: usize = 0,
+        };
+
+        pub var harness: ?*Harness = null;
+
+        const State = struct {
+            allocator: std.mem.Allocator,
+            descriptor: source.SourceDescriptor,
+            harness: *Harness,
+            stream_emitted: bool = false,
+            batch_emitted: bool = false,
+            stream_storage: [1]event.Event,
+            batch_storage: [1]event.Event,
+        };
+
+        pub fn factory() source.SourceFactory {
+            return .{ .type = .syslog, .create = create };
+        }
+
+        fn create(ctx: source.InitContext, config: *const cfg.SourceConfig) source.SourceError!source.Source {
+            const h = harness orelse return source.SourceError.InvalidConfiguration;
+
+            const descriptor = source.SourceDescriptor{
+                .type = .syslog,
+                .name = config.id,
+            };
+
+            const state = ctx.allocator.create(State) catch return source.SourceError.StartupFailed;
+            state.* = .{
+                .allocator = ctx.allocator,
+                .descriptor = descriptor,
+                .harness = h,
+                .stream_storage = .{event.Event{
+                    .metadata = .{ .source_id = config.id },
+                    .payload = .{ .log = .{ .message = "stream-event", .fields = &[_]event.Field{} } },
+                }},
+                .batch_storage = .{event.Event{
+                    .metadata = .{ .source_id = config.id },
+                    .payload = .{ .log = .{ .message = "batch-event", .fields = &[_]event.Field{} } },
+                }},
+            };
+
+            return source.Source{
+                .descriptor = descriptor,
+                .capabilities = .{ .streaming = true, .batching = true },
+                .lifecycle = .{
+                    .start_stream = startStream,
+                    .poll_batch = pollBatch,
+                    .shutdown = shutdown,
+                    .ready_hint = readyHint,
+                },
+                .context = state,
+            };
+        }
+
+        fn asState(ptr: *anyopaque) *State {
+            const aligned: *align(@alignOf(State)) anyopaque = @alignCast(ptr);
+            return @ptrCast(aligned);
+        }
+
+        fn startStream(context: *anyopaque, allocator: std.mem.Allocator) source.SourceError!?event.EventStream {
+            _ = allocator;
+            const state = asState(context);
+            return event.EventStream{
+                .context = state,
+                .next_fn = streamNext,
+                .finish_fn = streamFinish,
+            };
+        }
+
+        fn streamNext(context: *anyopaque, allocator: std.mem.Allocator) event.StreamError!?event.EventBatch {
+            _ = allocator;
+            const state = asState(context);
+            if (state.stream_emitted) {
+                return error.EndOfStream;
+            }
+            state.stream_emitted = true;
+            return event.EventBatch{
+                .events = state.stream_storage[0..1],
+                .ack = event.AckToken.none(),
+            };
+        }
+
+        fn streamFinish(context: *anyopaque, allocator: std.mem.Allocator) void {
+            _ = allocator;
+            const state = asState(context);
+            state.harness.finish_calls += 1;
+        }
+
+        fn pollBatch(context: *anyopaque, allocator: std.mem.Allocator) source.SourceError!?event.EventBatch {
+            _ = allocator;
+            const state = asState(context);
+            if (state.batch_emitted) {
+                return null;
+            }
+            state.batch_emitted = true;
+            state.harness.batch_polls += 1;
+            return event.EventBatch{
+                .events = state.batch_storage[0..1],
+                .ack = event.AckToken.none(),
+            };
+        }
+
+        fn shutdown(context: *anyopaque, allocator: std.mem.Allocator) void {
+            const state = asState(context);
+            state.harness.shutdowns += 1;
+            state.allocator.destroy(state);
+            _ = allocator;
+        }
+
+        fn readyHint(context: *anyopaque) bool {
+            _ = context;
+            return true;
+        }
+    };
+
+    var harness = Mock.Harness{};
+    Mock.harness = &harness;
+    defer Mock.harness = null;
+
+    const config = cfg.SourceConfig{
+        .id = "stream_to_batch",
+        .payload = .{ .syslog = cfg.SyslogConfig{ .address = "127.0.0.1:514" } },
+    };
+
+    const registry = source.Registry{ .factories = &[_]source.SourceFactory{Mock.factory()} };
+    const options = CollectorOptions{ .registry = registry };
+
+    var collector = try Collector.init(testing.allocator, &.{config}, options);
+    defer collector.deinit();
+
+    try collector.start(testing.allocator);
+
+    const first = try collector.poll(testing.allocator);
+    try testing.expect(first != null);
+    try testing.expectEqualStrings("stream-event", first.?.batch.events[0].payload.log.message);
+    try testing.expectEqual(@as(usize, 1), collector.status().streaming_sources);
+    try testing.expectEqual(@as(usize, 0), harness.finish_calls);
+
+    const handle = &collector.sources.items[0];
+
+    const second = try collector.poll(testing.allocator);
+    try testing.expect(second == null);
+    try testing.expectEqual(@as(usize, 1), harness.finish_calls);
+    try testing.expect(!transportIsStreaming(handle));
+    try testing.expectEqual(@as(usize, 0), collector.status().streaming_sources);
+
+    const third = try collector.poll(testing.allocator);
+    try testing.expect(third != null);
+    try testing.expectEqualStrings("batch-event", third.?.batch.events[0].payload.log.message);
+    try testing.expectEqual(@as(usize, 1), harness.batch_polls);
+
+    const fourth = try collector.poll(testing.allocator);
+    try testing.expect(fourth == null);
+
+    try collector.shutdown(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), harness.shutdowns);
+}
+
 test "collector restarts source after transient startup failure" {
     const testing = std.testing;
 
@@ -1954,7 +2169,7 @@ test "collector restarts source after transient startup failure" {
     try testing.expect(maybe_batch != null);
     try testing.expectEqual(@as(usize, 2), Mock.start_attempts);
     try testing.expect(!handle.restart_state.pending_restart);
-    try testing.expect(handle.stream != null);
+    try testing.expect(transportIsStreaming(handle));
     try testing.expectEqual(@as(usize, 1), maybe_batch.?.batch.events.len);
 
     const drained = try collector.poll(testing.allocator);
