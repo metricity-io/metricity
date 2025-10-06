@@ -5,6 +5,7 @@ const cfg = source.config;
 const event = source.event;
 const meta = std.meta;
 const math = std.math;
+const ReadyQueue = std.ArrayListUnmanaged(usize);
 
 /// Normalised error surface exposed by the collector during lifecycle and polling
 /// operations.
@@ -68,6 +69,8 @@ const collector_metrics = struct {
 };
 
 const max_ready_skip_cycles: usize = 8;
+const max_ready_queue_depth: usize = 16;
+const max_productive_streak: usize = 3;
 
 const FailurePermanence = enum { transient, permanent };
 
@@ -209,6 +212,17 @@ const ActiveTransport = union(enum) {
     batch,
 };
 
+const ReadySignalContext = struct {
+    collector: *Collector,
+    index: usize,
+
+    fn notify(context: *anyopaque) void {
+        const aligned: *align(@alignOf(ReadySignalContext)) anyopaque = @alignCast(context);
+        const self: *ReadySignalContext = @ptrCast(aligned);
+        self.collector.enqueueReady(self.index);
+    }
+};
+
 /// Carrier struct used internally to track the lifecycle of each configured source.
 pub const SourceHandle = struct {
     descriptor: source.SourceDescriptor,
@@ -218,6 +232,10 @@ pub const SourceHandle = struct {
     shutting_down: bool = false,
     ready_skip_count: usize = 0,
     consecutive_empty_polls: usize = 0,
+    ready_signal_depth: usize = 0,
+    productive_streak: usize = 0,
+    ready_signal_context: ?*ReadySignalContext = null,
+    ready_signal_registered: bool = false,
     restart_policy: RestartPolicy,
     restart_state: RestartState = .{},
 };
@@ -285,6 +303,21 @@ pub const Collector = struct {
     sources: std.ArrayListUnmanaged(SourceHandle) = .{},
     next_index: usize = 0,
     started: bool = false,
+    ready_queue: ReadyQueue = .{},
+    ready_queue_head: usize = 0,
+
+    const PollIndexStatus = enum {
+        skipped,
+        idle,
+        yielded,
+        backpressure,
+    };
+
+    const PollIndexResult = struct {
+        status: PollIndexStatus,
+        next_index: usize,
+        batch: ?PolledBatch = null,
+    };
 
     /// Instantiates source handles and brings up the IO runtime. Sources are
     /// created but not yet streaming or polling.
@@ -302,6 +335,8 @@ pub const Collector = struct {
             .sources = .{},
             .next_index = 0,
             .started = false,
+            .ready_queue = .{},
+            .ready_queue_head = 0,
         };
 
         const seed_salt = @intFromPtr(&collector);
@@ -357,7 +392,9 @@ pub const Collector = struct {
 
     /// Tears down all sources and releases the backing IO runtime.
     pub fn deinit(self: *Collector) void {
+        self.clearReadyQueue();
         destroySourceHandles(self, self.allocator);
+        self.ready_queue.deinit(self.allocator);
         self.sources.deinit(self.allocator);
         self.runtime.deinit();
     }
@@ -368,7 +405,7 @@ pub const Collector = struct {
 
         var fatal_error: ?CollectorError = null;
 
-        for (self.sources.items) |*handle| {
+        for (self.sources.items, 0..) |*handle, index| {
             if (handle.shutting_down) {
                 logError(self.options, "collector start aborted: source {s} already shutdown", .{handle.descriptor.name});
                 if (fatal_error == null) fatal_error = CollectorError.StartFailed;
@@ -444,6 +481,10 @@ pub const Collector = struct {
                 observeSuccess(&handle.restart_state);
                 activateBatchTransport(handle);
                 logInfo(self.options, "collector using batch-only mode for {s}", .{handle.descriptor.name});
+            }
+
+            if (!handle.shutting_down) {
+                self.registerReadyObserver(handle, index);
             }
         }
 
@@ -599,81 +640,57 @@ pub const Collector = struct {
 
         self.refreshQuarantineGauge();
 
+        var last_attempted: ?usize = null;
+
+        while (self.popReady()) |ready_index| {
+            const outcome = try self.pollIndex(allocator, ready_index, total);
+            last_attempted = ready_index;
+
+            switch (outcome.status) {
+                .yielded => {
+                    self.next_index = outcome.next_index;
+                    return outcome.batch;
+                },
+                .backpressure => {
+                    self.next_index = outcome.next_index;
+                    return CollectorError.Backpressure;
+                },
+                else => {},
+            }
+        }
+
         var index = if (self.next_index < total) self.next_index else 0;
         var examined: usize = 0;
 
+        if (last_attempted) |value| {
+            index = (value + 1) % total;
+        }
+
         while (examined < total) : (examined += 1) {
-            var handle = &self.sources.items[index];
+            const outcome = try self.pollIndex(allocator, index, total);
+            last_attempted = index;
 
-            if (handle.shutting_down) {
-                index = (index + 1) % total;
-                continue;
-            }
-
-            const now = self.clock.now();
-
-            if (isUnderQuarantine(&handle.restart_state.budget, now)) {
-                index = (index + 1) % total;
-                continue;
-            }
-
-            if (handle.restart_state.pending_restart) {
-                if (now >= handle.restart_state.backoff.resume_at_ns) {
-                    self.attemptHandleRestart(handle, allocator, now);
-                }
-                if (handle.restart_state.pending_restart) {
-                    index = (index + 1) % total;
-                    continue;
-                }
-            }
-
-            const ready = handle.instance.readyHint();
-            const forced_poll = !ready and handle.ready_skip_count >= max_ready_skip_cycles;
-            if (!ready and !forced_poll) {
-                if (handle.ready_skip_count < math.maxInt(usize)) {
-                    handle.ready_skip_count += 1;
-                }
-                recordReadySkip(self);
-                index = (index + 1) % total;
-                continue;
-            }
-            if (forced_poll) {
-                logInfo(
-                    self.options,
-                    "collector forcing poll for {s} after {d} ready skips",
-                    .{ handle.descriptor.name, handle.ready_skip_count },
-                );
-            }
-            handle.ready_skip_count = 0;
-
-            const result = try self.tryPoll(handle, allocator, now);
-
-            switch (result.status) {
+            switch (outcome.status) {
                 .yielded => {
-                    const batch = result.batch orelse unreachable;
-                    handle.consecutive_empty_polls = 0;
-                    recordBatchMetrics(self, batch.events.len);
-                    self.next_index = (index + 1) % total;
-                    return PolledBatch{
-                        .descriptor = handle.descriptor,
-                        .batch = batch,
-                    };
+                    self.next_index = outcome.next_index;
+                    return outcome.batch;
                 },
-                .backpressure => return CollectorError.Backpressure,
+                .backpressure => {
+                    self.next_index = outcome.next_index;
+                    return CollectorError.Backpressure;
+                },
                 else => {},
             }
 
-            if (result.attempted and result.status != .yielded and result.status != .backpressure) {
-                if (handle.consecutive_empty_polls < math.maxInt(usize)) {
-                    handle.consecutive_empty_polls += 1;
-                }
-                recordEmptyPoll(self);
-            }
-
-            index = (index + 1) % total;
+            index = outcome.next_index;
         }
 
-        self.next_index = index;
+        if (last_attempted) |value| {
+            self.next_index = (value + 1) % total;
+        } else {
+            self.next_index = index;
+        }
+
         return null;
     }
 
@@ -837,8 +854,189 @@ pub const Collector = struct {
         destroySourceHandles(self, allocator);
         self.started = false;
         self.next_index = 0;
+        self.clearReadyQueue();
         updateActiveSourcesGauge(self);
         logInfo(self.options, "collector shutdown complete", .{});
+    }
+
+    fn enqueueReady(self: *Collector, index: usize) void {
+        if (index >= self.sources.items.len) return;
+        var handle = &self.sources.items[index];
+        if (handle.shutting_down) return;
+        if (handle.ready_signal_depth >= max_ready_queue_depth) return;
+
+        handle.ready_signal_depth += 1;
+        self.ready_queue.append(self.allocator, index) catch {
+            handle.ready_signal_depth -= 1;
+            logError(
+                self.options,
+                "collector ready queue append failed for {s}",
+                .{handle.descriptor.name},
+            );
+        };
+    }
+
+    fn popReady(self: *Collector) ?usize {
+        while (self.ready_queue_head < self.ready_queue.items.len) {
+            const index = self.ready_queue.items[self.ready_queue_head];
+            self.ready_queue_head += 1;
+            if (index >= self.sources.items.len) continue;
+
+            var handle = &self.sources.items[index];
+            if (handle.ready_signal_depth > 0) {
+                handle.ready_signal_depth -= 1;
+            }
+            if (handle.shutting_down) continue;
+            return index;
+        }
+
+        if (self.ready_queue_head >= self.ready_queue.items.len and self.ready_queue.items.len != 0) {
+            self.ready_queue.clearRetainingCapacity();
+            self.ready_queue_head = 0;
+        }
+
+        return null;
+    }
+
+    fn clearReadyQueue(self: *Collector) void {
+        if (self.ready_queue.items.len == 0) {
+            self.ready_queue_head = 0;
+            return;
+        }
+
+        // Reset pending markers for any indices that remain queued.
+        var idx: usize = self.ready_queue_head;
+        while (idx < self.ready_queue.items.len) : (idx += 1) {
+            const index = self.ready_queue.items[idx];
+            if (index >= self.sources.items.len) continue;
+            self.sources.items[index].ready_signal_depth = 0;
+        }
+
+        self.ready_queue.clearRetainingCapacity();
+        self.ready_queue_head = 0;
+    }
+
+    fn registerReadyObserver(self: *Collector, handle: *SourceHandle, index: usize) void {
+        const register_fn = handle.instance.lifecycle.register_ready_observer orelse {
+            handle.ready_signal_registered = false;
+            return;
+        };
+
+        var context_ptr = handle.ready_signal_context;
+        if (context_ptr == null) {
+            const allocated = self.allocator.create(ReadySignalContext) catch {
+                logWarn(
+                    self.options,
+                    "collector ready observer allocation failed for {s}",
+                    .{handle.descriptor.name},
+                );
+                handle.ready_signal_registered = false;
+                return;
+            };
+            handle.ready_signal_context = allocated;
+            context_ptr = allocated;
+        }
+
+        const ctx = context_ptr.?;
+        ctx.* = .{ .collector = self, .index = index };
+
+        const observer = source.ReadyObserver{
+            .context = @as(*anyopaque, @ptrCast(ctx)),
+            .notify_fn = ReadySignalContext.notify,
+        };
+
+        register_fn(handle.instance.context, observer);
+        handle.ready_signal_registered = true;
+    }
+
+    fn applyProductiveBonus(self: *Collector, index: usize, streak: usize) void {
+        if (streak == 0) return;
+
+        var bonus = streak;
+        while (bonus > 0) : (bonus -= 1) {
+            self.enqueueReady(index);
+        }
+    }
+
+    fn pollIndex(self: *Collector, allocator: std.mem.Allocator, index: usize, total: usize) CollectorError!PollIndexResult {
+        const next_index = (index + 1) % total;
+        var handle = &self.sources.items[index];
+
+        if (handle.shutting_down) {
+            return PollIndexResult{ .status = .skipped, .next_index = next_index };
+        }
+
+        const now = self.clock.now();
+
+        if (isUnderQuarantine(&handle.restart_state.budget, now)) {
+            return PollIndexResult{ .status = .skipped, .next_index = next_index };
+        }
+
+        if (handle.restart_state.pending_restart) {
+            if (now >= handle.restart_state.backoff.resume_at_ns) {
+                self.attemptHandleRestart(handle, allocator, now);
+            }
+            if (handle.restart_state.pending_restart) {
+                return PollIndexResult{ .status = .skipped, .next_index = next_index };
+            }
+        }
+
+        const ready = handle.instance.readyHint();
+        const forced_poll = !ready and handle.ready_skip_count >= max_ready_skip_cycles;
+        if (!ready and !forced_poll) {
+            if (handle.ready_skip_count < math.maxInt(usize)) {
+                handle.ready_skip_count += 1;
+            }
+            recordReadySkip(self);
+            if (handle.productive_streak > 0) {
+                handle.productive_streak -= 1;
+            }
+            return PollIndexResult{ .status = .skipped, .next_index = next_index };
+        }
+        if (forced_poll) {
+            logInfo(
+                self.options,
+                "collector forcing poll for {s} after {d} ready skips",
+                .{ handle.descriptor.name, handle.ready_skip_count },
+            );
+        }
+        handle.ready_skip_count = 0;
+
+        const result = try self.tryPoll(handle, allocator, now);
+
+        switch (result.status) {
+            .yielded => {
+                const batch = result.batch orelse unreachable;
+                handle.consecutive_empty_polls = 0;
+                if (handle.productive_streak < max_productive_streak) {
+                    handle.productive_streak += 1;
+                }
+                self.applyProductiveBonus(index, handle.productive_streak);
+                recordBatchMetrics(self, batch.events.len);
+                return PollIndexResult{
+                    .status = .yielded,
+                    .next_index = next_index,
+                    .batch = PolledBatch{
+                        .descriptor = handle.descriptor,
+                        .batch = batch,
+                    },
+                };
+            },
+            .backpressure => return PollIndexResult{ .status = .backpressure, .next_index = next_index },
+            else => {},
+        }
+
+        if (result.attempted and result.status != .yielded and result.status != .backpressure) {
+            if (handle.consecutive_empty_polls < math.maxInt(usize)) {
+                handle.consecutive_empty_polls += 1;
+            }
+            recordEmptyPoll(self);
+            if (handle.productive_streak > 0) {
+                handle.productive_streak -= 1;
+            }
+        }
+
+        return PollIndexResult{ .status = .idle, .next_index = next_index };
     }
 };
 
@@ -846,12 +1044,20 @@ fn destroySourceHandles(collector: *Collector, allocator: std.mem.Allocator) voi
     if (collector.sources.items.len == 0) return;
 
     for (collector.sources.items) |*handle| {
-        if (handle.shutting_down) continue;
+        if (!handle.shutting_down) {
+            resetTransport(handle, allocator);
+            handle.instance.shutdown(allocator);
+            handle.shutting_down = true;
+        }
 
-        resetTransport(handle, allocator);
+        handle.ready_signal_depth = 0;
+        handle.ready_signal_registered = false;
+        handle.productive_streak = 0;
 
-        handle.instance.shutdown(allocator);
-        handle.shutting_down = true;
+        if (handle.ready_signal_context) |context| {
+            allocator.destroy(context);
+            handle.ready_signal_context = null;
+        }
     }
 }
 
@@ -1460,6 +1666,159 @@ test "collector defers polling until ready hint satisfied" {
 
     try collector.shutdown(testing.allocator);
     try testing.expectEqual(@as(usize, 1), harness.shutdowns);
+}
+
+test "collector biases scheduling toward productive sources" {
+    const testing = std.testing;
+
+    const Mock = struct {
+        pub const Harness = struct {
+            allocator: std.mem.Allocator,
+            sequence: std.ArrayList(u8),
+            a_poll_calls: usize = 0,
+            b_poll_calls: usize = 0,
+            a_ready_calls: usize = 0,
+            b_ready_calls: usize = 0,
+
+            fn init(allocator: std.mem.Allocator) Harness {
+                return .{ .allocator = allocator, .sequence = std.ArrayList(u8).init(allocator) };
+            }
+
+            fn deinit(self: *Harness) void {
+                self.sequence.deinit();
+            }
+        };
+
+        pub var harness: ?*Harness = null;
+
+        const Role = enum { productive, idle };
+
+        const State = struct {
+            allocator: std.mem.Allocator,
+            descriptor: source.SourceDescriptor,
+            harness: *Harness,
+            role: Role,
+            has_data: bool,
+            event_storage: [1]event.Event,
+        };
+
+        pub fn factory() source.SourceFactory {
+            return .{ .type = .syslog, .create = create };
+        }
+
+        fn create(ctx: source.InitContext, config: *const cfg.SourceConfig) source.SourceError!source.Source {
+            const h = harness orelse return source.SourceError.InvalidConfiguration;
+
+            const role = if (std.mem.eql(u8, config.id, "a_source")) Role.productive else Role.idle;
+
+            const descriptor = source.SourceDescriptor{
+                .type = .syslog,
+                .name = config.id,
+            };
+
+            const state = ctx.allocator.create(State) catch return source.SourceError.StartupFailed;
+            state.* = .{
+                .allocator = ctx.allocator,
+                .descriptor = descriptor,
+                .harness = h,
+                .role = role,
+                .has_data = role == .productive,
+                .event_storage = .{event.Event{
+                    .metadata = .{ .source_id = config.id },
+                    .payload = .{ .log = .{ .message = config.id, .fields = &[_]event.Field{} } },
+                }},
+            };
+
+            return source.Source{
+                .descriptor = descriptor,
+                .capabilities = .{ .streaming = false, .batching = true },
+                .lifecycle = .{
+                    .start_stream = startStream,
+                    .poll_batch = pollBatch,
+                    .shutdown = shutdown,
+                    .ready_hint = readyHint,
+                },
+                .context = state,
+            };
+        }
+
+        fn asState(ptr: *anyopaque) *State {
+            const aligned: *align(@alignOf(State)) anyopaque = @alignCast(ptr);
+            return @ptrCast(aligned);
+        }
+
+        fn startStream(context: *anyopaque, allocator: std.mem.Allocator) source.SourceError!?event.EventStream {
+            _ = context;
+            _ = allocator;
+            return source.SourceError.OperationNotSupported;
+        }
+
+        fn pollBatch(context: *anyopaque, allocator: std.mem.Allocator) source.SourceError!?event.EventBatch {
+            _ = allocator;
+            const state = asState(context);
+            switch (state.role) {
+                .productive => {
+                    state.harness.a_poll_calls += 1;
+                    if (!state.has_data) return null;
+                    state.has_data = false;
+                    return event.EventBatch{ .events = state.event_storage[0..1], .ack = event.AckToken.none() };
+                },
+                .idle => {
+                    state.harness.b_poll_calls += 1;
+                    return null;
+                },
+            }
+        }
+
+        fn shutdown(context: *anyopaque, allocator: std.mem.Allocator) void {
+            _ = allocator;
+            const state = asState(context);
+            state.allocator.destroy(state);
+        }
+
+        fn readyHint(context: *anyopaque) bool {
+            const state = asState(context);
+            switch (state.role) {
+                .productive => state.harness.a_ready_calls += 1,
+                .idle => state.harness.b_ready_calls += 1,
+            }
+            const marker: u8 = if (state.role == .productive) 'A' else 'B';
+            state.harness.sequence.append(marker) catch {};
+            return state.has_data;
+        }
+    };
+
+    var harness_storage = Mock.Harness.init(testing.allocator);
+    defer harness_storage.deinit();
+    Mock.harness = &harness_storage;
+    defer Mock.harness = null;
+
+    const configs = [_]cfg.SourceConfig{
+        .{ .id = "a_source", .payload = .{ .syslog = .{ .address = "127.0.0.1:1514" } } },
+        .{ .id = "b_source", .payload = .{ .syslog = .{ .address = "127.0.0.1:2514" } } },
+    };
+
+    const registry = source.Registry{ .factories = &[_]source.SourceFactory{Mock.factory()} };
+    const options = CollectorOptions{ .registry = registry };
+
+    var collector = try Collector.init(testing.allocator, &configs, options);
+    defer collector.deinit();
+    defer collector.shutdown(testing.allocator) catch {};
+
+    try collector.start(testing.allocator);
+
+    const first = try collector.poll(testing.allocator);
+    try testing.expect(first != null);
+    try testing.expectEqualStrings("a_source", first.?.descriptor.name);
+
+    // Second poll should prioritise the productive source again via weighting.
+    const second = try collector.poll(testing.allocator);
+    try testing.expect(second == null);
+
+    try testing.expect(harness_storage.sequence.items.len >= 2);
+    try testing.expectEqual(@as(u8, 'A'), harness_storage.sequence.items[0]);
+    try testing.expectEqual(@as(u8, 'A'), harness_storage.sequence.items[1]);
+    try testing.expectEqual(@as(usize, 1), harness_storage.a_poll_calls);
 }
 
 test "collector forces poll after exhausting ready hint budget" {

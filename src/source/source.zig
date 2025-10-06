@@ -80,11 +80,21 @@ pub const Capabilities = struct {
     batching: bool = true,
 };
 
+pub const ReadyObserver = struct {
+    context: *anyopaque,
+    notify_fn: *const fn (context: *anyopaque) void,
+
+    pub fn notify(self: ReadyObserver) void {
+        self.notify_fn(self.context);
+    }
+};
+
 pub const Lifecycle = struct {
     start_stream: *const fn (context: *anyopaque, allocator: std.mem.Allocator) SourceError!?event.EventStream,
     poll_batch: ?*const fn (context: *anyopaque, allocator: std.mem.Allocator) SourceError!?event.EventBatch = null,
     shutdown: *const fn (context: *anyopaque, allocator: std.mem.Allocator) void,
     ready_hint: ?*const fn (context: *anyopaque) bool = null,
+    register_ready_observer: ?*const fn (context: *anyopaque, observer: ReadyObserver) void = null,
 };
 
 pub const Source = struct {
@@ -110,6 +120,11 @@ pub const Source = struct {
     pub fn readyHint(self: *const Source) bool {
         const func = self.lifecycle.ready_hint orelse return true;
         return func(self.context);
+    }
+
+    pub fn registerReadyObserver(self: *const Source, observer: ReadyObserver) void {
+        const func = self.lifecycle.register_ready_observer orelse return;
+        func(self.context, observer);
     }
 };
 

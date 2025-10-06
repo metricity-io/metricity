@@ -15,6 +15,7 @@ pub const Logger = source_impl.Logger;
 pub const Metrics = source_impl.Metrics;
 pub const Capabilities = source_impl.Capabilities;
 pub const Lifecycle = source_impl.Lifecycle;
+pub const ReadyObserver = source_impl.ReadyObserver;
 const syslog = @import("syslog.zig");
 
 const builtin_factories = &[_]source.SourceFactory{

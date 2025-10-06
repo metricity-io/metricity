@@ -341,6 +341,7 @@ const SyslogState = struct {
     transport: TransportManager,
     framer: frame.Framer,
     acl: SyslogAcl,
+    ready_observer: ?src.ReadyObserver = null,
     rate_limiter: ?RateLimiter = null,
     time_source: TimeSource = defaultTimeSource,
 };
@@ -356,6 +357,12 @@ const BatchAckContext = struct {
     descriptor_name: []const u8,
     handle: event.AckHandle,
 };
+
+fn signalReady(state: *SyslogState) void {
+    if (state.ready_observer) |observer| {
+        observer.notify();
+    }
+}
 
 const DrainError = error{
     Backpressure,
@@ -459,6 +466,7 @@ fn create(ctx: src.InitContext, config: *const cfg.SourceConfig) src.SourceError
         .buffer = undefined,
         .log = ctx.log,
         .metrics = ctx.metrics,
+        .ready_observer = null,
         .transport = transport_manager,
         .framer = frame.Framer.init(ctx.allocator, .auto, syslog_cfg.message_size_limit),
         .acl = acl_init,
@@ -489,6 +497,7 @@ fn create(ctx: src.InitContext, config: *const cfg.SourceConfig) src.SourceError
             .poll_batch = pollBatch,
             .shutdown = shutdown,
             .ready_hint = readyHint,
+            .register_ready_observer = registerReadyObserver,
         },
         .context = state,
     };
@@ -536,6 +545,7 @@ fn pollBatch(context: *anyopaque, allocator: std.mem.Allocator) src.SourceError!
 fn shutdown(context: *anyopaque, allocator: std.mem.Allocator) void {
     _ = allocator;
     const state = asState(context);
+    state.ready_observer = null;
     state.transport.shutdown(state);
     state.acl.deinit();
     state.buffer.deinit();
@@ -547,6 +557,14 @@ fn readyHint(context: *anyopaque) bool {
     const state = asState(context);
     if (!state.buffer.isEmpty()) return true;
     return state.framer.hasBufferedData();
+}
+
+fn registerReadyObserver(context: *anyopaque, observer: src.ReadyObserver) void {
+    const state = asState(context);
+    state.ready_observer = observer;
+    if (readyHint(context)) {
+        signalReady(state);
+    }
 }
 
 fn asState(ptr: *anyopaque) *SyslogState {
@@ -575,7 +593,10 @@ fn enqueueEvent(state: *SyslogState, managed: event.ManagedEvent) src.SourceErro
     };
 
     switch (result) {
-        .stored => recordEnqueued(state, 1),
+        .stored => {
+            recordEnqueued(state, 1);
+            signalReady(state);
+        },
         .dropped_newest => {
             recordDrop(state, 1);
             managed.finalizer.run();
@@ -717,6 +738,8 @@ fn pumpTransport(state: *SyslogState, allocator: std.mem.Allocator) void {
             logError(state, "syslog source {s}: failed to buffer tcp chunk", .{state.descriptor.name});
             continue;
         };
+
+        signalReady(state);
 
         while (true) {
             const extracted = state.framer.next() catch |err| {
