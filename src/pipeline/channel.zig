@@ -39,6 +39,25 @@ pub fn Channel(comptime T: type) type {
             self.* = undefined;
         }
 
+        pub fn drainWith(self: *@This(), handler: anytype) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            while (self.buffer.pop()) |item| {
+                handler(item);
+            }
+
+            if (self.observer) |obs| {
+                obs.recordDepth(self.buffer.len());
+            }
+            self.not_full.broadcast();
+        }
+
+        pub fn deinitWith(self: *@This(), handler: anytype) void {
+            self.drainWith(handler);
+            self.deinit();
+        }
+
         pub fn push(self: *@This(), item: T) PushError!PushResult(T) {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -380,6 +399,11 @@ test "channel metrics capture depth and drops" {
     const newest_outcome = try newest_channel.push(22);
     try testing.expect(newest_outcome == .dropped_newest);
     try testing.expectEqual(@as(u64, 1), recorder.drop_newest);
+
+    channel.close();
+    newest_channel.close();
+    while (channel.pop()) |_| {}
+    while (newest_channel.pop()) |_| {}
 }
 
 test "pushBlocking waits for capacity" {

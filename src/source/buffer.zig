@@ -48,9 +48,21 @@ pub fn BoundedBuffer(comptime T: type) type {
             };
         }
 
+        pub fn drainWith(self: *Self, handler: anytype) void {
+            while (self.pop()) |item| {
+                handler(item);
+            }
+        }
+
         pub fn deinit(self: *Self) void {
+            std.debug.assert(self.count == 0);
             self.allocator.free(self.storage);
             self.* = undefined;
+        }
+
+        pub fn deinitWith(self: *Self, handler: anytype) void {
+            self.drainWith(handler);
+            self.deinit();
         }
 
         pub fn capacity(self: *const Self) usize {
@@ -139,6 +151,7 @@ test "reject policy signals producer" {
     try std.testing.expectError(PushError.WouldBlock, buffer.push(2));
     try std.testing.expectEqual(@as(?u32, 1), buffer.pop());
     try std.testing.expectEqual(Outcome{ .stored = {} }, try buffer.push(3));
+    try std.testing.expectEqual(@as(?u32, 3), buffer.pop());
 }
 
 test "drop_oldest policy evicts head and stores new item" {
@@ -159,4 +172,26 @@ test "drop_oldest policy evicts head and stores new item" {
     try std.testing.expectEqual(@as(?u32, 2), buffer.pop());
     try std.testing.expectEqual(@as(?u32, 3), buffer.pop());
     try std.testing.expectEqual(@as(?u32, null), buffer.pop());
+}
+
+test "drainWith executes handler for remaining items" {
+    const allocator = std.testing.allocator;
+    const Buffer = BoundedBuffer(u32);
+    var buffer = try Buffer.init(allocator, 4, .reject);
+    defer buffer.deinit();
+
+    _ = try buffer.push(5);
+    _ = try buffer.push(7);
+
+    const Tracker = struct {
+        var sum: usize = 0;
+
+        fn record(value: u32) void {
+            sum += value;
+        }
+    };
+
+    buffer.drainWith(Tracker.record);
+    try std.testing.expectEqual(@as(usize, 12), Tracker.sum);
+    try std.testing.expect(buffer.isEmpty());
 }

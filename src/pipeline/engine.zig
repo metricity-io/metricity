@@ -426,6 +426,11 @@ const TransformRuntime = struct {
     }
 
     fn deinit(self: *TransformRuntime, pipeline: *Pipeline) void {
+        self.channel.drainWith(struct {
+            fn release(message: EventMessage) void {
+                message.context.releaseFailure();
+            }
+        }.release);
         self.program.deinit();
         self.arena.deinit();
         pipeline.allocator.destroy(self.arena);
@@ -569,6 +574,12 @@ const SinkRuntime = struct {
     }
 
     fn deinit(self: *SinkRuntime, pipeline: *Pipeline) void {
+        self.channel.drainWith(struct {
+            fn release(message: SinkMessage) void {
+                message.row.deinit();
+                message.context.releaseFailure();
+            }
+        }.release);
         self.channel.deinit();
         pipeline.allocator.free(self.workers);
         self.channel_metrics.deinit();
@@ -1221,7 +1232,7 @@ test "retryPushEvent treats drop_oldest as stored" {
     var batch_ctx = try BatchContext.create(allocator, &pipeline.metrics, token, 2);
     errdefer batch_ctx.forceRelease();
 
-    var ctx_old = try EventContext.create(allocator, batch_ctx);
+    const ctx_old = try EventContext.create(allocator, batch_ctx);
     errdefer ctx_old.releaseFailure();
     var ctx_new = try EventContext.create(allocator, batch_ctx);
     errdefer ctx_new.releaseFailure();
@@ -1251,6 +1262,74 @@ test "retryPushEvent treats drop_oldest as stored" {
     try testing.expectEqual(event_mod.AckStatus.retryable_failure, status);
 }
 
+test "retryPushEvent releases evicted context" {
+    const allocator = testing.allocator;
+
+    var pipeline = Pipeline{
+        .allocator = allocator,
+        .collector = undefined,
+        .collector_configs = &[_]source_cfg.SourceConfig{},
+        .graph = undefined,
+        .nodes = undefined,
+        .source_lookup = .{},
+        .sink_builder = defaultSinkBuilder,
+        .started = false,
+        .shutting_down = std.atomic.Value(bool).init(false),
+        .worker_allocator = allocator,
+        .metrics = metrics_mod.PipelineMetrics.init(null),
+    };
+
+    var channel = try EventChannel.init(allocator, .{ .capacity = 1, .strategy = .drop_oldest }, null);
+    defer channel.deinit();
+
+    var recorder_alive = true;
+    const Recorder = struct {
+        calls: usize = 0,
+        status: ?event_mod.AckStatus = null,
+        alive_flag: *bool,
+
+        fn complete(context: *anyopaque, status: event_mod.AckStatus) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            self.status = status;
+            self.alive_flag.* = false;
+        }
+    };
+
+    var recorder = Recorder{ .alive_flag = &recorder_alive };
+    var handle = event_mod.AckHandle.init(&recorder, Recorder.complete);
+    const token = event_mod.AckToken.init(&handle);
+
+    var batch_ctx = try BatchContext.create(allocator, &pipeline.metrics, token, 1);
+    defer if (recorder_alive) batch_ctx.forceRelease();
+
+    const ctx_old = try EventContext.create(allocator, batch_ctx);
+
+    const event = event_mod.Event{
+        .metadata = .{},
+        .payload = .{ .log = .{ .message = "drop", .fields = &[_]event_mod.Field{} } },
+    };
+
+    var message_old = EventMessage{ .event = &event, .context = ctx_old };
+    retryPushEvent(&channel, &pipeline, &message_old);
+
+    var batch_ctx_new_alive = true;
+    var batch_ctx_new = try BatchContext.create(allocator, &pipeline.metrics, event_mod.AckToken.none(), 1);
+    defer if (batch_ctx_new_alive) batch_ctx_new.forceRelease();
+
+    const ctx_new = try EventContext.create(allocator, batch_ctx_new);
+    var message_new = EventMessage{ .event = &event, .context = ctx_new };
+    retryPushEvent(&channel, &pipeline, &message_new);
+
+    try testing.expectEqual(@as(usize, 1), recorder.calls);
+    const status = recorder.status orelse unreachable;
+    try testing.expectEqual(event_mod.AckStatus.retryable_failure, status);
+
+    const popped = channel.pop() orelse unreachable;
+    try testing.expect(popped.context == ctx_new);
+    popped.context.releaseSuccess();
+    batch_ctx_new_alive = false;
+}
 test "batch context records ack metrics" {
     const allocator = testing.allocator;
 

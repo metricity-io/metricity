@@ -551,7 +551,11 @@ fn shutdown(context: *anyopaque, allocator: std.mem.Allocator) void {
     state.ready_observer = null;
     state.transport.shutdown(state);
     state.acl.deinit();
-    state.buffer.deinit();
+    state.buffer.deinitWith(struct {
+        fn finalize(managed: event.ManagedEvent) void {
+            managed.finalizer.run();
+        }
+    }.finalize);
     state.framer.deinit();
     state.arena_pool.deinit();
     state.allocator.destroy(state);
@@ -1100,6 +1104,60 @@ test "syslog enqueue differentiates reject and drop metrics" {
     try std.testing.expectEqual(@as(u8, 1), evicted_finalizer_calls);
     try std.testing.expectEqual(@as(u8, 0), new_event_finalizer_calls);
     try std.testing.expectEqual(@as(i64, 1), harness.last_gauge);
+}
+
+test "syslog shutdown finalizes buffered events" {
+    const allocator = std.testing.allocator;
+    var runtime = try netx_runtime.IoRuntime.initDefault();
+    defer runtime.deinit();
+
+    const ctx = src.InitContext{
+        .allocator = allocator,
+        .runtime = &runtime,
+        .log = null,
+        .metrics = null,
+    };
+
+    var source_config = cfg.SourceConfig{
+        .id = "syslog_shutdown",
+        .payload = .{ .syslog = .{
+            .address = "127.0.0.1:5514",
+            .max_batch_size = 2,
+        } },
+    };
+
+    var source_instance = try create(ctx, &source_config);
+    var shut_down = false;
+    defer if (!shut_down) source_instance.shutdown(allocator);
+
+    const state = asState(source_instance.context);
+
+    var finalized: u8 = 0;
+    const Finalizer = struct {
+        fn bump(context: ?*anyopaque) void {
+            if (context) |ptr| {
+                const counter: *u8 = @ptrCast(@alignCast(ptr));
+                counter.* += 1;
+            }
+        }
+    };
+
+    const managed = event.ManagedEvent.init(
+        event.Event{
+            .metadata = .{},
+            .payload = .{ .log = .{ .message = "pending", .fields = &[_]event.Field{} } },
+        },
+        event.EventFinalizer.init(Finalizer.bump, @as(?*anyopaque, @ptrCast(&finalized))),
+    );
+
+    const outcome = try state.buffer.push(managed);
+    try std.testing.expect(outcome == .stored);
+    try std.testing.expectEqual(@as(u8, 0), finalized);
+
+    source_instance.shutdown(allocator);
+    shut_down = true;
+
+    try std.testing.expectEqual(@as(u8, 1), finalized);
 }
 
 test "syslog startStream reuses batch draining semantics" {
