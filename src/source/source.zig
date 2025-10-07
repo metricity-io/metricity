@@ -76,8 +76,8 @@ pub const Metrics = struct {
 };
 
 pub const Capabilities = struct {
-    streaming: bool = true,
-    batching: bool = true,
+    streaming: bool,
+    batching: bool,
 };
 
 pub const ReadyObserver = struct {
@@ -89,42 +89,125 @@ pub const ReadyObserver = struct {
     }
 };
 
-pub const Lifecycle = struct {
+pub const StreamLifecycle = struct {
     start_stream: *const fn (context: *anyopaque, allocator: std.mem.Allocator) SourceError!?event.EventStream,
-    poll_batch: ?*const fn (context: *anyopaque, allocator: std.mem.Allocator) SourceError!?event.EventBatch = null,
     shutdown: *const fn (context: *anyopaque, allocator: std.mem.Allocator) void,
     ready_hint: ?*const fn (context: *anyopaque) bool = null,
     register_ready_observer: ?*const fn (context: *anyopaque, observer: ReadyObserver) void = null,
 };
 
-pub const Source = struct {
-    descriptor: SourceDescriptor,
-    capabilities: Capabilities,
-    lifecycle: Lifecycle,
-    context: *anyopaque,
+pub const BatchLifecycle = struct {
+    poll_batch: *const fn (context: *anyopaque, allocator: std.mem.Allocator) SourceError!?event.EventBatch,
+    shutdown: *const fn (context: *anyopaque, allocator: std.mem.Allocator) void,
+    ready_hint: ?*const fn (context: *anyopaque) bool = null,
+    register_ready_observer: ?*const fn (context: *anyopaque, observer: ReadyObserver) void = null,
+};
+
+pub const Source = union(enum) {
+    stream: struct {
+        descriptor: SourceDescriptor,
+        capabilities: Capabilities,
+        context: *anyopaque,
+        lifecycle: StreamLifecycle,
+        batching: union(enum) {
+            unsupported,
+            supported: BatchLifecycle,
+        } = .unsupported,
+    },
+    batch: struct {
+        descriptor: SourceDescriptor,
+        capabilities: Capabilities,
+        context: *anyopaque,
+        lifecycle: BatchLifecycle,
+    },
+
+    pub fn descriptor(self: *const Source) SourceDescriptor {
+        return switch (self.*) {
+            .stream => |stream| stream.descriptor,
+            .batch => |batch| batch.descriptor,
+        };
+    }
+
+    pub fn capabilities(self: *const Source) Capabilities {
+        return switch (self.*) {
+            .stream => |stream| stream.capabilities,
+            .batch => |batch| batch.capabilities,
+        };
+    }
+
+    pub fn supportsStreaming(self: *const Source) bool {
+        return switch (self.*) {
+            .stream => true,
+            .batch => false,
+        };
+    }
+
+    pub fn supportsBatching(self: *const Source) bool {
+        return switch (self.*) {
+            .stream => |stream| switch (stream.batching) {
+                .unsupported => false,
+                .supported => true,
+            },
+            .batch => true,
+        };
+    }
 
     pub fn startStream(self: *const Source, allocator: std.mem.Allocator) SourceError!?event.EventStream {
-        return self.lifecycle.start_stream(self.context, allocator);
+        return switch (self.*) {
+            .stream => |stream| stream.lifecycle.start_stream(stream.context, allocator),
+            .batch => SourceError.OperationNotSupported,
+        };
     }
 
     pub fn pollBatch(self: *const Source, allocator: std.mem.Allocator) SourceError!?event.EventBatch {
-        const handler = self.lifecycle.poll_batch orelse
-            return SourceError.OperationNotSupported;
-        return handler(self.context, allocator);
+        return switch (self.*) {
+            .stream => |stream| switch (stream.batching) {
+                .unsupported => SourceError.OperationNotSupported,
+                .supported => |batch_lc| batch_lc.poll_batch(stream.context, allocator),
+            },
+            .batch => |batch| batch.lifecycle.poll_batch(batch.context, allocator),
+        };
     }
 
     pub fn shutdown(self: *const Source, allocator: std.mem.Allocator) void {
-        self.lifecycle.shutdown(self.context, allocator);
+        switch (self.*) {
+            .stream => |stream| stream.lifecycle.shutdown(stream.context, allocator),
+            .batch => |batch| batch.lifecycle.shutdown(batch.context, allocator),
+        }
     }
 
     pub fn readyHint(self: *const Source) bool {
-        const func = self.lifecycle.ready_hint orelse return true;
-        return func(self.context);
+        return switch (self.*) {
+            .stream => |stream| if (stream.lifecycle.ready_hint) |func| func(stream.context) else true,
+            .batch => |batch| if (batch.lifecycle.ready_hint) |func| func(batch.context) else true,
+        };
     }
 
     pub fn registerReadyObserver(self: *const Source, observer: ReadyObserver) void {
-        const func = self.lifecycle.register_ready_observer orelse return;
-        func(self.context, observer);
+        switch (self.*) {
+            .stream => |stream| {
+                const func = stream.lifecycle.register_ready_observer orelse return;
+                func(stream.context, observer);
+            },
+            .batch => |batch| {
+                const func = batch.lifecycle.register_ready_observer orelse return;
+                func(batch.context, observer);
+            },
+        }
+    }
+
+    pub fn supportsReadyObserver(self: *const Source) bool {
+        return switch (self.*) {
+            .stream => |stream| stream.lifecycle.register_ready_observer != null,
+            .batch => |batch| batch.lifecycle.register_ready_observer != null,
+        };
+    }
+
+    pub fn context(self: *const Source) *anyopaque {
+        return switch (self.*) {
+            .stream => |stream| stream.context,
+            .batch => |batch| batch.context,
+        };
     }
 };
 

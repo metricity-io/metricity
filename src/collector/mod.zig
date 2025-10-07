@@ -419,13 +419,14 @@ pub const Collector = struct {
                 return CollectorError.InitializationFailed;
             };
 
+            const descriptor = instance.descriptor();
             const handle = SourceHandle{
-                .descriptor = instance.descriptor,
+                .descriptor = descriptor,
                 .instance = instance,
                 .transport = .none,
-                .supports_batching = instance.lifecycle.poll_batch != null,
+                .supports_batching = instance.supportsBatching(),
                 .shutting_down = false,
-                .restart_policy = selectRestartPolicy(instance.descriptor),
+                .restart_policy = selectRestartPolicy(descriptor),
             };
 
             collector.sources.append(allocator, handle) catch {
@@ -460,7 +461,7 @@ pub const Collector = struct {
                 continue;
             }
 
-            const capabilities = handle.instance.capabilities;
+            const capabilities = handle.instance.capabilities();
             if (!capabilities.streaming and !handle.supports_batching) {
                 logError(
                     self.options,
@@ -613,7 +614,7 @@ pub const Collector = struct {
         allocator: std.mem.Allocator,
         now: u128,
     ) void {
-        if (!handle.instance.capabilities.streaming) {
+        if (!handle.instance.capabilities().streaming) {
             observeSuccess(&handle.restart_state);
             handle.restart_state.pending_restart = false;
             self.refreshQuarantineGauge();
@@ -987,11 +988,10 @@ pub const Collector = struct {
     }
 
     fn registerReadyObserver(self: *Collector, handle: *SourceHandle, index: usize) void {
-        const register_fn = handle.instance.lifecycle.register_ready_observer orelse {
+        if (!handle.instance.supportsReadyObserver()) {
             handle.ready_signal_registered = false;
             return;
-        };
-
+        }
         var context_ptr = handle.ready_signal_context;
         if (context_ptr == null) {
             const allocated = self.allocator.create(ReadySignalContext) catch {
@@ -1015,7 +1015,7 @@ pub const Collector = struct {
             .notify_fn = ReadySignalContext.notify,
         };
 
-        register_fn(handle.instance.context, observer);
+        handle.instance.registerReadyObserver(observer);
         handle.ready_signal_registered = true;
     }
 
@@ -1549,16 +1549,19 @@ test "collector polls batch-only mock source" {
                 }},
             };
 
+            const lifecycle = source.BatchLifecycle{
+                .poll_batch = pollBatch,
+                .shutdown = shutdown,
+                .ready_hint = readyHint,
+            };
+
             return source.Source{
-                .descriptor = descriptor,
-                .capabilities = .{ .streaming = false, .batching = true },
-                .lifecycle = .{
-                    .start_stream = startStream,
-                    .poll_batch = pollBatch,
-                    .shutdown = shutdown,
-                    .ready_hint = readyHint,
+                .batch = .{
+                    .descriptor = descriptor,
+                    .capabilities = .{ .streaming = false, .batching = true },
+                    .context = state,
+                    .lifecycle = lifecycle,
                 },
-                .context = state,
             };
         }
 
@@ -1686,16 +1689,19 @@ test "collector defers polling until ready hint satisfied" {
                 }},
             };
 
+            const lifecycle = source.BatchLifecycle{
+                .poll_batch = pollBatch,
+                .shutdown = shutdown,
+                .ready_hint = readyHint,
+            };
+
             return source.Source{
-                .descriptor = descriptor,
-                .capabilities = .{ .streaming = false, .batching = true },
-                .lifecycle = .{
-                    .start_stream = startStream,
-                    .poll_batch = pollBatch,
-                    .shutdown = shutdown,
-                    .ready_hint = readyHint,
+                .batch = .{
+                    .descriptor = descriptor,
+                    .capabilities = .{ .streaming = false, .batching = true },
+                    .context = state,
+                    .lifecycle = lifecycle,
                 },
-                .context = state,
             };
         }
 
@@ -1830,16 +1836,19 @@ test "collector biases scheduling toward productive sources" {
                 }},
             };
 
+            const lifecycle = source.BatchLifecycle{
+                .poll_batch = pollBatch,
+                .shutdown = shutdown,
+                .ready_hint = readyHint,
+            };
+
             return source.Source{
-                .descriptor = descriptor,
-                .capabilities = .{ .streaming = false, .batching = true },
-                .lifecycle = .{
-                    .start_stream = startStream,
-                    .poll_batch = pollBatch,
-                    .shutdown = shutdown,
-                    .ready_hint = readyHint,
+                .batch = .{
+                    .descriptor = descriptor,
+                    .capabilities = .{ .streaming = false, .batching = true },
+                    .context = state,
+                    .lifecycle = lifecycle,
                 },
-                .context = state,
             };
         }
 
@@ -1975,16 +1984,19 @@ test "collector forces poll after exhausting ready hint budget" {
                 .harness = h,
             };
 
+            const lifecycle = source.BatchLifecycle{
+                .poll_batch = pollBatch,
+                .shutdown = shutdown,
+                .ready_hint = readyHint,
+            };
+
             return source.Source{
-                .descriptor = descriptor,
-                .capabilities = .{ .streaming = false, .batching = true },
-                .lifecycle = .{
-                    .start_stream = startStream,
-                    .poll_batch = pollBatch,
-                    .shutdown = shutdown,
-                    .ready_hint = readyHint,
+                .batch = .{
+                    .descriptor = descriptor,
+                    .capabilities = .{ .streaming = false, .batching = true },
+                    .context = state,
+                    .lifecycle = lifecycle,
                 },
-                .context = state,
             };
         }
 
@@ -2111,16 +2123,19 @@ test "collector surfaces stream backpressure error" {
                 .harness = h,
             };
 
+            const lifecycle = source.StreamLifecycle{
+                .start_stream = startStream,
+                .shutdown = shutdown,
+                .ready_hint = readyHint,
+            };
+
             return source.Source{
-                .descriptor = descriptor,
-                .capabilities = .{ .streaming = true, .batching = false },
-                .lifecycle = .{
-                    .start_stream = startStream,
-                    .poll_batch = null,
-                    .shutdown = shutdown,
-                    .ready_hint = readyHint,
+                .stream = .{
+                    .descriptor = descriptor,
+                    .capabilities = .{ .streaming = true, .batching = false },
+                    .context = state,
+                    .lifecycle = lifecycle,
                 },
-                .context = state,
             };
         }
 
@@ -2240,16 +2255,19 @@ test "collector releases stream after end of stream" {
                 }},
             };
 
+            const lifecycle = source.StreamLifecycle{
+                .start_stream = startStream,
+                .shutdown = shutdown,
+                .ready_hint = readyHint,
+            };
+
             return source.Source{
-                .descriptor = descriptor,
-                .capabilities = .{ .streaming = true, .batching = false },
-                .lifecycle = .{
-                    .start_stream = startStream,
-                    .poll_batch = null,
-                    .shutdown = shutdown,
-                    .ready_hint = readyHint,
+                .stream = .{
+                    .descriptor = descriptor,
+                    .capabilities = .{ .streaming = true, .batching = false },
+                    .context = state,
+                    .lifecycle = lifecycle,
                 },
-                .context = state,
             };
         }
 
@@ -2385,16 +2403,19 @@ test "collector stream decode failures trigger backoff after streak" {
                 .harness = h,
             };
 
+            const lifecycle = source.StreamLifecycle{
+                .start_stream = startStream,
+                .shutdown = shutdown,
+                .ready_hint = readyHint,
+            };
+
             return source.Source{
-                .descriptor = descriptor,
-                .capabilities = .{ .streaming = true, .batching = false },
-                .lifecycle = .{
-                    .start_stream = startStream,
-                    .poll_batch = null,
-                    .shutdown = shutdown,
-                    .ready_hint = readyHint,
+                .stream = .{
+                    .descriptor = descriptor,
+                    .capabilities = .{ .streaming = true, .batching = false },
+                    .context = state,
+                    .lifecycle = lifecycle,
                 },
-                .context = state,
             };
         }
 
@@ -2549,16 +2570,26 @@ test "collector falls back to batch after stream completion" {
                 }},
             };
 
+            const stream_lifecycle = source.StreamLifecycle{
+                .start_stream = startStream,
+                .shutdown = shutdown,
+                .ready_hint = readyHint,
+            };
+
+            const batch_lifecycle = source.BatchLifecycle{
+                .poll_batch = pollBatch,
+                .shutdown = shutdown,
+                .ready_hint = readyHint,
+            };
+
             return source.Source{
-                .descriptor = descriptor,
-                .capabilities = .{ .streaming = true, .batching = true },
-                .lifecycle = .{
-                    .start_stream = startStream,
-                    .poll_batch = pollBatch,
-                    .shutdown = shutdown,
-                    .ready_hint = readyHint,
+                .stream = .{
+                    .descriptor = descriptor,
+                    .capabilities = .{ .streaming = true, .batching = true },
+                    .context = state,
+                    .lifecycle = stream_lifecycle,
+                    .batching = .{ .supported = batch_lifecycle },
                 },
-                .context = state,
             };
         }
 
@@ -2696,16 +2727,18 @@ test "collector restarts source after transient startup failure" {
             const state = try ctx.allocator.create(SourceCtx);
             state.* = .{ .allocator = ctx.allocator, .descriptor = descriptor };
 
+            const lifecycle = source.StreamLifecycle{
+                .start_stream = startStream,
+                .shutdown = shutdown,
+            };
+
             return source.Source{
-                .descriptor = descriptor,
-                .capabilities = .{ .streaming = true, .batching = false },
-                .lifecycle = .{
-                    .start_stream = startStream,
-                    .poll_batch = null,
-                    .shutdown = shutdown,
-                    .ready_hint = null,
+                .stream = .{
+                    .descriptor = descriptor,
+                    .capabilities = .{ .streaming = true, .batching = false },
+                    .context = state,
+                    .lifecycle = lifecycle,
                 },
-                .context = state,
             };
         }
 
@@ -2818,16 +2851,18 @@ test "collector marks permanent start failures as shutdown" {
             const descriptor = source.SourceDescriptor{ .type = .syslog, .name = config.id };
             const state = try ctx.allocator.create(source.SourceDescriptor);
             state.* = descriptor;
+            const lifecycle = source.StreamLifecycle{
+                .start_stream = startStream,
+                .shutdown = shutdown,
+            };
+
             return source.Source{
-                .descriptor = descriptor,
-                .capabilities = .{ .streaming = true, .batching = false },
-                .lifecycle = .{
-                    .start_stream = startStream,
-                    .poll_batch = null,
-                    .shutdown = shutdown,
-                    .ready_hint = null,
+                .stream = .{
+                    .descriptor = descriptor,
+                    .capabilities = .{ .streaming = true, .batching = false },
+                    .context = state,
+                    .lifecycle = lifecycle,
                 },
-                .context = state,
             };
         }
 
@@ -2887,16 +2922,18 @@ test "collector enforces restart failure budget hold" {
             const state = try ctx.allocator.create(SourceCtx);
             state.* = .{ .allocator = ctx.allocator, .descriptor = descriptor };
 
+            const lifecycle = source.StreamLifecycle{
+                .start_stream = startStream,
+                .shutdown = shutdown,
+            };
+
             return source.Source{
-                .descriptor = descriptor,
-                .capabilities = .{ .streaming = true, .batching = false },
-                .lifecycle = .{
-                    .start_stream = startStream,
-                    .poll_batch = null,
-                    .shutdown = shutdown,
-                    .ready_hint = null,
+                .stream = .{
+                    .descriptor = descriptor,
+                    .capabilities = .{ .streaming = true, .batching = false },
+                    .context = state,
+                    .lifecycle = lifecycle,
                 },
-                .context = state,
             };
         }
 

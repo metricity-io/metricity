@@ -16,7 +16,8 @@ pub const InitContext = source_impl.InitContext;
 pub const Logger = source_impl.Logger;
 pub const Metrics = source_impl.Metrics;
 pub const Capabilities = source_impl.Capabilities;
-pub const Lifecycle = source_impl.Lifecycle;
+pub const StreamLifecycle = source_impl.StreamLifecycle;
+pub const BatchLifecycle = source_impl.BatchLifecycle;
 pub const ReadyObserver = source_impl.ReadyObserver;
 const syslog = @import("syslog.zig");
 

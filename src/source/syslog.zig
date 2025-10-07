@@ -497,17 +497,28 @@ fn create(ctx: src.InitContext, config: *const cfg.SourceConfig) src.SourceError
         };
     };
 
+    const stream_lifecycle = src.StreamLifecycle{
+        .start_stream = startStream,
+        .shutdown = shutdown,
+        .ready_hint = readyHint,
+        .register_ready_observer = registerReadyObserver,
+    };
+
+    const batch_lifecycle = src.BatchLifecycle{
+        .poll_batch = pollBatch,
+        .shutdown = shutdown,
+        .ready_hint = readyHint,
+        .register_ready_observer = registerReadyObserver,
+    };
+
     return src.Source{
-        .descriptor = descriptor,
-        .capabilities = .{ .streaming = true, .batching = true },
-        .lifecycle = .{
-            .start_stream = startStream,
-            .poll_batch = pollBatch,
-            .shutdown = shutdown,
-            .ready_hint = readyHint,
-            .register_ready_observer = registerReadyObserver,
+        .stream = .{
+            .descriptor = descriptor,
+            .capabilities = .{ .streaming = true, .batching = true },
+            .context = state,
+            .lifecycle = stream_lifecycle,
+            .batching = .{ .supported = batch_lifecycle },
         },
-        .context = state,
     };
 }
 

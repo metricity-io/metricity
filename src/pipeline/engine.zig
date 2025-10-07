@@ -1007,15 +1007,18 @@ const TestSource = struct {
             .payload = .{ .log = .{ .message = "hello", .fields = state.fields } },
         };
 
+        const lifecycle = source_mod.BatchLifecycle{
+            .poll_batch = pollBatch,
+            .shutdown = shutdown,
+        };
+
         return source_mod.Source{
-            .descriptor = .{ .type = .syslog, .name = config.id },
-            .capabilities = .{ .streaming = false, .batching = true },
-            .lifecycle = .{
-                .start_stream = startStream,
-                .poll_batch = pollBatch,
-                .shutdown = shutdown,
+            .batch = .{
+                .descriptor = .{ .type = .syslog, .name = config.id },
+                .capabilities = .{ .streaming = false, .batching = true },
+                .context = state,
+                .lifecycle = lifecycle,
             },
-            .context = state,
         };
     }
 
