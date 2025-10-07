@@ -881,13 +881,13 @@ const TestSink = struct {
     const Context = struct {
         mutex: std.Thread.Mutex = .{},
         seen: bool = false,
-        value: ?i64 = null,
+        severity: ?i64 = null,
         message: ?[]const u8 = null,
     };
 
     const Snapshot = struct {
         seen: bool,
-        value: ?i64,
+        severity: ?i64,
         message: ?[]const u8,
     };
 
@@ -906,7 +906,7 @@ const TestSink = struct {
         defer ctx.mutex.unlock();
         ctx.seen = true;
         if (row.values.len > 0 and row.values[0].value == .integer) {
-            ctx.value = row.values[0].value.integer;
+            ctx.severity = row.values[0].value.integer;
         }
         if (row.values.len > 1 and row.values[1].value == .string) {
             ctx.message = row.values[1].value.string;
@@ -923,9 +923,9 @@ const TestSink = struct {
     }
 
     fn snapshot() Snapshot {
-        const ctx = shared_context orelse return Snapshot{ .seen = false, .value = null, .message = null };
+        const ctx = shared_context orelse return Snapshot{ .seen = false, .severity = null, .message = null };
         ctx.mutex.lock();
-        const snap = Snapshot{ .seen = ctx.seen, .value = ctx.value, .message = ctx.message };
+        const snap = Snapshot{ .seen = ctx.seen, .severity = ctx.severity, .message = ctx.message };
         ctx.mutex.unlock();
         return snap;
     }
@@ -997,10 +997,9 @@ const TestSource = struct {
             .fields = &[_]event_mod.Field{},
         };
 
-        state.fields = ctx.allocator.alloc(event_mod.Field, 2) catch return source_mod.SourceError.StartupFailed;
+        state.fields = ctx.allocator.alloc(event_mod.Field, 1) catch return source_mod.SourceError.StartupFailed;
         errdefer ctx.allocator.free(state.fields);
-        state.fields[0] = .{ .name = "value", .value = .{ .integer = 41 } };
-        state.fields[1] = .{ .name = "level", .value = .{ .string = "info" } };
+        state.fields[0] = .{ .name = "syslog_severity", .value = .{ .integer = 4 } };
 
         state.event_storage[0] = event_mod.Event{
             .metadata = .{ .source_id = config.id },
@@ -1058,7 +1057,7 @@ test "pipeline applies sql transform and emits to sink" {
                 .id = "sql",
                 .inputs = &[_][]const u8{"test_source"},
                 .outputs = &[_][]const u8{"sink"},
-                .query = "SELECT value + 1 AS next_value, message FROM logs WHERE level = 'info'",
+                .query = "SELECT syslog_severity, message FROM logs WHERE syslog_severity <= 4",
             } },
         },
         .sinks = &[_]config_mod.SinkNode{
@@ -1080,7 +1079,7 @@ test "pipeline applies sql transform and emits to sink" {
     while (attempts < 100) : (attempts += 1) {
         const snapshot = TestSink.snapshot();
         if (snapshot.seen) {
-            try testing.expectEqual(@as(?i64, 42), snapshot.value);
+            try testing.expectEqual(@as(?i64, 4), snapshot.severity);
             try testing.expectEqualStrings("hello", snapshot.message orelse "");
             break;
         }

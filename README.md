@@ -35,7 +35,7 @@ address = "udp://0.0.0.0:514"
 [transforms.sql_enrich]
 type = "sql"
 inputs = ["syslog_in"]
-query = "SELECT value + 1 AS next_value, message FROM logs WHERE level = 'info'"
+query = "SELECT syslog_severity, message FROM logs WHERE syslog_severity <= 4"
 
 [sinks.console]
 type = "console"

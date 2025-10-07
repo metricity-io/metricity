@@ -47,7 +47,7 @@ const BackpressureSource = struct {
 
         state.fields = ctx.allocator.alloc(event_mod.Field, 1) catch return source_mod.SourceError.StartupFailed;
         errdefer ctx.allocator.free(state.fields);
-        state.fields[0] = .{ .name = "value", .value = .{ .integer = 41 } };
+        state.fields[0] = .{ .name = "syslog_severity", .value = .{ .integer = 4 } };
 
         state.event_storage[0] = event_mod.Event{
             .metadata = .{ .source_id = config.id },

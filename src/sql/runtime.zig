@@ -329,9 +329,8 @@ fn compareEqual(left: event_mod.Value, right: event_mod.Value) bool {
 const testing = std.testing;
 
 fn testEvent(allocator: std.mem.Allocator) !event_mod.Event {
-    const fields = try allocator.alloc(event_mod.Field, 2);
-    fields[0] = .{ .name = "value", .value = .{ .integer = 41 } };
-    fields[1] = .{ .name = "level", .value = .{ .string = "info" } };
+    const fields = try allocator.alloc(event_mod.Field, 1);
+    fields[0] = .{ .name = "syslog_severity", .value = .{ .integer = 4 } };
 
     return event_mod.Event{
         .metadata = .{ .source_id = "syslog" },
@@ -355,7 +354,7 @@ test "execute projection" {
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
 
-    const stmt = try @import("parser.zig").parseSelect(arena, "SELECT value + 1 AS next_value, message FROM logs WHERE level = 'info'");
+    const stmt = try @import("parser.zig").parseSelect(arena, "SELECT syslog_severity, message FROM logs WHERE syslog_severity <= 4");
 
     var program = try compile(testing.allocator, stmt);
     defer program.deinit();
@@ -368,9 +367,9 @@ test "execute projection" {
     try testing.expect(maybe_row != null);
     const row = maybe_row.?;
     try testing.expectEqual(@as(usize, 2), row.values.len);
-    try testing.expectEqualStrings("next_value", row.values[0].name);
+    try testing.expectEqualStrings("syslog_severity", row.values[0].name);
     try testing.expect(row.values[0].value == .integer);
-    try testing.expect(row.values[0].value.integer == 42);
+    try testing.expect(row.values[0].value.integer == 4);
     try testing.expectEqualStrings("message", row.values[1].name);
     try testing.expect(row.values[1].value == .string);
     try testing.expectEqualStrings("hello", row.values[1].value.string);
@@ -381,7 +380,7 @@ test "filter out non matching event" {
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
 
-    const stmt = try @import("parser.zig").parseSelect(arena, "SELECT message FROM logs WHERE level = 'error'");
+    const stmt = try @import("parser.zig").parseSelect(arena, "SELECT message FROM logs WHERE syslog_severity <= 2");
     var program = try compile(testing.allocator, stmt);
     defer program.deinit();
 

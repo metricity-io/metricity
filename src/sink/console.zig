@@ -132,7 +132,7 @@ const testing = std.testing;
 
 fn mockRow(allocator: std.mem.Allocator) !sql_runtime.Row {
     var entries = try allocator.alloc(sql_runtime.ValueEntry, 2);
-    entries[0] = .{ .name = "value", .value = .{ .integer = 42 } };
+    entries[0] = .{ .name = "syslog_severity", .value = .{ .integer = 4 } };
     entries[1] = .{ .name = "message", .value = .{ .string = "hello" } };
     return sql_runtime.Row{ .allocator = allocator, .values = entries };
 }
@@ -147,7 +147,7 @@ test "console sink formats row as json-like output" {
 
     try writeRow(stream.writer(), &row);
     const written = stream.getWritten();
-    try testing.expectEqualStrings("{\"value\": 42, \"message\": \"hello\"}\n", written);
+    try testing.expectEqualStrings("{\"syslog_severity\": 4, \"message\": \"hello\"}\n", written);
 }
 
 test "writeString escapes control characters" {
@@ -185,5 +185,5 @@ test "emitBatch writes multiple rows using shared buffer" {
 
     const content = try dir.dir.readFileAlloc(allocator, "console.log", 1024);
     defer allocator.free(content);
-    try testing.expectEqualStrings("{\"value\": 42, \"message\": \"hello\"}\n{\"value\": 42, \"message\": \"hello\"}\n", content);
+    try testing.expectEqualStrings("{\"syslog_severity\": 4, \"message\": \"hello\"}\n{\"syslog_severity\": 4, \"message\": \"hello\"}\n", content);
 }
