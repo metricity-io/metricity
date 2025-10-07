@@ -12,6 +12,7 @@ pub const TcpOptions = struct {
     keepalive_seconds: ?u32 = null,
     high_watermark: usize = 256 * 1024,
     low_watermark: usize = 128 * 1024,
+    flush_partial_on_close: bool = false,
 };
 
 pub const UdpOptions = struct {

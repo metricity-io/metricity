@@ -13,6 +13,18 @@ pub const ExtractResult = struct {
     consumed: usize,
 };
 
+pub const DropReason = enum {
+    length,
+    overflow,
+    invalid,
+};
+
+pub const DropStats = struct {
+    length: usize = 0,
+    overflow: usize = 0,
+    invalid: usize = 0,
+};
+
 pub const Mode = enum {
     auto,
     lf,
@@ -30,6 +42,7 @@ pub const Framer = struct {
     mode: Mode,
     active_mode: Mode,
     message_limit: usize,
+    drop_stats: DropStats,
 
     pub fn init(allocator: std.mem.Allocator, mode: Mode, message_limit: usize) Framer {
         return .{
@@ -38,6 +51,7 @@ pub const Framer = struct {
             .mode = mode,
             .active_mode = .auto,
             .message_limit = message_limit,
+            .drop_stats = .{},
         };
     }
 
@@ -63,6 +77,11 @@ pub const Framer = struct {
                 const attempt = extractOctetCount(slice) catch |err| switch (err) {
                     FrameError.Incomplete => return null,
                     FrameError.InvalidLength, FrameError.Overflow => {
+                        self.recordDrop(switch (err) {
+                            FrameError.InvalidLength => .length,
+                            FrameError.Overflow => .overflow,
+                            else => unreachable,
+                        });
                         self.dropUntilNewline();
                         return err;
                     },
@@ -88,6 +107,11 @@ pub const Framer = struct {
                     const attempt = extractOctetCount(slice) catch |err| switch (err) {
                         FrameError.Incomplete => return null,
                         FrameError.InvalidLength, FrameError.Overflow => {
+                            self.recordDrop(switch (err) {
+                                FrameError.InvalidLength => .length,
+                                FrameError.Overflow => .overflow,
+                                else => unreachable,
+                            });
                             self.dropUntilNewline();
                             self.active_mode = .auto;
                             return err;
@@ -163,6 +187,18 @@ pub const Framer = struct {
         self.buffer.clearRetainingCapacity();
         self.active_mode = .auto;
         return FramerResult{ .payload = payload, .truncated = truncated };
+    }
+
+    pub fn dropStats(self: *const Framer) DropStats {
+        return self.drop_stats;
+    }
+
+    pub fn recordDrop(self: *Framer, reason: DropReason) void {
+        switch (reason) {
+            .length => self.drop_stats.length += 1,
+            .overflow => self.drop_stats.overflow += 1,
+            .invalid => self.drop_stats.invalid += 1,
+        }
     }
 };
 
@@ -243,4 +279,48 @@ test "framer truncates messages over limit" {
     try std.testing.expectEqualStrings("hell", result.payload);
     try std.testing.expect(result.truncated);
     try std.testing.expect((try framer.next()) == null);
+}
+
+test "framer records drop statistics for malformed frames" {
+    const allocator = std.testing.allocator;
+    var framer = Framer.init(allocator, .auto, 128);
+    defer framer.deinit();
+
+    try framer.push("5hello");
+
+    var saw_invalid_length = false;
+    const first_attempt = blk: {
+        const value = framer.next() catch |err| {
+            try std.testing.expect(err == FrameError.InvalidLength);
+            saw_invalid_length = true;
+            break :blk null;
+        };
+        break :blk value;
+    };
+    try std.testing.expect(first_attempt == null);
+    try std.testing.expect(saw_invalid_length);
+
+    const after_length = framer.dropStats();
+    try std.testing.expectEqual(@as(usize, 1), after_length.length);
+    try std.testing.expectEqual(@as(usize, 0), after_length.overflow);
+    try std.testing.expectEqual(@as(usize, 0), after_length.invalid);
+
+    try framer.push("18446744073709551616 foo\n");
+
+    var saw_overflow = false;
+    const second_attempt = blk2: {
+        const value = framer.next() catch |err| {
+            try std.testing.expect(err == FrameError.Overflow);
+            saw_overflow = true;
+            break :blk2 null;
+        };
+        break :blk2 value;
+    };
+    try std.testing.expect(second_attempt == null);
+    try std.testing.expect(saw_overflow);
+
+    const after_overflow = framer.dropStats();
+    try std.testing.expectEqual(@as(usize, 1), after_overflow.length);
+    try std.testing.expectEqual(@as(usize, 1), after_overflow.overflow);
+    try std.testing.expectEqual(@as(usize, 0), after_overflow.invalid);
 }

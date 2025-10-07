@@ -116,6 +116,7 @@ fn createTcpTransport(
         .keepalive_seconds = config.tcp_keepalive_seconds,
         .high_watermark = config.tcp_high_watermark,
         .low_watermark = config.tcp_low_watermark,
+        .flush_partial_on_close = config.flush_partial_on_close,
     };
 
     return netx_tcp.create(allocator, runtime.loopHandle(), tcp_opts);
@@ -340,6 +341,7 @@ const SyslogState = struct {
     stream_closed: bool = false,
     transport: TransportManager,
     framer: frame.Framer,
+    framer_drop_last: frame.DropStats = .{},
     acl: SyslogAcl,
     ready_observer: ?src.ReadyObserver = null,
     rate_limiter: ?RateLimiter = null,
@@ -379,6 +381,9 @@ const metrics = struct {
     const ack_success = "sources_syslog_batch_ack_success_total";
     const ack_retryable = "sources_syslog_batch_ack_retryable_total";
     const ack_failure = "sources_syslog_batch_ack_failure_total";
+    const corrupted_length = "sources_syslog_frames_corrupted_total{reason=\"length\"}";
+    const corrupted_overflow = "sources_syslog_frames_corrupted_total{reason=\"overflow\"}";
+    const corrupted_invalid = "sources_syslog_frames_corrupted_total{reason=\"invalid\"}";
 };
 
 fn batchAckComplete(context: *anyopaque, status: event.AckStatus) void {
@@ -680,6 +685,10 @@ fn processFramerResult(
         if (framed_message.finalizer) |finalizer| finalizer.run();
         recordReject(state, 1);
         logWarn(state, "syslog source {s}: failed to parse message ({s})", .{ state.descriptor.name, @errorName(err) });
+        if (err == parser.ParseError.InvalidMessage) {
+            state.framer.recordDrop(.invalid);
+            flushFramerDrops(state);
+        }
         return;
     };
 
@@ -752,6 +761,7 @@ fn pumpTransport(state: *SyslogState, allocator: std.mem.Allocator) void {
             const extracted = state.framer.next() catch |err| {
                 recordReject(state, 1);
                 logWarn(state, "syslog source {s}: dropped invalid frame ({s})", .{ state.descriptor.name, @errorName(err) });
+                flushFramerDrops(state);
                 continue;
             };
 
@@ -830,6 +840,26 @@ fn drainBatch(state: *SyslogState, allocator: std.mem.Allocator) DrainError!?eve
         .events = ack_context.allocated[0..ack_context.view_len],
         .ack = event.AckToken.init(&ack_context.handle),
     };
+}
+
+fn flushFramerDrops(state: *SyslogState) void {
+    const current = state.framer.dropStats();
+    defer state.framer_drop_last = current;
+
+    const metrics_sink = state.metrics orelse return;
+
+    if (current.length > state.framer_drop_last.length) {
+        const delta: u64 = @intCast(current.length - state.framer_drop_last.length);
+        metrics_sink.incrCounter(metrics.corrupted_length, delta);
+    }
+    if (current.overflow > state.framer_drop_last.overflow) {
+        const delta: u64 = @intCast(current.overflow - state.framer_drop_last.overflow);
+        metrics_sink.incrCounter(metrics.corrupted_overflow, delta);
+    }
+    if (current.invalid > state.framer_drop_last.invalid) {
+        const delta: u64 = @intCast(current.invalid - state.framer_drop_last.invalid);
+        metrics_sink.incrCounter(metrics.corrupted_invalid, delta);
+    }
 }
 
 fn recordEnqueued(state: *SyslogState, count: usize) void {
@@ -1104,6 +1134,190 @@ test "syslog enqueue differentiates reject and drop metrics" {
     try std.testing.expectEqual(@as(u8, 1), evicted_finalizer_calls);
     try std.testing.expectEqual(@as(u8, 0), new_event_finalizer_calls);
     try std.testing.expectEqual(@as(i64, 1), harness.last_gauge);
+}
+
+test "pumpTransport records corrupted frame metrics" {
+    const allocator = std.testing.allocator;
+
+    const MetricsHarness = struct {
+        corrupted_length: usize = 0,
+        rejects: usize = 0,
+
+        fn incr(context: *anyopaque, name: []const u8, value: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (std.mem.eql(u8, name, metrics.corrupted_length)) {
+                self.corrupted_length += value;
+            } else if (std.mem.eql(u8, name, metrics.rejected)) {
+                self.rejects += value;
+            }
+        }
+
+        fn gauge(_: *anyopaque, _: []const u8, _: i64) void {}
+    };
+
+    var harness = MetricsHarness{};
+    const metrics_obj = src.Metrics{
+        .context = @ptrCast(&harness),
+        .incr_counter_fn = MetricsHarness.incr,
+        .record_gauge_fn = MetricsHarness.gauge,
+    };
+
+    var runtime = try netx_runtime.IoRuntime.initDefault();
+    defer runtime.deinit();
+
+    const config = cfg.SyslogConfig{
+        .address = "127.0.0.1:5514",
+        .max_batch_size = 4,
+        .message_size_limit = 64,
+    };
+
+    const FakeTransport = struct {
+        message: ?netx_transport.Message,
+
+        fn get(context: *anyopaque) *@This() {
+            const aligned: *align(@alignOf(@This())) anyopaque = @alignCast(context);
+            return @ptrCast(aligned);
+        }
+
+        fn start(_: *anyopaque) netx_transport.TransportError!void {
+            return;
+        }
+
+        fn poll(context: *anyopaque, _: std.mem.Allocator) netx_transport.TransportError!?netx_transport.Message {
+            const self = get(context);
+            const payload = self.message orelse return null;
+            self.message = null;
+            return payload;
+        }
+
+        fn shutdown(_: *anyopaque) void {}
+    };
+
+    const message = netx_transport.Message{
+        .bytes = "5oops\n",
+        .metadata = .{
+            .peer_address = "127.0.0.1:5000",
+            .protocol = "tcp",
+            .truncated = false,
+        },
+        .finalizer = null,
+    };
+
+    var fake_ctx = FakeTransport{ .message = message };
+    const fake_vtable = netx_transport.VTable{
+        .start = FakeTransport.start,
+        .poll = FakeTransport.poll,
+        .shutdown = FakeTransport.shutdown,
+    };
+    const transport_instance = netx_transport.Transport.init(&fake_ctx, &fake_vtable);
+
+    const manager = TransportManager{
+        .runtime = &runtime,
+        .transport = transport_instance,
+    };
+
+    var state = SyslogState{
+        .allocator = allocator,
+        .descriptor = .{ .type = .syslog, .name = "syslog_corrupted" },
+        .config = config,
+        .buffer = undefined,
+        .log = null,
+        .metrics = &metrics_obj,
+        .stream_closed = false,
+        .transport = manager,
+        .framer = frame.Framer.init(allocator, .auto, config.message_size_limit),
+        .acl = SyslogAcl.allowAll(),
+        .rate_limiter = null,
+        .time_source = defaultTimeSource,
+        .arena_pool = parser.EventArenaPool.init(allocator),
+    };
+    defer state.arena_pool.deinit();
+    state.buffer = try EventBuffer.init(allocator, config.max_batch_size, .reject);
+    defer state.buffer.deinit();
+    defer state.framer.deinit();
+    defer state.acl.deinit();
+
+    pumpTransport(&state, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), state.framer.dropStats().length);
+    try std.testing.expectEqual(@as(usize, 1), harness.corrupted_length);
+    try std.testing.expectEqual(@as(usize, 1), harness.rejects);
+}
+
+test "processFramerResult records invalid message drops" {
+    const allocator = std.testing.allocator;
+
+    const MetricsHarness = struct {
+        corrupted_invalid: usize = 0,
+        rejects: usize = 0,
+
+        fn incr(context: *anyopaque, name: []const u8, value: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (std.mem.eql(u8, name, metrics.corrupted_invalid)) {
+                self.corrupted_invalid += value;
+            } else if (std.mem.eql(u8, name, metrics.rejected)) {
+                self.rejects += value;
+            }
+        }
+
+        fn gauge(_: *anyopaque, _: []const u8, _: i64) void {}
+    };
+
+    var harness = MetricsHarness{};
+    const metrics_obj = src.Metrics{
+        .context = @ptrCast(&harness),
+        .incr_counter_fn = MetricsHarness.incr,
+        .record_gauge_fn = MetricsHarness.gauge,
+    };
+
+    var runtime = try netx_runtime.IoRuntime.initDefault();
+    defer runtime.deinit();
+
+    const config = cfg.SyslogConfig{
+        .address = "127.0.0.1:5514",
+        .max_batch_size = 4,
+        .message_size_limit = 64,
+    };
+
+    var state = SyslogState{
+        .allocator = allocator,
+        .descriptor = .{ .type = .syslog, .name = "syslog_invalid" },
+        .config = config,
+        .buffer = undefined,
+        .log = null,
+        .metrics = &metrics_obj,
+        .stream_closed = false,
+        .transport = .{ .runtime = &runtime, .transport = null },
+        .framer = frame.Framer.init(allocator, .auto, config.message_size_limit),
+        .acl = SyslogAcl.allowAll(),
+        .rate_limiter = null,
+        .time_source = defaultTimeSource,
+        .arena_pool = parser.EventArenaPool.init(allocator),
+    };
+    defer state.arena_pool.deinit();
+    state.buffer = try EventBuffer.init(allocator, config.max_batch_size, .reject);
+    defer state.buffer.deinit();
+    defer state.framer.deinit();
+    defer state.acl.deinit();
+
+    const payload = try allocator.alloc(u8, 7);
+    @memcpy(payload, "invalid");
+    const frame_result = frame.FramerResult{
+        .payload = payload,
+        .truncated = false,
+    };
+
+    const metadata = netx_transport.Metadata{
+        .peer_address = "127.0.0.1:5000",
+        .protocol = "tcp",
+        .truncated = false,
+    };
+
+    processFramerResult(&state, metadata, frame_result, false);
+
+    try std.testing.expectEqual(@as(usize, 1), state.framer.dropStats().invalid);
+    try std.testing.expectEqual(@as(usize, 1), harness.corrupted_invalid);
+    try std.testing.expectEqual(@as(usize, 1), harness.rejects);
 }
 
 test "syslog shutdown finalizes buffered events" {

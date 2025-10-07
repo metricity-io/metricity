@@ -62,6 +62,18 @@ body.
 The console sink prints each transformed row as a single JSON-like line to either STDOUT or STDERR.
 This makes it easy to inspect the pipeline output or redirect it for further processing.
 
+### Syslog source configuration
+
+Syslog sources accept a handful of transport-related tuning knobs in addition to the address and
+parser mode shown above. Notable fields:
+
+- `message_size_limit` — caps per-frame payload size before truncation.
+- `tcp_high_watermark` / `tcp_low_watermark` — backpressure thresholds for TCP ring buffers.
+- `allowed_peers` — CIDR filters applied before parsing.
+- `flush_partial_on_close` — when `true`, any buffered bytes left in a TCP connection are flushed
+  as a truncated frame when the peer closes the stream. This helps avoid losing partial messages
+  on orderly shutdowns while keeping the default behavior unchanged.
+
 ### Metrics
 
 When `pipeline.Options.metrics` is set to a `source.Metrics` sink, the pipeline exports the
@@ -80,6 +92,8 @@ following telemetry:
   acknowledgement outcome counters.
 - `pipeline_ack_latency_ns_total` and `pipeline_ack_latency_events_total` — cumulative latency and
   event count for batch acknowledgements.
+- `sources_syslog_frames_corrupted_total{reason="length|overflow|invalid"}` — syslog source frames
+  rejected by the framer or parser, labeled by the reason.
 
 ## Signals and shutdown
 

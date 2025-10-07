@@ -44,6 +44,7 @@ pub const SyslogConfig = struct {
     allowed_peers: []const []const u8 = &[_][]const u8{},
     rate_limit_per_sec: ?usize = null,
     rate_limit_burst: ?usize = null,
+    flush_partial_on_close: bool = false,
 };
 
 pub const TomlValue = union(enum) {
@@ -147,6 +148,7 @@ pub fn parseSourceConfig(
                 "allowed_peers",
                 "rate_limit_per_sec",
                 "rate_limit_burst",
+                "flush_partial_on_close",
             };
             try ensureKnownKeys(table.*, &allowed);
 
@@ -222,6 +224,13 @@ pub fn parseSourceConfig(
                 if (burst <= 0) return ParseError.InvalidValue;
                 const casted = std.math.cast(usize, burst) orelse return ParseError.InvalidValue;
                 config.rate_limit_burst = casted;
+            }
+
+            if (table.get("flush_partial_on_close")) |value| {
+                switch (value) {
+                    .bool => |flag| config.flush_partial_on_close = flag,
+                    else => return ParseError.InvalidType,
+                }
             }
 
             if (config.rate_limit_burst != null and config.rate_limit_per_sec == null) {

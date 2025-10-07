@@ -31,6 +31,7 @@ const TcpContext = struct {
     keepalive_seconds: ?u32,
     high_watermark: usize,
     low_watermark: usize,
+    flush_partial_on_close: bool,
     shutting_down: bool = false,
 
     fn init(
@@ -90,6 +91,7 @@ const TcpContext = struct {
             .keepalive_seconds = opts.keepalive_seconds,
             .high_watermark = opts.high_watermark,
             .low_watermark = opts.low_watermark,
+            .flush_partial_on_close = opts.flush_partial_on_close,
         };
 
         ctx.accept_completion = .{};
@@ -197,10 +199,10 @@ const TcpContext = struct {
             };
         }
 
-        try self.flushBufferedChunks(conn);
+        try self.flushBufferedChunks(conn, false);
     }
 
-    fn flushBufferedChunks(self: *TcpContext, conn: *Connection) ProcessError!void {
+    fn flushBufferedChunks(self: *TcpContext, conn: *Connection, force_truncated: bool) ProcessError!void {
         while (conn.ring.len() > 0) {
             const available = conn.ring.len();
             const take = @min(available, self.message_limit);
@@ -211,7 +213,7 @@ const TcpContext = struct {
             conn.ring.consume(take);
 
             const peer_copy = try socket_util.copySlice(self.allocator, conn.peer_address);
-            const truncated = available > self.message_limit;
+            const truncated = force_truncated or (available > self.message_limit);
 
             const allocation = transport.IoAllocation.create(self.allocator, payload, peer_copy) catch {
                 self.allocator.free(payload);
@@ -234,8 +236,14 @@ const TcpContext = struct {
                 return error.Fatal;
             };
 
-            _ = self.maybeResume(conn);
+            if (!force_truncated) _ = self.maybeResume(conn);
         }
+    }
+
+    fn flushPartialRemainder(self: *TcpContext, conn: *Connection) void {
+        if (!self.flush_partial_on_close) return;
+        if (conn.ring.len() == 0) return;
+        self.flushBufferedChunks(conn, true) catch {};
     }
 
     fn maybeResume(self: *TcpContext, conn: *Connection) bool {
@@ -312,6 +320,7 @@ fn pollCallback(
         const process = ctx.processConnection(conn);
         if (process) |_| {} else |err| switch (err) {
             error.ConnectionClosed => {
+                ctx.flushPartialRemainder(conn);
                 ctx.removeConnection(conn);
                 conn.deinit();
                 return .disarm;
@@ -421,6 +430,7 @@ pub fn create(
         .keepalive_seconds = opts.keepalive_seconds,
         .high_watermark = opts.high_watermark,
         .low_watermark = opts.low_watermark,
+        .flush_partial_on_close = opts.flush_partial_on_close,
     };
 
     const ctx = try TcpContext.init(allocator, loop_handle, normalized);
@@ -454,6 +464,7 @@ test "flushBufferedChunks splits payload into capped messages" {
         .keepalive_seconds = null,
         .high_watermark = 8,
         .low_watermark = 4,
+        .flush_partial_on_close = false,
         .shutting_down = false,
     };
     defer ctx.connections.deinit();
@@ -473,7 +484,7 @@ test "flushBufferedChunks splits payload into capped messages" {
     defer conn.ring.deinit();
 
     try conn.ring.write("abcdef");
-    try ctx.flushBufferedChunks(&conn);
+    try ctx.flushBufferedChunks(&conn, false);
 
     const first = ctx.takePending() orelse unreachable;
     defer if (first.finalizer) |finalizer| finalizer.run();
@@ -506,6 +517,7 @@ test "flushBufferedChunks no-op on empty buffer" {
         .keepalive_seconds = null,
         .high_watermark = std.math.maxInt(usize),
         .low_watermark = std.math.maxInt(usize),
+        .flush_partial_on_close = false,
         .shutting_down = false,
     };
     defer ctx.connections.deinit();
@@ -523,6 +535,53 @@ test "flushBufferedChunks no-op on empty buffer" {
     };
     defer conn.ring.deinit();
 
-    try ctx.flushBufferedChunks(&conn);
+    try ctx.flushBufferedChunks(&conn, false);
     try std.testing.expect(ctx.takePending() == null);
+}
+
+test "flushPartialRemainder emits truncated message" {
+    const allocator = std.testing.allocator;
+    var scratch_storage: [0]u8 = .{};
+    var ctx = TcpContext{
+        .allocator = allocator,
+        .loop = undefined,
+        .listener = undefined,
+        .accept_completion = .{},
+        .scratch = scratch_storage[0..],
+        .connections = ConnectionList.init(allocator),
+        .pending = MessageList.init(allocator),
+        .pending_head = 0,
+        .read_buffer_bytes = 0,
+        .message_limit = 16,
+        .max_connections = 0,
+        .keepalive_seconds = null,
+        .high_watermark = 32,
+        .low_watermark = 16,
+        .flush_partial_on_close = true,
+        .shutting_down = false,
+    };
+    defer ctx.connections.deinit();
+    defer ctx.pending.deinit();
+
+    var empty_peer: [0]u8 = .{};
+    var conn = Connection{
+        .parent = &ctx,
+        .socket = undefined,
+        .fd = 0,
+        .ring = try ring_buffer.RingBuffer.init(allocator, 32),
+        .peer_address = empty_peer[0..],
+        .poll_completion = .{},
+        .suspended = true,
+    };
+    defer conn.ring.deinit();
+
+    try conn.ring.write("partial");
+
+    ctx.flushPartialRemainder(&conn);
+
+    const emitted = ctx.takePending() orelse unreachable;
+    defer if (emitted.finalizer) |finalizer| finalizer.run();
+    try std.testing.expectEqualStrings("partial", emitted.bytes);
+    try std.testing.expect(emitted.metadata.truncated);
+    try std.testing.expect(conn.ring.len() == 0);
 }
