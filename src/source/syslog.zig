@@ -344,6 +344,7 @@ const SyslogState = struct {
     ready_observer: ?src.ReadyObserver = null,
     rate_limiter: ?RateLimiter = null,
     time_source: TimeSource = defaultTimeSource,
+    arena_pool: parser.EventArenaPool,
 };
 
 const BatchAckContext = struct {
@@ -472,9 +473,11 @@ fn create(ctx: src.InitContext, config: *const cfg.SourceConfig) src.SourceError
         .acl = acl_init,
         .rate_limiter = rate_limiter_value,
         .time_source = time_source,
+        .arena_pool = parser.EventArenaPool.init(ctx.allocator),
     };
     errdefer state.acl.deinit();
     errdefer state.framer.deinit();
+    errdefer state.arena_pool.deinit();
 
     const buffer_instance = EventBuffer.init(ctx.allocator, syslog_cfg.max_batch_size, .reject) catch
         return src.SourceError.StartupFailed;
@@ -550,6 +553,7 @@ fn shutdown(context: *anyopaque, allocator: std.mem.Allocator) void {
     state.acl.deinit();
     state.buffer.deinit();
     state.framer.deinit();
+    state.arena_pool.deinit();
     state.allocator.destroy(state);
 }
 
@@ -623,7 +627,6 @@ fn enqueueEvent(state: *SyslogState, managed: event.ManagedEvent) src.SourceErro
 
 fn processFramerResult(
     state: *SyslogState,
-    allocator: std.mem.Allocator,
     base_metadata: netx_transport.Metadata,
     frame_result: frame.FramerResult,
     assume_truncated: bool,
@@ -669,7 +672,7 @@ fn processFramerResult(
         recordTruncated(state, 1);
     }
 
-    const parsed = parser.parseMessage(allocator, state.config, framed_message) catch |err| {
+    const parsed = parser.parseMessage(&state.arena_pool, state.config, framed_message) catch |err| {
         if (framed_message.finalizer) |finalizer| finalizer.run();
         recordReject(state, 1);
         logWarn(state, "syslog source {s}: failed to parse message ({s})", .{ state.descriptor.name, @errorName(err) });
@@ -749,7 +752,7 @@ fn pumpTransport(state: *SyslogState, allocator: std.mem.Allocator) void {
             };
 
             const frame_result = extracted orelse break;
-            processFramerResult(state, allocator, message.metadata, frame_result, false);
+            processFramerResult(state, message.metadata, frame_result, false);
         }
 
         if (message.metadata.truncated and state.framer.hasBufferedData()) {
@@ -760,7 +763,7 @@ fn pumpTransport(state: *SyslogState, allocator: std.mem.Allocator) void {
                 break;
             };
             if (drained) |frame_result| {
-                processFramerResult(state, allocator, message.metadata, frame_result, true);
+                processFramerResult(state, message.metadata, frame_result, true);
             }
         }
 
@@ -1167,7 +1170,10 @@ test "parser handles rfc5424 message" {
         .finalizer = null,
     };
 
-    var result = try parser.parseMessage(allocator, config, message);
+    var pool = parser.EventArenaPool.init(allocator);
+    defer pool.deinit();
+
+    var result = try parser.parseMessage(&pool, config, message);
     defer result.managed.finalizer.run();
 
     const log = result.managed.event.payload.log;
@@ -1201,7 +1207,10 @@ test "parser auto parses rfc3164" {
         .finalizer = null,
     };
 
-    var result = try parser.parseMessage(allocator, config, message);
+    var pool = parser.EventArenaPool.init(allocator);
+    defer pool.deinit();
+
+    var result = try parser.parseMessage(&pool, config, message);
     defer result.managed.finalizer.run();
 
     const log = result.managed.event.payload.log;
@@ -1216,6 +1225,49 @@ test "parser auto parses rfc3164" {
 
     const host_field = testFindField(log.fields, "syslog_hostname") orelse return std.testing.expect(false);
     try std.testing.expectEqualStrings("mymachine", host_field.value.string);
+}
+
+test "parser arena pool reuses allocations" {
+    const allocator = std.testing.allocator;
+    var pool = parser.EventArenaPool.init(allocator);
+    defer pool.deinit();
+
+    const config = cfg.SyslogConfig{
+        .address = "127.0.0.1:5514",
+        .transport = .udp,
+        .parser = .auto,
+    };
+
+    const raw_bytes = "<34>1 2023-10-10T12:30:45Z host app 123 ID47 - Message body";
+
+    var message = netx_transport.Message{
+        .bytes = raw_bytes,
+        .metadata = .{},
+        .finalizer = null,
+    };
+
+    var first = try parser.parseMessage(&pool, config, message);
+    try std.testing.expectEqual(@as(usize, 0), pool.freeCount());
+    first.managed.finalizer.run();
+    try std.testing.expectEqual(@as(usize, 1), pool.freeCount());
+
+    message = netx_transport.Message{
+        .bytes = raw_bytes,
+        .metadata = .{},
+        .finalizer = null,
+    };
+
+    var second = try parser.parseMessage(&pool, config, message);
+    try std.testing.expectEqual(@as(usize, 0), pool.freeCount());
+
+    const log = second.managed.event.payload.log;
+    const base_ptr = @intFromPtr(raw_bytes.ptr);
+    const msg_ptr = @intFromPtr(log.message.ptr);
+    try std.testing.expect(msg_ptr >= base_ptr);
+    try std.testing.expect(msg_ptr < base_ptr + raw_bytes.len);
+
+    second.managed.finalizer.run();
+    try std.testing.expectEqual(@as(usize, 1), pool.freeCount());
 }
 
 test "pumpTransport propagates truncation metadata and metrics" {
@@ -1310,7 +1362,9 @@ test "pumpTransport propagates truncation metadata and metrics" {
         .acl = SyslogAcl.allowAll(),
         .rate_limiter = null,
         .time_source = defaultTimeSource,
+        .arena_pool = parser.EventArenaPool.init(allocator),
     };
+    defer state.arena_pool.deinit();
     state.buffer = try EventBuffer.init(allocator, config.max_batch_size, .reject);
     defer state.buffer.deinit();
     defer state.framer.deinit();
@@ -1405,7 +1459,9 @@ test "pumpTransport enforces ACL" {
         .acl = acl,
         .rate_limiter = null,
         .time_source = defaultTimeSource,
+        .arena_pool = parser.EventArenaPool.init(allocator),
     };
+    defer state.arena_pool.deinit();
     defer state.framer.deinit();
     defer state.acl.deinit();
 
@@ -1508,7 +1564,9 @@ test "pumpTransport enforces rate limiter" {
         .acl = SyslogAcl.allowAll(),
         .rate_limiter = RateLimiter.init(TimeStub.now(), 1, 1),
         .time_source = TimeStub.now,
+        .arena_pool = parser.EventArenaPool.init(allocator),
     };
+    defer state.arena_pool.deinit();
     defer state.framer.deinit();
     defer state.acl.deinit();
 

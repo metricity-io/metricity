@@ -3,7 +3,6 @@ const event = @import("../event.zig");
 const cfg = @import("../config.zig");
 const netx = @import("netx");
 const transport = netx.transport;
-const array_list = std.array_list;
 const unicode = std.unicode;
 const time = std.time;
 const epoch = std.time.epoch;
@@ -22,26 +21,81 @@ pub const ParseResult = struct {
     managed: event.ManagedEvent,
 };
 
-const FieldList = array_list.Managed(event.Field);
-const StringList = array_list.Managed([]u8);
+const EventArena = struct {
+    arena: std.heap.ArenaAllocator,
+    next: ?*EventArena = null,
+
+    fn allocator(self: *EventArena) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+};
+
+pub const EventArenaPool = struct {
+    allocator: std.mem.Allocator,
+    free_list: ?*EventArena = null,
+
+    pub fn init(allocator: std.mem.Allocator) EventArenaPool {
+        return .{ .allocator = allocator, .free_list = null };
+    }
+
+    pub fn deinit(self: *EventArenaPool) void {
+        var cursor = self.free_list;
+        while (cursor) |arena| {
+            const next = arena.next;
+            arena.arena.deinit();
+            self.allocator.destroy(arena);
+            cursor = next;
+        }
+        self.free_list = null;
+    }
+
+    pub fn acquire(self: *EventArenaPool) ParseError!*EventArena {
+        if (self.free_list) |arena| {
+            self.free_list = arena.next;
+            arena.next = null;
+            return arena;
+        }
+
+        const arena = self.allocator.create(EventArena) catch return ParseError.Truncated;
+        arena.* = .{
+            .arena = std.heap.ArenaAllocator.init(self.allocator),
+            .next = null,
+        };
+        return arena;
+    }
+
+    pub fn release(self: *EventArenaPool, arena: *EventArena) void {
+        _ = arena.arena.reset(.retain_capacity);
+        arena.next = self.free_list;
+        self.free_list = arena;
+    }
+
+    pub fn freeCount(self: *const EventArenaPool) usize {
+        var cursor = self.free_list;
+        var count: usize = 0;
+        while (cursor) |arena| {
+            count += 1;
+            cursor = arena.next;
+        }
+        return count;
+    }
+};
 
 const EventAllocation = struct {
-    allocator: std.mem.Allocator,
-    fields: []event.Field,
-    strings: StringList,
+    pool: *EventArenaPool,
+    arena: *EventArena,
     message_finalizer: ?transport.Finalizer,
 
     fn release(context: ?*anyopaque) void {
         const raw = context orelse return;
         const aligned: *align(@alignOf(EventAllocation)) anyopaque = @alignCast(raw);
         const allocation: *EventAllocation = @ptrCast(aligned);
-        for (allocation.strings.items) |slice| {
-            allocation.allocator.free(slice);
-        }
-        allocation.strings.deinit();
-        allocation.allocator.free(allocation.fields);
+
+        allocation.pool.release(allocation.arena);
+
         const message_finalizer = allocation.message_finalizer;
-        allocation.allocator.destroy(allocation);
+        allocation.pool.allocator.destroy(allocation);
+
         if (message_finalizer) |finalizer| {
             finalizer.run();
         }
@@ -49,7 +103,7 @@ const EventAllocation = struct {
 };
 
 pub fn parseMessage(
-    allocator: std.mem.Allocator,
+    pool: *EventArenaPool,
     config: cfg.SyslogConfig,
     message: transport.Message,
 ) ParseError!ParseResult {
@@ -65,10 +119,10 @@ pub fn parseMessage(
     const payload_truncated = message.metadata.truncated;
 
     switch (config.parser) {
-        .rfc3164 => return parseRfc3164(allocator, input, facility, severity, transport_meta, payload_truncated, message_finalizer),
-        .rfc5424 => return parseRfc5424(allocator, input, facility, severity, transport_meta, payload_truncated, message_finalizer),
+        .rfc3164 => return parseRfc3164(pool, input, facility, severity, transport_meta, payload_truncated, message_finalizer),
+        .rfc5424 => return parseRfc5424(pool, input, facility, severity, transport_meta, payload_truncated, message_finalizer),
         .auto => {
-            const attempt_5424 = parseRfc5424(allocator, input, facility, severity, transport_meta, payload_truncated, message_finalizer);
+            const attempt_5424 = parseRfc5424(pool, input, facility, severity, transport_meta, payload_truncated, message_finalizer);
             if (attempt_5424) |result| {
                 return result;
             } else |err| switch (err) {
@@ -76,7 +130,7 @@ pub fn parseMessage(
                 else => return err,
             }
 
-            return parseRfc3164(allocator, input, facility, severity, transport_meta, payload_truncated, message_finalizer);
+            return parseRfc3164(pool, input, facility, severity, transport_meta, payload_truncated, message_finalizer);
         },
     }
 }
@@ -108,7 +162,7 @@ fn parsePriority(input: []const u8) ParseError!PriorityParse {
 }
 
 fn parseRfc5424(
-    allocator: std.mem.Allocator,
+    pool: *EventArenaPool,
     input: []const u8,
     facility: u8,
     severity: u8,
@@ -116,6 +170,10 @@ fn parseRfc5424(
     payload_truncated: bool,
     message_finalizer: ?transport.Finalizer,
 ) ParseError!ParseResult {
+    var arena = try pool.acquire();
+    var arena_owned = true;
+    errdefer if (arena_owned) pool.release(arena);
+
     var cursor = input;
     const version_end = std.mem.indexOfScalar(u8, cursor, ' ') orelse return ParseError.InvalidMessage;
     const version_slice = cursor[0..version_end];
@@ -139,8 +197,10 @@ fn parseRfc5424(
     }
     const message_is_utf8 = unicode.utf8ValidateSlice(message_text);
 
-    return buildResult(
-        allocator,
+    const result = try buildResult(
+        pool,
+        arena,
+        arena.allocator(),
         facility,
         severity,
         message_text,
@@ -160,10 +220,13 @@ fn parseRfc5424(
         payload_truncated,
         message_finalizer,
     );
+
+    arena_owned = false;
+    return result;
 }
 
 fn parseRfc3164(
-    allocator: std.mem.Allocator,
+    pool: *EventArenaPool,
     input: []const u8,
     facility: u8,
     severity: u8,
@@ -171,6 +234,10 @@ fn parseRfc3164(
     payload_truncated: bool,
     message_finalizer: ?transport.Finalizer,
 ) ParseError!ParseResult {
+    var arena = try pool.acquire();
+    var arena_owned = true;
+    errdefer if (arena_owned) pool.release(arena);
+
     var cursor = input;
     const timestamp_len = findTimestampEnd(cursor) orelse return ParseError.InvalidMessage;
     const timestamp = cursor[0..timestamp_len];
@@ -189,8 +256,10 @@ fn parseRfc3164(
     var normalized_storage: [32]u8 = undefined;
     const normalized_ts = normalizeRfc3164Timestamp(timestamp, normalized_storage[0..]);
 
-    return buildResult(
-        allocator,
+    const result = try buildResult(
+        pool,
+        arena,
+        arena.allocator(),
         facility,
         severity,
         message_body,
@@ -210,6 +279,9 @@ fn parseRfc3164(
         payload_truncated,
         message_finalizer,
     );
+
+    arena_owned = false;
+    return result;
 }
 
 const FormatKind = enum { rfc3164, rfc5424 };
@@ -225,7 +297,9 @@ const HeaderInfo = struct {
 };
 
 fn buildResult(
-    allocator: std.mem.Allocator,
+    pool: *EventArenaPool,
+    arena: *EventArena,
+    arena_allocator: std.mem.Allocator,
     facility: u8,
     severity: u8,
     message_text: []const u8,
@@ -238,55 +312,81 @@ fn buildResult(
     message_finalizer: ?transport.Finalizer,
 ) ParseError!ParseResult {
 
-    var fields = FieldList.init(allocator);
-    var fields_captured = false;
-    errdefer if (!fields_captured) fields.deinit();
+    const include_timestamp = header.timestamp.len > 0 and !isNilValue(header.timestamp);
+    const include_hostname = header.hostname.len > 0 and !isNilValue(header.hostname);
+    const include_app = header.app_name.len > 0 and !isNilValue(header.app_name);
+    const include_proc = header.proc_id.len > 0 and !isNilValue(header.proc_id);
+    const include_msg_id = header.msg_id.len > 0 and !isNilValue(header.msg_id);
+    const include_structured = header.structured_data.len > 0 and !isNilValue(header.structured_data);
+    const include_version = format == .rfc5424;
+    const include_utf8_flag = !message_utf8_valid;
 
-    var string_storage = StringList.init(allocator);
-    var strings_captured = false;
-    errdefer if (!strings_captured) string_storage.deinit();
-
-    fields.append(.{ .name = "syslog_facility", .value = .{ .integer = facility } }) catch return ParseError.Truncated;
-    fields.append(.{ .name = "syslog_severity", .value = .{ .integer = severity } }) catch return ParseError.Truncated;
-    fields.append(.{ .name = "syslog_format", .value = .{ .string = try copyString(allocator, formatName(format), &string_storage) } }) catch return ParseError.Truncated;
-
-    if (header.timestamp.len > 0 and !isNilValue(header.timestamp)) {
-        fields.append(.{ .name = "syslog_timestamp", .value = .{ .string = try copyString(allocator, header.timestamp, &string_storage) } }) catch return ParseError.Truncated;
-    }
+    var normalized_owned: ?[]const u8 = null;
     if (normalized_timestamp) |normalized| {
-        fields.append(.{ .name = "syslog_timestamp_normalized", .value = .{ .string = try copyString(allocator, normalized, &string_storage) } }) catch return ParseError.Truncated;
-    }
-    if (header.hostname.len > 0 and !isNilValue(header.hostname)) {
-        fields.append(.{ .name = "syslog_hostname", .value = .{ .string = try copyString(allocator, header.hostname, &string_storage) } }) catch return ParseError.Truncated;
-    }
-    if (header.app_name.len > 0 and !isNilValue(header.app_name)) {
-        fields.append(.{ .name = "syslog_app_name", .value = .{ .string = try copyString(allocator, header.app_name, &string_storage) } }) catch return ParseError.Truncated;
-    }
-    if (header.proc_id.len > 0 and !isNilValue(header.proc_id)) {
-        fields.append(.{ .name = "syslog_proc_id", .value = .{ .string = try copyString(allocator, header.proc_id, &string_storage) } }) catch return ParseError.Truncated;
-    }
-    if (header.msg_id.len > 0 and !isNilValue(header.msg_id)) {
-        fields.append(.{ .name = "syslog_msg_id", .value = .{ .string = try copyString(allocator, header.msg_id, &string_storage) } }) catch return ParseError.Truncated;
-    }
-    if (header.structured_data.len > 0 and !isNilValue(header.structured_data)) {
-        fields.append(.{ .name = "syslog_structured_data", .value = .{ .string = try copyString(allocator, header.structured_data, &string_storage) } }) catch return ParseError.Truncated;
-    }
-    if (format == .rfc5424) {
-        fields.append(.{ .name = "syslog_version", .value = .{ .integer = header.version } }) catch return ParseError.Truncated;
-    }
-    if (!message_utf8_valid) {
-        fields.append(.{ .name = "syslog_msg_utf8_valid", .value = .{ .boolean = false } }) catch return ParseError.Truncated;
+        const copy = arena_allocator.alloc(u8, normalized.len) catch return ParseError.Truncated;
+        @memcpy(copy, normalized);
+        normalized_owned = copy;
     }
 
-    const fields_slice = fields.toOwnedSlice() catch return ParseError.Truncated;
-    fields_captured = true;
+    var field_count: usize = 3; // facility, severity, format
+    if (include_timestamp) field_count += 1;
+    if (normalized_owned != null) field_count += 1;
+    if (include_hostname) field_count += 1;
+    if (include_app) field_count += 1;
+    if (include_proc) field_count += 1;
+    if (include_msg_id) field_count += 1;
+    if (include_structured) field_count += 1;
+    if (include_version) field_count += 1;
+    if (include_utf8_flag) field_count += 1;
 
-    const allocation = allocator.create(EventAllocation) catch return ParseError.Truncated;
-    allocation.allocator = allocator;
-    allocation.fields = fields_slice;
-    allocation.strings = string_storage;
-    allocation.message_finalizer = message_finalizer;
-    strings_captured = true;
+    const fields_slice = arena_allocator.alloc(event.Field, field_count) catch return ParseError.Truncated;
+
+    var index: usize = 0;
+    fields_slice[index] = .{ .name = "syslog_facility", .value = .{ .integer = facility } };
+    index += 1;
+    fields_slice[index] = .{ .name = "syslog_severity", .value = .{ .integer = severity } };
+    index += 1;
+    fields_slice[index] = .{ .name = "syslog_format", .value = .{ .string = formatName(format) } };
+    index += 1;
+
+    if (include_timestamp) {
+        fields_slice[index] = .{ .name = "syslog_timestamp", .value = .{ .string = header.timestamp } };
+        index += 1;
+    }
+    if (normalized_owned) |normalized| {
+        fields_slice[index] = .{ .name = "syslog_timestamp_normalized", .value = .{ .string = normalized } };
+        index += 1;
+    }
+    if (include_hostname) {
+        fields_slice[index] = .{ .name = "syslog_hostname", .value = .{ .string = header.hostname } };
+        index += 1;
+    }
+    if (include_app) {
+        fields_slice[index] = .{ .name = "syslog_app_name", .value = .{ .string = header.app_name } };
+        index += 1;
+    }
+    if (include_proc) {
+        fields_slice[index] = .{ .name = "syslog_proc_id", .value = .{ .string = header.proc_id } };
+        index += 1;
+    }
+    if (include_msg_id) {
+        fields_slice[index] = .{ .name = "syslog_msg_id", .value = .{ .string = header.msg_id } };
+        index += 1;
+    }
+    if (include_structured) {
+        fields_slice[index] = .{ .name = "syslog_structured_data", .value = .{ .string = header.structured_data } };
+        index += 1;
+    }
+    if (include_version) {
+        fields_slice[index] = .{ .name = "syslog_version", .value = .{ .integer = header.version } };
+        index += 1;
+    }
+    if (include_utf8_flag) {
+        fields_slice[index] = .{ .name = "syslog_msg_utf8_valid", .value = .{ .boolean = false } };
+        index += 1;
+    }
+
+    std.debug.assert(index == field_count);
 
     const log_event = event.LogEvent{
         .message = message_text,
@@ -298,6 +398,13 @@ fn buildResult(
             .payload_truncated = payload_truncated,
         },
         .payload = .{ .log = log_event },
+    };
+
+    const allocation = pool.allocator.create(EventAllocation) catch return ParseError.Truncated;
+    allocation.* = .{
+        .pool = pool,
+        .arena = arena,
+        .message_finalizer = message_finalizer,
     };
 
     const managed = event.ManagedEvent.init(ev, event.EventFinalizer.init(EventAllocation.release, allocation));
@@ -468,13 +575,6 @@ fn parseUnsigned(token: []const u8, min: u8, max: u8) ?u8 {
 
 fn isNilValue(token: []const u8) bool {
     return token.len == 1 and token[0] == '-';
-}
-
-fn copyString(allocator: std.mem.Allocator, source: []const u8, storage: *StringList) ParseError![]const u8 {
-    const copy = allocator.alloc(u8, source.len) catch return ParseError.Truncated;
-    @memcpy(copy, source);
-    storage.append(copy) catch return ParseError.Truncated;
-    return copy;
 }
 
 fn formatName(format: FormatKind) []const u8 {
