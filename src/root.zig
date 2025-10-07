@@ -6,6 +6,7 @@ pub const testing = @import("testing/mod.zig");
 pub const sql = @import("sql/mod.zig");
 pub const source = @import("source");
 pub const collector = @import("collector");
+pub const restart = @import("restart");
 pub const config = @import("config/mod.zig");
 pub const pipeline = @import("pipeline/mod.zig");
 pub const config_parser = @import("config/parser.zig");

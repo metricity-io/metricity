@@ -33,6 +33,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    const restart_module = b.createModule(.{
+        .root_source_file = b.path("src/common/restart.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const source_module = b.createModule(.{
         .root_source_file = b.path("src/source/mod.zig"),
         .target = target,
@@ -45,6 +51,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "source", .module = source_module },
             .{ .name = "netx", .module = netx_module },
+            .{ .name = "restart", .module = restart_module },
         },
     });
 
@@ -69,6 +76,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "netx", .module = netx_module },
             .{ .name = "source", .module = source_module },
             .{ .name = "collector", .module = collector_module },
+            .{ .name = "restart", .module = restart_module },
         },
     });
 
