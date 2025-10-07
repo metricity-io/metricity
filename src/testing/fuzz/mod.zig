@@ -5,6 +5,8 @@ const std = @import("std");
 pub const common = @import("common.zig");
 pub const config = @import("config.zig");
 pub const sql = @import("sql.zig");
+pub const syslog_framer = @import("syslog_framer.zig");
+pub const syslog_parser = @import("syslog_parser.zig");
 
 pub const Config = struct {
     seed: ?u64 = null,

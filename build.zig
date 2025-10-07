@@ -78,6 +78,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "metricity", .module = mod },
+            .{ .name = "source", .module = source_module },
+            .{ .name = "netx", .module = netx_module },
         },
     });
 

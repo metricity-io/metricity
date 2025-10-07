@@ -1,7 +1,7 @@
 //! By convention, root.zig is the root source file when making a library.
 const std = @import("std");
 const builtin = @import("builtin");
-const netx = @import("netx");
+pub const netx = @import("netx");
 pub const testing = @import("testing/mod.zig");
 pub const sql = @import("sql/mod.zig");
 pub const source = @import("source");
