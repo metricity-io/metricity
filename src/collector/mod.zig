@@ -301,7 +301,7 @@ pub const Status = struct {
 /// fan-out to downstream pipeline components.
 pub const Collector = struct {
     allocator: std.mem.Allocator,
-    runtime: netx.runtime.IoRuntime,
+    runtime: *netx.runtime.IoRuntime,
     options: CollectorOptions,
     clock: Clock,
     prng: std.Random.DefaultPrng,
@@ -348,15 +348,22 @@ pub const Collector = struct {
         const seed = options.restart.rng_seed orelse deriveSeed(collector.clock, seed_salt);
         collector.prng = std.Random.DefaultPrng.init(seed);
 
-        collector.runtime = netx.runtime.IoRuntime.initDefault() catch {
+        const runtime_ptr = allocator.create(netx.runtime.IoRuntime) catch {
             return CollectorError.InitializationFailed;
         };
+        errdefer allocator.destroy(runtime_ptr);
+        runtime_ptr.* = netx.runtime.IoRuntime.initDefault() catch {
+            allocator.destroy(runtime_ptr);
+            return CollectorError.InitializationFailed;
+        };
+        collector.runtime = runtime_ptr;
 
         var cleanup_needed = true;
         errdefer if (cleanup_needed) {
             destroySourceHandles(&collector, allocator);
             collector.sources.deinit(allocator);
             collector.runtime.deinit();
+            allocator.destroy(collector.runtime);
         };
 
         for (configs) |config| {
@@ -367,7 +374,7 @@ pub const Collector = struct {
 
             const init_ctx = source.InitContext{
                 .allocator = allocator,
-                .runtime = &collector.runtime,
+                .runtime = collector.runtime,
                 .log = options.log,
                 .metrics = options.metrics,
             };
@@ -407,6 +414,7 @@ pub const Collector = struct {
         self.ready_queue.deinit(self.allocator);
         self.sources.deinit(self.allocator);
         self.runtime.deinit();
+        self.allocator.destroy(self.runtime);
     }
 
     /// Starts streaming and/or batching for each configured source. Idempotent.

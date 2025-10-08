@@ -189,6 +189,12 @@ pub fn Channel(comptime T: type) type {
             self.not_empty.broadcast();
             self.not_full.broadcast();
         }
+
+        pub fn clearObserver(self: *@This()) void {
+            self.mutex.lock();
+            self.observer = null;
+            self.mutex.unlock();
+        }
     };
 }
 

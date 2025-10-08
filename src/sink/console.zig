@@ -47,8 +47,7 @@ fn emitBatch(context_ptr: *anyopaque, rows: []const sql_runtime.Row) sink_iface.
 }
 
 fn flush(context_ptr: *anyopaque) sink_iface.Error!void {
-    const context: *Context = @ptrCast(@alignCast(context_ptr));
-    try context.file.sync();
+    _ = context_ptr;
 }
 
 fn deinit(context_ptr: *anyopaque, allocator: std.mem.Allocator) void {

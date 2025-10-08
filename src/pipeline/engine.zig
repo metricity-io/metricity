@@ -410,6 +410,7 @@ const TransformRuntime = struct {
     }
 
     fn stop(self: *TransformRuntime) void {
+        self.channel.clearObserver();
         self.channel.close();
     }
 
@@ -558,6 +559,7 @@ const SinkRuntime = struct {
     }
 
     fn stop(self: *SinkRuntime) void {
+        self.channel.clearObserver();
         self.channel.close();
     }
 
