@@ -227,6 +227,35 @@ pub fn build(b: *std.Build) void {
     const netx_tcp_tests = b.addTest(.{ .root_module = netx_tcp_test_module });
     const run_netx_tcp_tests = b.addRunArtifact(netx_tcp_tests);
 
+    const coverage_root = b.pathJoin(&.{ b.install_path, "kcov" });
+
+    const mod_cov_tests = b.addTest(.{
+        .root_module = mod,
+    });
+    configureCoverageExecCmd(b, mod_cov_tests, coverage_root, "module-tests", true);
+    const run_mod_cov_tests = b.addRunArtifact(mod_cov_tests);
+
+    const exe_cov_tests = b.addTest(.{
+        .root_module = exe.root_module,
+    });
+    configureCoverageExecCmd(b, exe_cov_tests, coverage_root, "executable-tests", false);
+    const run_exe_cov_tests = b.addRunArtifact(exe_cov_tests);
+    run_exe_cov_tests.step.dependOn(&run_mod_cov_tests.step);
+
+    const netx_udp_cov_tests = b.addTest(.{
+        .root_module = netx_udp_test_module,
+    });
+    configureCoverageExecCmd(b, netx_udp_cov_tests, coverage_root, "netx-udp-tests", false);
+    const run_netx_udp_cov_tests = b.addRunArtifact(netx_udp_cov_tests);
+    run_netx_udp_cov_tests.step.dependOn(&run_exe_cov_tests.step);
+
+    const netx_tcp_cov_tests = b.addTest(.{
+        .root_module = netx_tcp_test_module,
+    });
+    configureCoverageExecCmd(b, netx_tcp_cov_tests, coverage_root, "netx-tcp-tests", false);
+    const run_netx_tcp_cov_tests = b.addRunArtifact(netx_tcp_cov_tests);
+    run_netx_tcp_cov_tests.step.dependOn(&run_netx_udp_cov_tests.step);
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
@@ -259,6 +288,9 @@ pub fn build(b: *std.Build) void {
         bench_run.addArgs(args);
     }
 
+    const coverage_step = b.step("coverage", "Run tests under kcov and collect coverage");
+    coverage_step.dependOn(&run_netx_tcp_cov_tests.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means
@@ -270,4 +302,38 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+}
+
+fn configureCoverageExecCmd(
+    b: *std.Build,
+    tests: *std.Build.Step.Compile,
+    coverage_root: []const u8,
+    label: []const u8,
+    clean: bool,
+) void {
+    const include_arg = b.fmt("--include-pattern={s}", .{"src"});
+    const exclude_arg = b.fmt("--exclude-pattern={s}", .{"zig-cache,zig-out"});
+    const output_dir = b.pathJoin(&.{ coverage_root, label });
+
+    std.fs.cwd().makePath(coverage_root) catch {};
+    std.fs.cwd().makePath(output_dir) catch {};
+
+    if (clean) {
+        tests.setExecCmd(&[_]?[]const u8{
+            "kcov",
+            "--clean",
+            include_arg,
+            exclude_arg,
+            output_dir,
+            null,
+        });
+    } else {
+        tests.setExecCmd(&[_]?[]const u8{
+            "kcov",
+            include_arg,
+            exclude_arg,
+            output_dir,
+            null,
+        });
+    }
 }

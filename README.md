@@ -10,6 +10,11 @@ console sink.
 zig build
 ```
 
+## Coverage
+
+Run `zig build coverage` to execute the test suites under `kcov` and collect the report in `zig-out/kcov`.  
+Make sure `kcov` is installed on your system and available on `$PATH`.
+
 ## Commands
 
 - `metricity run --config <path> [--once] [--max-batches <n>]`
