@@ -10,6 +10,7 @@ pub const restart = @import("restart");
 pub const config = @import("config/mod.zig");
 pub const pipeline = @import("pipeline/mod.zig");
 pub const config_parser = @import("config/parser.zig");
+pub const di = @import("common/di.zig");
 
 comptime {
     if (builtin.is_test) {
