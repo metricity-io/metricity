@@ -178,6 +178,11 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
+    const source_tests = b.addTest(.{
+        .root_module = source_module,
+    });
+    const run_source_tests = b.addRunArtifact(source_tests);
+
     // Creates an executable that will run `test` blocks from the executable's
     // root module. Note that test executables only test one module at a time,
     // hence why we have to create two separate ones.
@@ -235,12 +240,19 @@ pub fn build(b: *std.Build) void {
     configureCoverageExecCmd(b, mod_cov_tests, coverage_root, "module-tests", true);
     const run_mod_cov_tests = b.addRunArtifact(mod_cov_tests);
 
+    const source_cov_tests = b.addTest(.{
+        .root_module = source_module,
+    });
+    configureCoverageExecCmd(b, source_cov_tests, coverage_root, "source-tests", false);
+    const run_source_cov_tests = b.addRunArtifact(source_cov_tests);
+    run_source_cov_tests.step.dependOn(&run_mod_cov_tests.step);
+
     const exe_cov_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
     configureCoverageExecCmd(b, exe_cov_tests, coverage_root, "executable-tests", false);
     const run_exe_cov_tests = b.addRunArtifact(exe_cov_tests);
-    run_exe_cov_tests.step.dependOn(&run_mod_cov_tests.step);
+    run_exe_cov_tests.step.dependOn(&run_source_cov_tests.step);
 
     const netx_udp_cov_tests = b.addTest(.{
         .root_module = netx_udp_test_module,
@@ -261,6 +273,7 @@ pub fn build(b: *std.Build) void {
     // make the two of them run in parallel.
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
+    test_step.dependOn(&run_source_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_bench_queries_tests.step);
     test_step.dependOn(&run_netx_udp_tests.step);

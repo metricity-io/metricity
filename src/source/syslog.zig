@@ -927,6 +927,13 @@ fn logError(state: *SyslogState, comptime fmt: []const u8, args: anytype) void {
     }
 }
 
+fn stateFromSource(source: *src.Source) *SyslogState {
+    return switch (source.*) {
+        .stream => |stream| asState(stream.context),
+        .batch => @panic("syslog tests expect streaming source"),
+    };
+}
+
 test "syslog pollBatch drains buffer" {
     const allocator = std.testing.allocator;
     var runtime = try netx_runtime.IoRuntime.initDefault();
@@ -946,7 +953,7 @@ test "syslog pollBatch drains buffer" {
     var source_instance = try create(ctx, &source_config);
     defer source_instance.shutdown(allocator);
 
-    const state = asState(source_instance.context);
+    const state = stateFromSource(&source_instance);
     const sample_event = event.Event{
         .metadata = .{},
         .payload = .{ .log = .{ .message = "hello", .fields = &[_]event.Field{} } },
@@ -985,7 +992,7 @@ test "syslog ack runs managed event finalizers" {
     var source_instance = try create(ctx, &source_config);
     defer source_instance.shutdown(allocator);
 
-    const state = asState(source_instance.context);
+    const state = stateFromSource(&source_instance);
 
     var finalized: u8 = 0;
     const Finalizer = struct {
@@ -1073,7 +1080,7 @@ test "syslog enqueue differentiates reject and drop metrics" {
     var source_instance = try create(ctx, &source_config);
     defer source_instance.shutdown(allocator);
 
-    const state = asState(source_instance.context);
+    const state = stateFromSource(&source_instance);
 
     var evicted_finalizer_calls: u8 = 0;
     const Finalizer = struct {
@@ -1355,7 +1362,7 @@ test "syslog shutdown finalizes buffered events" {
     var shut_down = false;
     defer if (!shut_down) source_instance.shutdown(allocator);
 
-    const state = asState(source_instance.context);
+    const state = stateFromSource(&source_instance);
 
     var finalized: u8 = 0;
     const Finalizer = struct {
@@ -1404,7 +1411,7 @@ test "syslog startStream reuses batch draining semantics" {
     var source_instance = try create(ctx, &source_config);
     defer source_instance.shutdown(allocator);
 
-    const state = asState(source_instance.context);
+    const state = stateFromSource(&source_instance);
 
     const maybe_stream = try source_instance.startStream(allocator);
     try std.testing.expect(maybe_stream != null);
@@ -1821,6 +1828,26 @@ test "pumpTransport enforces rate limiter" {
         fn shutdown(_: *anyopaque) void {}
     };
 
+    const MetricsHarness = struct {
+        rejects: usize = 0,
+
+        fn incr(context: *anyopaque, name: []const u8, value: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (std.mem.eql(u8, name, metrics.rejected)) {
+                self.rejects += value;
+            }
+        }
+
+        fn gauge(_: *anyopaque, _: []const u8, _: i64) void {}
+    };
+
+    var harness = MetricsHarness{};
+    const metrics_obj = src.Metrics{
+        .context = @ptrCast(&harness),
+        .incr_counter_fn = MetricsHarness.incr,
+        .record_gauge_fn = MetricsHarness.gauge,
+    };
+
     var fake_ctx = FakeTransport{ .messages = messages[0..] };
     const fake_vtable = netx_transport.VTable{
         .start = FakeTransport.start,
@@ -1840,7 +1867,7 @@ test "pumpTransport enforces rate limiter" {
         .config = config,
         .buffer = undefined,
         .log = null,
-        .metrics = null,
+        .metrics = &metrics_obj,
         .stream_closed = false,
         .transport = manager,
         .framer = frame.Framer.init(allocator, .auto, config.message_size_limit),
@@ -1858,8 +1885,8 @@ test "pumpTransport enforces rate limiter" {
 
     pumpTransport(&state, allocator);
 
-    const maybe_first = state.buffer.pop() orelse return std.testing.expect(false);
-    defer maybe_first.finalizer.run();
-    try std.testing.expect(state.buffer.pop() == null);
+    try std.testing.expect(state.buffer.isEmpty());
     try std.testing.expectEqual(@as(usize, 0), state.buffer.len());
+    try std.testing.expectEqual(@as(usize, 1), harness.rejects);
+    try std.testing.expectEqual(@as(usize, messages.len), fake_ctx.index);
 }
