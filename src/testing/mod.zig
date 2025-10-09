@@ -7,6 +7,7 @@ pub const fuzz = @import("fuzz/mod.zig");
 pub const property = @import("property/mod.zig");
 pub const pipeline = @import("pipeline/mod.zig");
 pub const bench = @import("bench/mod.zig");
+pub const source = @import("source/mod.zig");
 
 /// Top-level context passed to helpers when additional dependencies are needed.
 pub const Context = struct {

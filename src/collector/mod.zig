@@ -6,6 +6,7 @@ const event = source.event;
 const meta = std.meta;
 const math = std.math;
 const restart = @import("restart");
+const test_utils = @import("testing");
 const ReadyQueue = std.ArrayListUnmanaged(usize);
 
 /// Normalised error surface exposed by the collector during lifecycle and polling
@@ -1476,6 +1477,70 @@ test "collector polls batch-only mock source" {
     const after_stats = collector.status();
     try testing.expect(!after_stats.started);
     try testing.expectEqual(@as(usize, 0), after_stats.active_sources);
+}
+
+test "collector polls syslog source via testing harness" {
+    const testing = std.testing;
+
+    var fixture = test_utils.source.syslog.Fixture.init(testing.allocator);
+    defer fixture.deinit();
+
+    const frames = &[_][]const u8{
+        "<34>1 2023-10-10T12:30:45Z host app 123 ID47 - First harness message",
+        "<34>1 2023-10-10T12:31:00Z host app 123 ID48 - Second harness message",
+    };
+
+    try fixture.register("syslog_harness", .{ .frames = frames });
+
+    const config = cfg.SourceConfig{
+        .id = "syslog_harness",
+        .payload = .{ .syslog = .{
+            .address = "127.0.0.1:5514",
+            .transport = .udp,
+            .parser = .auto,
+            .max_batch_size = 4,
+        } },
+    };
+
+    const options = CollectorOptions{ .registry = fixture.registry() };
+
+    var collector = try Collector.init(testing.allocator, &.{config}, options);
+    defer collector.deinit();
+
+    try collector.start(testing.allocator);
+
+    var seen: usize = 0;
+    while (seen < frames.len) : (seen += 1) {
+        const maybe_polled = try collector.poll(testing.allocator);
+        try testing.expect(maybe_polled != null);
+
+        var polled = maybe_polled.?;
+        try testing.expectEqualStrings("syslog_harness", polled.descriptor.name);
+        try testing.expectEqual(@as(usize, 1), polled.batch.events.len);
+
+        const event_payload = polled.batch.events[0].payload;
+        switch (event_payload) {
+            .log => |log_event| switch (seen) {
+                0 => try testing.expectEqualStrings("First harness message", log_event.message),
+                1 => try testing.expectEqualStrings("Second harness message", log_event.message),
+                else => unreachable,
+            },
+        }
+
+        try testing.expect(polled.batch.ack.isAvailable());
+        try polled.batch.ack.success();
+    }
+
+    try testing.expectEqual(@as(usize, frames.len), seen);
+
+    const no_more = try collector.poll(testing.allocator);
+    try testing.expect(no_more == null);
+
+    try collector.shutdown(testing.allocator);
+
+    const final_stats = collector.status();
+    try testing.expect(!final_stats.started);
+    try testing.expectEqual(@as(usize, 0), final_stats.active_sources);
 }
 
 test "collector defers polling until ready hint satisfied" {

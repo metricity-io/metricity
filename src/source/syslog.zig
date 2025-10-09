@@ -451,19 +451,38 @@ fn create(ctx: src.InitContext, config: *const cfg.SourceConfig) src.SourceError
         break :blk RateLimiter.init(now_ns, rate, burst);
     } else null;
 
+    const transport_manager = TransportManager.init(ctx, descriptor, syslog_cfg) catch {
+        var acl_copy = acl_init;
+        acl_copy.deinit();
+        return src.SourceError.StartupFailed;
+    };
+
+    return instantiateSource(
+        ctx,
+        descriptor,
+        syslog_cfg,
+        time_source,
+        transport_manager,
+        acl_init,
+        rate_limiter_value,
+    );
+}
+
+fn instantiateSource(
+    ctx: src.InitContext,
+    descriptor: src.SourceDescriptor,
+    syslog_cfg: cfg.SyslogConfig,
+    time_source: TimeSource,
+    transport_manager: TransportManager,
+    acl_init: SyslogAcl,
+    rate_limiter_value: ?RateLimiter,
+) src.SourceError!src.Source {
     const state = ctx.allocator.create(SyslogState) catch {
         var acl_copy = acl_init;
         acl_copy.deinit();
         return src.SourceError.StartupFailed;
     };
     errdefer ctx.allocator.destroy(state);
-
-    const transport_manager = TransportManager.init(ctx, descriptor, syslog_cfg) catch {
-        var acl_copy = acl_init;
-        acl_copy.deinit();
-        ctx.allocator.destroy(state);
-        return src.SourceError.StartupFailed;
-    };
 
     state.* = .{
         .allocator = ctx.allocator,
@@ -521,6 +540,67 @@ fn create(ctx: src.InitContext, config: *const cfg.SourceConfig) src.SourceError
         },
     };
 }
+
+pub const testing = struct {
+    pub const CreateOptions = struct {
+        time_source: ?TimeSource = null,
+        rate_limiter: ?RateLimiter = null,
+    };
+
+    pub fn createWithTransport(
+        ctx: src.InitContext,
+        config: *const cfg.SourceConfig,
+        transport: netx_transport.Transport,
+        options: CreateOptions,
+    ) src.SourceError!src.Source {
+        const syslog_cfg = switch (config.payload) {
+            .syslog => |value| value,
+        };
+
+        const descriptor = src.SourceDescriptor{
+            .type = .syslog,
+            .name = config.id,
+        };
+
+        const acl_init = SyslogAcl.init(ctx.allocator, syslog_cfg.allowed_peers) catch {
+            if (ctx.log) |logger| {
+                logger.errorf(
+                    "syslog source {s}: invalid ACL configuration",
+                    .{descriptor.name},
+                );
+            }
+            return src.SourceError.StartupFailed;
+        };
+
+        const time_source = options.time_source orelse defaultTimeSource;
+        const now_ns = time_source();
+        const rate_limiter_value: ?RateLimiter = if (options.rate_limiter) |limiter|
+            limiter
+        else if (syslog_cfg.rate_limit_per_sec) |rate|
+            RateLimiter.init(now_ns, rate, syslog_cfg.rate_limit_burst orelse rate)
+        else
+            null;
+
+        const manager = TransportManager{
+            .runtime = ctx.runtime,
+            .transport = transport,
+        };
+
+        return instantiateSource(
+            ctx,
+            descriptor,
+            syslog_cfg,
+            time_source,
+            manager,
+            acl_init,
+            rate_limiter_value,
+        );
+    }
+
+    pub fn statePointer(source_instance: *src.Source) *SyslogState {
+        return stateFromSourceInternal(source_instance);
+    }
+};
 
 fn startStream(context: *anyopaque, allocator: std.mem.Allocator) src.SourceError!?event.EventStream {
     _ = allocator;
@@ -927,7 +1007,7 @@ fn logError(state: *SyslogState, comptime fmt: []const u8, args: anytype) void {
     }
 }
 
-fn stateFromSource(source: *src.Source) *SyslogState {
+fn stateFromSourceInternal(source: *src.Source) *SyslogState {
     return switch (source.*) {
         .stream => |stream| asState(stream.context),
         .batch => @panic("syslog tests expect streaming source"),
@@ -953,7 +1033,7 @@ test "syslog pollBatch drains buffer" {
     var source_instance = try create(ctx, &source_config);
     defer source_instance.shutdown(allocator);
 
-    const state = stateFromSource(&source_instance);
+    const state = stateFromSourceInternal(&source_instance);
     const sample_event = event.Event{
         .metadata = .{},
         .payload = .{ .log = .{ .message = "hello", .fields = &[_]event.Field{} } },
@@ -992,7 +1072,7 @@ test "syslog ack runs managed event finalizers" {
     var source_instance = try create(ctx, &source_config);
     defer source_instance.shutdown(allocator);
 
-    const state = stateFromSource(&source_instance);
+    const state = stateFromSourceInternal(&source_instance);
 
     var finalized: u8 = 0;
     const Finalizer = struct {
@@ -1080,7 +1160,7 @@ test "syslog enqueue differentiates reject and drop metrics" {
     var source_instance = try create(ctx, &source_config);
     defer source_instance.shutdown(allocator);
 
-    const state = stateFromSource(&source_instance);
+    const state = stateFromSourceInternal(&source_instance);
 
     var evicted_finalizer_calls: u8 = 0;
     const Finalizer = struct {
@@ -1362,7 +1442,7 @@ test "syslog shutdown finalizes buffered events" {
     var shut_down = false;
     defer if (!shut_down) source_instance.shutdown(allocator);
 
-    const state = stateFromSource(&source_instance);
+    const state = stateFromSourceInternal(&source_instance);
 
     var finalized: u8 = 0;
     const Finalizer = struct {
@@ -1411,7 +1491,7 @@ test "syslog startStream reuses batch draining semantics" {
     var source_instance = try create(ctx, &source_config);
     defer source_instance.shutdown(allocator);
 
-    const state = stateFromSource(&source_instance);
+    const state = stateFromSourceInternal(&source_instance);
 
     const maybe_stream = try source_instance.startStream(allocator);
     try std.testing.expect(maybe_stream != null);

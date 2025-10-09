@@ -19,10 +19,10 @@ pub const Capabilities = source_impl.Capabilities;
 pub const StreamLifecycle = source_impl.StreamLifecycle;
 pub const BatchLifecycle = source_impl.BatchLifecycle;
 pub const ReadyObserver = source_impl.ReadyObserver;
-const syslog = @import("syslog.zig");
+const syslog_impl = @import("syslog.zig");
 
 const builtin_factories = &[_]source.SourceFactory{
-    syslog.factory(),
+    syslog_impl.factory(),
 };
 
 pub const Registry = struct {
@@ -51,10 +51,14 @@ pub fn status() []const u8 {
     return "source module initialized";
 }
 
+pub const testing = struct {
+    pub const syslog = syslog_impl.testing;
+};
+
 test "builtin registry exposes syslog factory" {
     const registry = Registry.builtin();
     const maybe_factory = registry.findFactory(.syslog);
     try std.testing.expect(maybe_factory != null);
-    const factory = maybe_factory.?;
+    const factory = maybe_factory.?; 
     try std.testing.expectEqual(@as(source.SourceType, .syslog), factory.type);
 }
