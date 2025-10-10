@@ -3,8 +3,7 @@ name: Syslog Smoke (macOS)
 on:
   push:
     branches:
-      - main
-  pull_request:
+      - master
 
 jobs:
   syslog-smoke:
