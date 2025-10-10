@@ -1,0 +1,50 @@
+name: Syslog End-to-End Matrix
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
+
+jobs:
+  syslog-e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          set -eo pipefail
+          brew update
+          brew install zig
+
+      - name: Install Zig (Ubuntu)
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zig netcat-openbsd
+
+      - name: Build metricity
+        run: |
+          set -eo pipefail
+          zig build
+
+      - name: Run syslog end-to-end scenarios
+        env:
+          LOG_DIR: ${{ runner.temp }}/metricity-e2e
+        run: |
+          ci/run-syslog-e2e.sh
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: syslog-e2e-logs-${{ matrix.os }}
+          path: ${{ runner.temp }}/metricity-e2e

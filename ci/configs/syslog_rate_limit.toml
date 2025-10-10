@@ -1,0 +1,17 @@
+[sources.syslog_rate]
+type = "syslog"
+address = "udp://127.0.0.1:5516"
+rate_limit_per_sec = 1
+rate_limit_burst = 1
+allowed_peers = ["127.0.0.1/32"]
+max_batch_size = 32
+
+[transforms.pass_through]
+type = "sql"
+inputs = ["syslog_rate"]
+query = "SELECT syslog_severity, message FROM logs"
+
+[sinks.console]
+type = "console"
+inputs = ["pass_through"]
+target = "stdout"

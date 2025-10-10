@@ -175,10 +175,12 @@ pub const Pipeline = struct {
                 .transform => {
                     const transform_cfg = &cfg.transforms[graph_node.component.transform];
                     self.nodes[idx].data = .{ .transform = try TransformRuntime.init(self, transform_cfg) };
+                    self.nodes[idx].data.transform.attachObserver();
                 },
                 .sink => {
                     const sink_cfg = &cfg.sinks[graph_node.component.sink];
                     self.nodes[idx].data = .{ .sink = try SinkRuntime.init(self, sink_cfg) };
+                    self.nodes[idx].data.sink.attachObserver();
                 },
             }
         }
@@ -359,10 +361,12 @@ const TransformRuntime = struct {
             pipeline.allocator,
             .{ .name = config.id(), .kind = .transform },
         );
-        errdefer channel_metrics.deinit();
+        var channel_metrics_owned = true;
+        errdefer if (channel_metrics_owned) channel_metrics.deinit();
 
-        var channel = try EventChannel.init(pipeline.worker_allocator, exec.queue, channel_metrics.observer());
-        errdefer channel.deinit();
+        var channel = try EventChannel.init(pipeline.worker_allocator, exec.queue, null);
+        var channel_owned = true;
+        errdefer if (channel_owned) channel.deinit();
 
         var arena = try pipeline.allocator.create(std.heap.ArenaAllocator);
         errdefer pipeline.allocator.destroy(arena);
@@ -381,7 +385,7 @@ const TransformRuntime = struct {
         errdefer pipeline.allocator.free(workers);
         for (workers) |*worker| worker.* = .{};
 
-        return TransformRuntime{
+        const runtime = TransformRuntime{
             .channel = channel,
             .queue = exec.queue,
             .workers = workers,
@@ -391,6 +395,9 @@ const TransformRuntime = struct {
             .config = config,
             .channel_metrics = channel_metrics,
         };
+        channel_owned = false;
+        channel_metrics_owned = false;
+        return runtime;
     }
 
     fn spawn(self: *TransformRuntime, pipeline: *Pipeline, node_index: usize) Error!void {
@@ -438,6 +445,10 @@ const TransformRuntime = struct {
         self.channel.deinit();
         pipeline.allocator.free(self.workers);
         self.channel_metrics.deinit();
+    }
+
+    fn attachObserver(self: *TransformRuntime) void {
+        self.channel.setObserver(self.channel_metrics.observer());
     }
 };
 
@@ -521,16 +532,18 @@ const SinkRuntime = struct {
             pipeline.allocator,
             .{ .name = config.id(), .kind = .sink },
         );
-        errdefer channel_metrics.deinit();
+        var channel_metrics_owned = true;
+        errdefer if (channel_metrics_owned) channel_metrics.deinit();
 
-        var channel = try SinkChannel.init(pipeline.worker_allocator, exec.queue, channel_metrics.observer());
-        errdefer channel.deinit();
+        var channel = try SinkChannel.init(pipeline.worker_allocator, exec.queue, null);
+        var channel_owned = true;
+        errdefer if (channel_owned) channel.deinit();
 
         const workers = try pipeline.allocator.alloc(SinkWorker, exec.parallelism);
         errdefer pipeline.allocator.free(workers);
         for (workers) |*worker| worker.* = .{};
 
-        return SinkRuntime{
+        const runtime = SinkRuntime{
             .channel = channel,
             .queue = exec.queue,
             .workers = workers,
@@ -538,6 +551,9 @@ const SinkRuntime = struct {
             .config = config,
             .channel_metrics = channel_metrics,
         };
+        channel_owned = false;
+        channel_metrics_owned = false;
+        return runtime;
     }
 
     fn spawn(self: *SinkRuntime, pipeline: *Pipeline, node_index: usize) Error!void {
@@ -585,6 +601,10 @@ const SinkRuntime = struct {
         self.channel.deinit();
         pipeline.allocator.free(self.workers);
         self.channel_metrics.deinit();
+    }
+
+    fn attachObserver(self: *SinkRuntime) void {
+        self.channel.setObserver(self.channel_metrics.observer());
     }
 };
 

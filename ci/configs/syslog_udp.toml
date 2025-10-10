@@ -1,0 +1,13 @@
+[sources.syslog_udp]
+type = "syslog"
+address = "udp://127.0.0.1:5514"
+
+[transforms.pass_through]
+type = "sql"
+inputs = ["syslog_udp"]
+query = "SELECT syslog_severity, message FROM logs"
+
+[sinks.console]
+type = "console"
+inputs = ["pass_through"]
+target = "stdout"

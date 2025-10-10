@@ -34,6 +34,17 @@ pub fn Channel(comptime T: type) type {
             return channel;
         }
 
+        pub fn setObserver(self: *@This(), observer: ?metrics_mod.ChannelObserver) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            self.observer = observer;
+            if (self.observer) |obs| {
+                obs.recordCapacity(self.buffer.capacity());
+                obs.recordDepth(self.buffer.len());
+            }
+        }
+
         pub fn deinit(self: *@This()) void {
             self.buffer.deinit();
             self.* = undefined;

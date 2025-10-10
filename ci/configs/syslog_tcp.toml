@@ -1,0 +1,16 @@
+[sources.syslog_tcp]
+type = "syslog"
+address = "tcp://127.0.0.1:6514"
+transport = "tcp"
+tcp_keepalive_seconds = 30
+flush_partial_on_close = true
+
+[transforms.pass_through]
+type = "sql"
+inputs = ["syslog_tcp"]
+query = "SELECT syslog_severity, message FROM logs"
+
+[sinks.console]
+type = "console"
+inputs = ["pass_through"]
+target = "stdout"

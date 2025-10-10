@@ -1,0 +1,41 @@
+name: Syslog Smoke (macOS)
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  syslog-smoke:
+    runs-on: macos-14
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig
+        run: |
+          set -eo pipefail
+          brew update
+          brew install zig
+
+      - name: Build metricity
+        run: |
+          set -eo pipefail
+          zig build
+
+      - name: Run syslog smoke test
+        shell: bash
+        env:
+          LOG_PATH: ${{ runner.temp }}/metricity-syslog-smoke.log
+        run: |
+          ci/run-syslog-smoke.sh examples/basic.toml
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: syslog-smoke-logs
+          path: ${{ runner.temp }}/metricity-syslog-smoke.log
