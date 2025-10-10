@@ -18,13 +18,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.1
+      - name: Download Zig
+        run: ./zig/download.sh
 
       - name: Check Zig version
-        run: zig version
+        run: ./zig/zig version
 
       - name: Install netcat (Ubuntu)
         if: matrix.os == 'ubuntu-22.04'
@@ -35,7 +33,7 @@ jobs:
       - name: Build metricity
         run: |
           set -eo pipefail
-          zig build
+          ./zig/zig build
 
       - name: Run syslog end-to-end scenarios
         env:
