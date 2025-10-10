@@ -135,6 +135,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe.root_module.link_libc = true;
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
@@ -174,6 +175,7 @@ pub fn build(b: *std.Build) void {
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
+    mod_tests.root_module.link_libc = true;
 
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
@@ -181,6 +183,7 @@ pub fn build(b: *std.Build) void {
     const source_tests = b.addTest(.{
         .root_module = source_module,
     });
+    source_tests.root_module.link_libc = true;
     const run_source_tests = b.addRunArtifact(source_tests);
 
     // Creates an executable that will run `test` blocks from the executable's
@@ -189,6 +192,7 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
+    exe_tests.root_module.link_libc = true;
 
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
@@ -207,6 +211,7 @@ pub fn build(b: *std.Build) void {
     const bench_queries_tests = b.addTest(.{
         .root_module = bench_queries_module,
     });
+    bench_queries_tests.root_module.link_libc = true;
 
     const run_bench_queries_tests = b.addRunArtifact(bench_queries_tests);
 
@@ -219,6 +224,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const netx_udp_tests = b.addTest(.{ .root_module = netx_udp_test_module });
+    netx_udp_tests.root_module.link_libc = true;
     const run_netx_udp_tests = b.addRunArtifact(netx_udp_tests);
 
     const netx_tcp_test_module = b.createModule(.{
@@ -230,6 +236,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const netx_tcp_tests = b.addTest(.{ .root_module = netx_tcp_test_module });
+    netx_tcp_tests.root_module.link_libc = true;
     const run_netx_tcp_tests = b.addRunArtifact(netx_tcp_tests);
 
     const coverage_root = b.pathJoin(&.{ b.install_path, "kcov" });
@@ -237,12 +244,14 @@ pub fn build(b: *std.Build) void {
     const mod_cov_tests = b.addTest(.{
         .root_module = mod,
     });
+    mod_cov_tests.root_module.link_libc = true;
     configureCoverageExecCmd(b, mod_cov_tests, coverage_root, "module-tests", true);
     const run_mod_cov_tests = b.addRunArtifact(mod_cov_tests);
 
     const source_cov_tests = b.addTest(.{
         .root_module = source_module,
     });
+    source_cov_tests.root_module.link_libc = true;
     configureCoverageExecCmd(b, source_cov_tests, coverage_root, "source-tests", false);
     const run_source_cov_tests = b.addRunArtifact(source_cov_tests);
     run_source_cov_tests.step.dependOn(&run_mod_cov_tests.step);
@@ -250,6 +259,7 @@ pub fn build(b: *std.Build) void {
     const exe_cov_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
+    exe_cov_tests.root_module.link_libc = true;
     configureCoverageExecCmd(b, exe_cov_tests, coverage_root, "executable-tests", false);
     const run_exe_cov_tests = b.addRunArtifact(exe_cov_tests);
     run_exe_cov_tests.step.dependOn(&run_source_cov_tests.step);
@@ -257,6 +267,7 @@ pub fn build(b: *std.Build) void {
     const netx_udp_cov_tests = b.addTest(.{
         .root_module = netx_udp_test_module,
     });
+    netx_udp_cov_tests.root_module.link_libc = true;
     configureCoverageExecCmd(b, netx_udp_cov_tests, coverage_root, "netx-udp-tests", false);
     const run_netx_udp_cov_tests = b.addRunArtifact(netx_udp_cov_tests);
     run_netx_udp_cov_tests.step.dependOn(&run_exe_cov_tests.step);
@@ -264,6 +275,7 @@ pub fn build(b: *std.Build) void {
     const netx_tcp_cov_tests = b.addTest(.{
         .root_module = netx_tcp_test_module,
     });
+    netx_tcp_cov_tests.root_module.link_libc = true;
     configureCoverageExecCmd(b, netx_tcp_cov_tests, coverage_root, "netx-tcp-tests", false);
     const run_netx_tcp_cov_tests = b.addRunArtifact(netx_tcp_cov_tests);
     run_netx_tcp_cov_tests.step.dependOn(&run_netx_udp_cov_tests.step);
@@ -293,6 +305,7 @@ pub fn build(b: *std.Build) void {
         .name = "metricity-bench",
         .root_module = bench_module,
     });
+    bench_exe.root_module.link_libc = true;
 
     const bench_run = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run SQL parser benchmarks");

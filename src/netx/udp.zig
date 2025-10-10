@@ -10,11 +10,18 @@ const MessageList = array_list.Managed(transport.Message);
 const UdpSocket = xev.UDP;
 const UdpState = UdpSocket.State;
 
+fn makeState(userdata: ?*anyopaque) UdpState {
+    if (@hasField(UdpState, "op")) {
+        return .{ .userdata = userdata, .op = undefined };
+    }
+    return .{ .userdata = userdata };
+}
+
 const UdpContext = struct {
     allocator: std.mem.Allocator,
     loop: *xev.Loop,
     socket: UdpSocket,
-    state: UdpState = .{ .userdata = null },
+    state: UdpState = makeState(null),
     read_completion: xev.Completion = .{},
     scratch: []u8,
     message_limit: usize,
@@ -66,7 +73,7 @@ const UdpContext = struct {
             .pending_head = 0,
         };
 
-        ctx.state = .{ .userdata = ctx };
+        ctx.state = makeState(@as(*anyopaque, @ptrCast(ctx)));
         ctx.startRead();
 
         return ctx;
@@ -226,7 +233,7 @@ test "udp enqueueDatagram marks truncated metadata" {
         .allocator = allocator,
         .loop = undefined,
         .socket = undefined,
-        .state = .{ .userdata = null },
+        .state = makeState(null),
         .read_completion = .{},
         .scratch = scratch_storage[0..],
         .message_limit = 4,
