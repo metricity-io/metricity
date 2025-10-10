@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LOG_DIR="${LOG_DIR:-$ROOT_DIR/ci/logs}"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+LOG_DIR="${LOG_DIR:-$ROOT_DIR/.github/ci/logs}"
 mkdir -p "$LOG_DIR"
 
 metricity_pid=""
@@ -73,7 +73,7 @@ assert_log_clean() {
 }
 
 run_udp_scenario() {
-  local config="$ROOT_DIR/ci/configs/syslog_udp.toml"
+  local config="$ROOT_DIR/.github/ci/configs/syslog_udp.toml"
   local log_path="$LOG_DIR/syslog-udp.log"
   local port=5514
 
@@ -88,7 +88,7 @@ run_udp_scenario() {
 }
 
 run_tcp_scenario() {
-  local config="$ROOT_DIR/ci/configs/syslog_tcp.toml"
+  local config="$ROOT_DIR/.github/ci/configs/syslog_tcp.toml"
   local log_path="$LOG_DIR/syslog-tcp.log"
   local port=6514
 

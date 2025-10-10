@@ -39,7 +39,7 @@ jobs:
         env:
           LOG_DIR: ${{ runner.temp }}/metricity-e2e
         run: |
-          ci/run-syslog-e2e.sh
+          ./.github/ci/run-syslog-e2e.sh
 
       - name: Upload logs on failure
         if: failure()

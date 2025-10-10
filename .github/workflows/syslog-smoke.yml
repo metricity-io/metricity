@@ -39,7 +39,7 @@ jobs:
         env:
           LOG_PATH: ${{ runner.temp }}/metricity-syslog-smoke-${{ matrix.os }}.log
         run: |
-          ci/run-syslog-smoke.sh examples/basic.toml
+          ./.github/ci/run-syslog-smoke.sh examples/basic.toml
 
       - name: Upload logs on failure
         if: failure()
