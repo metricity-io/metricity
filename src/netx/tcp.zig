@@ -184,6 +184,8 @@ const TcpContext = struct {
     }
 
     fn processConnection(self: *TcpContext, conn: *Connection) ProcessError!void {
+        var saw_close = false;
+
         while (true) {
             const read_len = posix.recv(conn.fd, self.scratch, posix.MSG.DONTWAIT) catch |err| switch (err) {
                 error.WouldBlock => break,
@@ -192,7 +194,10 @@ const TcpContext = struct {
                 else => return error.Fatal,
             };
 
-            if (read_len == 0) return error.ConnectionClosed;
+            if (read_len == 0) {
+                saw_close = true;
+                break;
+            }
 
             conn.ring.write(self.scratch[0..read_len]) catch {
                 return error.Fatal;
@@ -200,6 +205,8 @@ const TcpContext = struct {
         }
 
         try self.flushBufferedChunks(conn, false);
+
+        if (saw_close) return error.ConnectionClosed;
     }
 
     fn flushBufferedChunks(self: *TcpContext, conn: *Connection, force_truncated: bool) ProcessError!void {
