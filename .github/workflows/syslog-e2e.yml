@@ -18,18 +18,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Zig (macOS)
-        if: startsWith(matrix.os, 'macos')
-        run: |
-          set -eo pipefail
-          brew update
-          brew install zig
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.1
 
-      - name: Install Zig (Ubuntu)
+      - name: Check Zig version
+        run: zig version
+
+      - name: Install netcat (Ubuntu)
         if: matrix.os == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y zig netcat-openbsd
+          sudo apt-get install -y netcat-openbsd
 
       - name: Build metricity
         run: |
