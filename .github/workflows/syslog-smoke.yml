@@ -9,7 +9,7 @@ jobs:
   syslog-smoke:
     strategy:
       matrix:
-        os: [macos-14, ubuntu-22.04]
+        os: [macos-14, ubuntu-22.04, ubuntu-22.04-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
 
@@ -24,7 +24,7 @@ jobs:
         run: ./zig/zig version
 
       - name: Install netcat (Ubuntu)
-        if: matrix.os == 'ubuntu-22.04'
+        if: contains(matrix.os, 'ubuntu-')
         run: |
           sudo apt-get update
           sudo apt-get install -y netcat-openbsd
