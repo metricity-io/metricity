@@ -122,9 +122,9 @@ pub const Pipeline = struct {
         if (!self.started) return;
         const already = self.shutting_down.swap(true, atomic_order.seq_cst);
         if (!already) {
-            self.collector.shutdown(self.allocator) catch {};
             for (self.nodes) |*node| node.stop();
             for (self.nodes) |*node| node.join(self);
+            self.collector.shutdown(self.allocator) catch {};
         }
         self.started = false;
     }

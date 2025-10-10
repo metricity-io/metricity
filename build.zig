@@ -16,6 +16,8 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+    const sanitize_thread =
+        b.option(bool, "sanitize-thread", "Enable ThreadSanitizer for all compiled artifacts") orelse false;
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -32,17 +34,20 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/netx/mod.zig"),
         .target = target,
     });
+    netx_module.sanitize_thread = sanitize_thread;
 
     const restart_module = b.createModule(.{
         .root_source_file = b.path("src/common/restart.zig"),
         .target = target,
         .optimize = optimize,
     });
+    restart_module.sanitize_thread = sanitize_thread;
 
     const source_module = b.createModule(.{
         .root_source_file = b.path("src/source/mod.zig"),
         .target = target,
     });
+    source_module.sanitize_thread = sanitize_thread;
     source_module.addImport("netx", netx_module);
 
     const collector_module = b.createModule(.{
@@ -54,6 +59,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "restart", .module = restart_module },
         },
     });
+    collector_module.sanitize_thread = sanitize_thread;
 
     const libxev_dep = b.dependency("libxev", .{
         .target = target,
@@ -79,6 +85,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "restart", .module = restart_module },
         },
     });
+    mod.sanitize_thread = sanitize_thread;
 
     const testing_module = b.createModule(.{
         .root_source_file = b.path("src/testing/mod.zig"),
@@ -90,6 +97,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "netx", .module = netx_module },
         },
     });
+    testing_module.sanitize_thread = sanitize_thread;
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -136,6 +144,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.link_libc = true;
+    exe.root_module.sanitize_thread = sanitize_thread;
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
