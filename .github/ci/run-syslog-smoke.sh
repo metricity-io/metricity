@@ -83,6 +83,15 @@ send_udp_messages() {
   done
 }
 
+send_tcp_messages() {
+  local port=$1
+  shift
+  for payload in "$@"; do
+    { printf "%s\n" "$payload"; sleep 1; } | nc 127.0.0.1 "$port"
+    sleep 1
+  done
+}
+
 run_case() {
   local name=$1
   local config=$2
@@ -222,6 +231,9 @@ run_case "udp-rfc3164" "$udp_rfc3164_config" "$udp_rfc3164_port" send_udp_messag
   "<34>Oct 11 22:14:15 host app[123]: Syslog smoke test (RFC3164 UDP)"
 
 run_startup_case "tcp-startup" "$tcp_rfc5424_config"
+
+run_case "tcp-rfc5424" "$tcp_rfc5424_config" "$tcp_rfc5424_port" send_tcp_messages \
+  "<12>1 2024-01-01T00:00:02Z localhost app - - - Syslog smoke test (RFC5424 TCP)"
 
 run_case "udp-invalid" "$udp_invalid_config" "$udp_invalid_port" send_udp_messages \
   "not-a-syslog-packet" \
