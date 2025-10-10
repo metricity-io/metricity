@@ -1,4 +1,4 @@
-name: Syslog Smoke (macOS)
+name: Syslog Smoke
 
 on:
   push:
@@ -7,7 +7,10 @@ on:
 
 jobs:
   syslog-smoke:
-    runs-on: macos-14
+    strategy:
+      matrix:
+        os: [macos-14, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
 
     steps:
@@ -15,10 +18,17 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Zig
+        if: startsWith(matrix.os, 'macos')
         run: |
           set -eo pipefail
           brew update
           brew install zig
+
+      - name: Install Zig (Ubuntu)
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zig netcat-openbsd
 
       - name: Build metricity
         run: |
@@ -28,7 +38,7 @@ jobs:
       - name: Run syslog smoke test
         shell: bash
         env:
-          LOG_PATH: ${{ runner.temp }}/metricity-syslog-smoke.log
+          LOG_PATH: ${{ runner.temp }}/metricity-syslog-smoke-${{ matrix.os }}.log
         run: |
           ci/run-syslog-smoke.sh examples/basic.toml
 
@@ -36,5 +46,5 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: syslog-smoke-logs
-          path: ${{ runner.temp }}/metricity-syslog-smoke.log
+          name: syslog-smoke-logs-${{ matrix.os }}
+          path: ${{ runner.temp }}/metricity-syslog-smoke-${{ matrix.os }}.log
