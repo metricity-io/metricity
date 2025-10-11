@@ -1,13 +1,11 @@
-[sources.syslog_rate]
+[sources.syslog_rfc3164]
 type = "syslog"
-address = "udp://127.0.0.1:5516"
-rate_limit_per_sec = 1
-rate_limit_burst = 1
-max_batch_size = 32
+address = "udp://127.0.0.1:5518"
+parser = "rfc3164"
 
 [transforms.pass_through]
 type = "sql"
-inputs = ["syslog_rate"]
+inputs = ["syslog_rfc3164"]
 query = "SELECT syslog_severity, message FROM logs"
 
 [sinks.console]

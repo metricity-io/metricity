@@ -803,24 +803,24 @@ fn pumpTransport(state: *SyslogState, allocator: std.mem.Allocator) void {
 
         if (state.acl.isEnabled()) {
             const peer = parsePeerAddress(message.metadata) catch |err| {
-                if (chunk_finalizer) |finalizer| finalizer.run();
                 recordReject(state, 1);
                 logWarn(
                     state,
                     "syslog source {s}: rejected message with invalid peer ({s})",
                     .{ state.descriptor.name, @errorName(err) },
                 );
+                if (chunk_finalizer) |finalizer| finalizer.run();
                 continue;
             };
 
             if (!state.acl.allows(peer)) {
-                if (chunk_finalizer) |finalizer| finalizer.run();
                 recordReject(state, 1);
                 logWarn(
                     state,
                     "syslog source {s}: dropped packet from disallowed peer {s}",
                     .{ state.descriptor.name, message.metadata.peer_address },
                 );
+                if (chunk_finalizer) |finalizer| finalizer.run();
                 continue;
             }
         }
@@ -828,13 +828,13 @@ fn pumpTransport(state: *SyslogState, allocator: std.mem.Allocator) void {
         if (state.rate_limiter) |*limiter| {
             const now = state.time_source();
             if (!limiter.allow(now)) {
-                if (chunk_finalizer) |finalizer| finalizer.run();
                 recordReject(state, 1);
                 logWarn(
                     state,
                     "syslog source {s}: rate limit exceeded (peer {s})",
                     .{ state.descriptor.name, message.metadata.peer_address },
                 );
+                if (chunk_finalizer) |finalizer| finalizer.run();
                 continue;
             }
         }

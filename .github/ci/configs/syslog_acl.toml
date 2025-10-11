@@ -1,13 +1,13 @@
-[sources.syslog_rate]
+[sources.syslog_acl]
 type = "syslog"
-address = "udp://127.0.0.1:5516"
-rate_limit_per_sec = 1
-rate_limit_burst = 1
-max_batch_size = 32
+address = "tcp://127.0.0.1:6515"
+transport = "tcp"
+allowed_peers = ["10.0.0.0/8"]
+flush_partial_on_close = true
 
 [transforms.pass_through]
 type = "sql"
-inputs = ["syslog_rate"]
+inputs = ["syslog_acl"]
 query = "SELECT syslog_severity, message FROM logs"
 
 [sinks.console]

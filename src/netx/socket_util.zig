@@ -90,34 +90,90 @@ pub fn configureTcpKeepalive(fd: posix.socket_t, seconds: u32) void {
 pub fn fetchPeerAddress(allocator: std.mem.Allocator, socket: xev.TCP) ![]u8 {
     var addr_storage: posix.sockaddr = undefined;
     var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-    posix.getpeername(socket.fd, &addr_storage, &addr_len) catch {
+    posix.getpeername(socket.fd, &addr_storage, &addr_len) catch |err| {
+        std.log.warn("fetchPeerAddress: getpeername failed for fd {d}: {s}", .{ socket.fd, @errorName(err) });
         return allocator.alloc(u8, 0);
     };
     const address = std.net.Address.initPosix(@alignCast(&addr_storage));
     var buffer: [128]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buffer);
-    var writer = stream.writer();
-    var adapter = writer.adaptToNewApi(buffer[0..]);
-    address.format(&adapter.new_interface) catch {
-        return allocator.alloc(u8, 0);
+
+    const family = address.any.family;
+    const slice = switch (family) {
+        posix.AF.INET => blk: {
+            const ip = address.in;
+            const bytes: *const [4]u8 = @ptrCast(@alignCast(&ip.sa.addr));
+            const port = ip.getPort();
+            break :blk std.fmt.bufPrint(buffer[0..], "{d}.{d}.{d}.{d}:{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3], port }) catch |err| {
+                std.log.warn("fetchPeerAddress: ipv4 format failed for fd {d}: {s}", .{ socket.fd, @errorName(err) });
+                return allocator.alloc(u8, 0);
+            };
+        },
+        posix.AF.INET6 => blk: {
+            const ip6 = address.in6;
+            const parts = [_]u16{
+                (@as(u16, ip6.sa.addr[0]) << 8) | @as(u16, ip6.sa.addr[1]),
+                (@as(u16, ip6.sa.addr[2]) << 8) | @as(u16, ip6.sa.addr[3]),
+                (@as(u16, ip6.sa.addr[4]) << 8) | @as(u16, ip6.sa.addr[5]),
+                (@as(u16, ip6.sa.addr[6]) << 8) | @as(u16, ip6.sa.addr[7]),
+                (@as(u16, ip6.sa.addr[8]) << 8) | @as(u16, ip6.sa.addr[9]),
+                (@as(u16, ip6.sa.addr[10]) << 8) | @as(u16, ip6.sa.addr[11]),
+                (@as(u16, ip6.sa.addr[12]) << 8) | @as(u16, ip6.sa.addr[13]),
+                (@as(u16, ip6.sa.addr[14]) << 8) | @as(u16, ip6.sa.addr[15]),
+            };
+            break :blk std.fmt.bufPrint(
+                buffer[0..],
+                "[{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}]:{d}",
+                .{ parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6], parts[7], ip6.getPort() },
+            ) catch |err| {
+                std.log.warn("fetchPeerAddress: ipv6 format failed for fd {d}: {s}", .{ socket.fd, @errorName(err) });
+                return allocator.alloc(u8, 0);
+            };
+        },
+        else => blk: {
+            std.log.warn("fetchPeerAddress: unsupported address family {d} for fd {d}", .{ family, socket.fd });
+            break :blk buffer[0..0];
+        },
     };
-    if (adapter.err) |_| {
-        return allocator.alloc(u8, 0);
+
+    if (slice.len == 0) {
+        std.log.warn("fetchPeerAddress: empty formatted address for fd {d} (family {d})", .{ socket.fd, family });
     }
-    return copySlice(allocator, stream.getWritten());
+    return copySlice(allocator, slice);
 }
 
 pub fn formatPeerAddress(address: std.net.Address, buffer: []u8) []const u8 {
-    var stream = std.io.fixedBufferStream(buffer);
-    var writer = stream.writer();
-    var adapter = writer.adaptToNewApi(buffer);
-    address.format(&adapter.new_interface) catch {
-        return &[_]u8{};
+    const family = address.any.family;
+    return switch (family) {
+        posix.AF.INET => blk: {
+            const ip = address.in;
+            const bytes: *const [4]u8 = @ptrCast(@alignCast(&ip.sa.addr));
+            const port = ip.getPort();
+            break :blk std.fmt.bufPrint(buffer, "{d}.{d}.{d}.{d}:{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3], port }) catch {
+                return &[_]u8{};
+            };
+        },
+        posix.AF.INET6 => blk: {
+            const ip6 = address.in6;
+            const parts = [_]u16{
+                (@as(u16, ip6.sa.addr[0]) << 8) | @as(u16, ip6.sa.addr[1]),
+                (@as(u16, ip6.sa.addr[2]) << 8) | @as(u16, ip6.sa.addr[3]),
+                (@as(u16, ip6.sa.addr[4]) << 8) | @as(u16, ip6.sa.addr[5]),
+                (@as(u16, ip6.sa.addr[6]) << 8) | @as(u16, ip6.sa.addr[7]),
+                (@as(u16, ip6.sa.addr[8]) << 8) | @as(u16, ip6.sa.addr[9]),
+                (@as(u16, ip6.sa.addr[10]) << 8) | @as(u16, ip6.sa.addr[11]),
+                (@as(u16, ip6.sa.addr[12]) << 8) | @as(u16, ip6.sa.addr[13]),
+                (@as(u16, ip6.sa.addr[14]) << 8) | @as(u16, ip6.sa.addr[15]),
+            };
+            break :blk std.fmt.bufPrint(
+                buffer,
+                "[{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}]:{d}",
+                .{ parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6], parts[7], ip6.getPort() },
+            ) catch {
+                return &[_]u8{};
+            };
+        },
+        else => buffer[0..0],
     };
-    if (adapter.err) |_| {
-        return &[_]u8{};
-    }
-    return stream.getWritten();
 }
 
 pub fn copySlice(allocator: std.mem.Allocator, source: []const u8) ![]u8 {

@@ -49,6 +49,17 @@ const RuntimeServices = struct {
 
 const RuntimeContainer = di.Container(RuntimeServices);
 
+fn stderrLogWrite(_: *anyopaque, level: source_mod.source.LogLevel, message: []const u8) void {
+    std.debug.print("[{s}] {s}\n", .{@tagName(level), message});
+}
+
+var stderr_logger_cookie: u8 = 0;
+
+const default_logger = source_mod.Logger{
+    .context = @ptrCast(@alignCast(&stderr_logger_cookie)),
+    .write_fn = stderrLogWrite,
+};
+
 fn defaultParseFile(allocator: std.mem.Allocator, path: []const u8) Error!config_mod.OwnedPipelineConfig {
     return config_parser.parseFile(allocator, path);
 }
@@ -140,7 +151,11 @@ fn createRealPipeline(
     allocator: std.mem.Allocator,
     cfg: *const config_mod.PipelineConfig,
 ) pipeline_mod.Error!PipelineHandle {
-    var pipeline_instance = try pipeline_mod.Pipeline.init(allocator, cfg, .{});
+    var pipeline_instance = try pipeline_mod.Pipeline.init(allocator, cfg, .{
+        .collector = .{
+            .log = &default_logger,
+        },
+    });
     const ctx = allocator.create(RealPipelineContext) catch |err| {
         pipeline_instance.deinit();
         return err;
