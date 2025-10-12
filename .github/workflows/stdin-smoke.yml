@@ -1,0 +1,43 @@
+name: Stdin Smoke
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  stdin-smoke:
+    strategy:
+      matrix:
+        os: [macos-14, ubuntu-22.04, ubuntu-22.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Zig
+        run: ./zig/download.sh
+
+      - name: Check Zig version
+        run: ./zig/zig version
+
+      - name: Build metricity
+        run: |
+          set -eo pipefail
+          ./zig/zig build
+
+      - name: Run stdin smoke test
+        shell: bash
+        env:
+          LOG_PATH: ${{ runner.temp }}/metricity-stdin-smoke-${{ matrix.os }}.log
+        run: |
+          ./.github/ci/run-stdin-smoke.sh
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stdin-smoke-logs-${{ matrix.os }}
+          path: ${{ runner.temp }}/metricity-stdin-smoke-${{ matrix.os }}.log
