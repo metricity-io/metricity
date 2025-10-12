@@ -18,34 +18,38 @@ const has_posix_regex = switch (builtin.target.os.tag) {
 };
 
 const c = if (has_posix_regex) @cImport({
-    @cInclude("regex.h");
+    @cInclude("regex_helper.h");
 }) else struct {};
 
 const RegexError = if (has_posix_regex) error{ InvalidPattern, RegexExecFailed } else error{};
 const PatternError = RegexError || std.mem.Allocator.Error;
 
 const RegexMatcher = if (has_posix_regex) struct {
-    regex: c.regex_t,
+    regex: c.metricity_regex_t,
 
     fn init(allocator: std.mem.Allocator, pattern: []const u8) PatternError!RegexMatcher {
-        var compiled: c.regex_t = undefined;
+        var matcher = RegexMatcher{
+            .regex = undefined,
+        };
+        c.metricity_regex_init(&matcher.regex);
+
         const pattern_z = try allocator.dupeZ(u8, pattern);
         defer allocator.free(pattern_z);
 
-        const res = c.regcomp(&compiled, pattern_z.ptr, c.REG_EXTENDED | c.REG_NEWLINE);
+        const res = c.regcomp(c.metricity_regex_ptr(&matcher.regex), pattern_z.ptr, c.REG_EXTENDED | c.REG_NEWLINE);
         if (res != 0) return RegexError.InvalidPattern;
-        return .{ .regex = compiled };
+        return matcher;
     }
 
     fn deinit(self: *RegexMatcher) void {
-        c.regfree(&self.regex);
+        c.regfree(c.metricity_regex_ptr(&self.regex));
     }
 
     fn matches(self: *const RegexMatcher, allocator: std.mem.Allocator, line: []const u8) PatternError!bool {
         const line_z = try allocator.dupeZ(u8, line);
         defer allocator.free(line_z);
 
-        const res = c.regexec(&self.regex, line_z.ptr, 0, null, 0);
+        const res = c.regexec(c.metricity_regex_ptr_const(&self.regex), line_z.ptr, 0, null, 0);
         return switch (res) {
             0 => true,
             c.REG_NOMATCH => false,

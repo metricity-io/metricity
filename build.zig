@@ -48,6 +48,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
     source_module.sanitize_thread = sanitize_thread;
+    source_module.addIncludePath(b.path("src/source"));
     source_module.addImport("netx", netx_module);
 
     const collector_module = b.createModule(.{
