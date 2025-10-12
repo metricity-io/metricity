@@ -427,6 +427,7 @@ fn batchAckComplete(context: *anyopaque, status: event.AckStatus) void {
 fn create(ctx: src.InitContext, config: *const cfg.SourceConfig) src.SourceError!src.Source {
     const syslog_cfg = switch (config.payload) {
         .syslog => |value| value,
+        else => return src.SourceError.InvalidConfiguration,
     };
 
     const descriptor = src.SourceDescriptor{
@@ -555,6 +556,7 @@ pub const testing = struct {
     ) src.SourceError!src.Source {
         const syslog_cfg = switch (config.payload) {
             .syslog => |value| value,
+            else => return src.SourceError.InvalidConfiguration,
         };
 
         const descriptor = src.SourceDescriptor{

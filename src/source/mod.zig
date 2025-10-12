@@ -20,9 +20,12 @@ pub const StreamLifecycle = source_impl.StreamLifecycle;
 pub const BatchLifecycle = source_impl.BatchLifecycle;
 pub const ReadyObserver = source_impl.ReadyObserver;
 const syslog_impl = @import("syslog.zig");
+pub const arena_pool = @import("arena_pool.zig");
+pub const stdin_impl = @import("stdin.zig");
 
 const builtin_factories = &[_]source.SourceFactory{
     syslog_impl.factory(),
+    stdin_impl.factory(),
 };
 
 pub const Registry = struct {
@@ -55,10 +58,8 @@ pub const testing = struct {
     pub const syslog = syslog_impl.testing;
 };
 
-test "builtin registry exposes syslog factory" {
+test "builtin registry exposes syslog and stdin factories" {
     const registry = Registry.builtin();
-    const maybe_factory = registry.findFactory(.syslog);
-    try std.testing.expect(maybe_factory != null);
-    const factory = maybe_factory.?; 
-    try std.testing.expectEqual(@as(source.SourceType, .syslog), factory.type);
+    try std.testing.expect(registry.findFactory(.syslog) != null);
+    try std.testing.expect(registry.findFactory(.stdin) != null);
 }

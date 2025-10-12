@@ -7,6 +7,7 @@ const unicode = std.unicode;
 const time = std.time;
 const epoch = std.time.epoch;
 const ascii = std.ascii;
+const arena_pool = @import("../arena_pool.zig");
 
 const UTF8_BOM = [_]u8{ 0xEF, 0xBB, 0xBF };
 
@@ -21,69 +22,11 @@ pub const ParseResult = struct {
     managed: event.ManagedEvent,
 };
 
-const EventArena = struct {
-    arena: std.heap.ArenaAllocator,
-    next: ?*EventArena = null,
-
-    fn allocator(self: *EventArena) std.mem.Allocator {
-        return self.arena.allocator();
-    }
-};
-
-pub const EventArenaPool = struct {
-    allocator: std.mem.Allocator,
-    free_list: ?*EventArena = null,
-
-    pub fn init(allocator: std.mem.Allocator) EventArenaPool {
-        return .{ .allocator = allocator, .free_list = null };
-    }
-
-    pub fn deinit(self: *EventArenaPool) void {
-        var cursor = self.free_list;
-        while (cursor) |arena| {
-            const next = arena.next;
-            arena.arena.deinit();
-            self.allocator.destroy(arena);
-            cursor = next;
-        }
-        self.free_list = null;
-    }
-
-    pub fn acquire(self: *EventArenaPool) ParseError!*EventArena {
-        if (self.free_list) |arena| {
-            self.free_list = arena.next;
-            arena.next = null;
-            return arena;
-        }
-
-        const arena = self.allocator.create(EventArena) catch return ParseError.Truncated;
-        arena.* = .{
-            .arena = std.heap.ArenaAllocator.init(self.allocator),
-            .next = null,
-        };
-        return arena;
-    }
-
-    pub fn release(self: *EventArenaPool, arena: *EventArena) void {
-        _ = arena.arena.reset(.retain_capacity);
-        arena.next = self.free_list;
-        self.free_list = arena;
-    }
-
-    pub fn freeCount(self: *const EventArenaPool) usize {
-        var cursor = self.free_list;
-        var count: usize = 0;
-        while (cursor) |arena| {
-            count += 1;
-            cursor = arena.next;
-        }
-        return count;
-    }
-};
+pub const EventArenaPool = arena_pool.EventArenaPool;
 
 const EventAllocation = struct {
     pool: *EventArenaPool,
-    arena: *EventArena,
+    arena: *EventArenaPool.Arena,
     message_finalizer: ?transport.Finalizer,
 
     fn release(context: ?*anyopaque) void {
@@ -170,7 +113,9 @@ fn parseRfc5424(
     payload_truncated: bool,
     message_finalizer: ?transport.Finalizer,
 ) ParseError!ParseResult {
-    var arena = try pool.acquire();
+    var arena = pool.acquire() catch |err| switch (err) {
+        EventArenaPool.Error.OutOfMemory => return ParseError.Truncated,
+    };
     var arena_owned = true;
     errdefer if (arena_owned) pool.release(arena);
 
@@ -234,7 +179,9 @@ fn parseRfc3164(
     payload_truncated: bool,
     message_finalizer: ?transport.Finalizer,
 ) ParseError!ParseResult {
-    var arena = try pool.acquire();
+    var arena = pool.acquire() catch |err| switch (err) {
+        EventArenaPool.Error.OutOfMemory => return ParseError.Truncated,
+    };
     var arena_owned = true;
     errdefer if (arena_owned) pool.release(arena);
 
@@ -298,7 +245,7 @@ const HeaderInfo = struct {
 
 fn buildResult(
     pool: *EventArenaPool,
-    arena: *EventArena,
+    arena: *EventArenaPool.Arena,
     arena_allocator: std.mem.Allocator,
     facility: u8,
     severity: u8,

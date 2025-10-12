@@ -14,6 +14,7 @@ pub const SourceError = error{
 
 pub const SourceType = enum {
     syslog,
+    stdin,
 };
 
 pub const SourceDescriptor = struct {

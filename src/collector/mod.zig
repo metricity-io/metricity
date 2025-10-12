@@ -1121,6 +1121,7 @@ fn destroySourceHandles(collector: *Collector, allocator: std.mem.Allocator) voi
 fn selectRestartPolicy(descriptor: source.SourceDescriptor) RestartPolicy {
     return switch (descriptor.type) {
         .syslog => syslog_restart_policy,
+        .stdin => syslog_restart_policy,
     };
 }
 
@@ -1532,6 +1533,59 @@ test "collector polls syslog source via testing harness" {
     }
 
     try testing.expectEqual(@as(usize, frames.len), seen);
+
+    const no_more = try collector.poll(testing.allocator);
+    try testing.expect(no_more == null);
+
+    try collector.shutdown(testing.allocator);
+
+    const final_stats = collector.status();
+    try testing.expect(!final_stats.started);
+    try testing.expectEqual(@as(usize, 0), final_stats.active_sources);
+}
+
+test "collector polls stdin source via testing harness" {
+    const testing = std.testing;
+
+    var fixture = test_utils.source.stdin.Fixture.init(testing.allocator);
+    defer fixture.deinit();
+
+    const lines = &[_][]const u8{
+        "first stdin line",
+        "second stdin line",
+    };
+
+    try fixture.register("stdin_harness", .{ .lines = lines });
+
+    const config = cfg.SourceConfig{
+        .id = "stdin_harness",
+        .payload = .{ .stdin = .{} },
+    };
+
+    const options = CollectorOptions{ .registry = fixture.registry() };
+
+    var collector = try Collector.init(testing.allocator, &.{config}, options);
+    defer collector.deinit();
+
+    try collector.start(testing.allocator);
+
+    var seen: usize = 0;
+    while (seen < lines.len) : (seen += 1) {
+        const maybe_polled = try collector.poll(testing.allocator);
+        try testing.expect(maybe_polled != null);
+
+        var polled = maybe_polled.?;
+        try testing.expectEqualStrings("stdin_harness", polled.descriptor.name);
+        try testing.expectEqual(@as(usize, 1), polled.batch.events.len);
+
+        const payload = polled.batch.events[0].payload;
+        switch (payload) {
+            .log => |log_event| try testing.expectEqualStrings(lines[seen], log_event.message),
+        }
+
+        try testing.expect(polled.batch.ack.isAvailable());
+        try polled.batch.ack.success();
+    }
 
     const no_more = try collector.poll(testing.allocator);
     try testing.expect(no_more == null);

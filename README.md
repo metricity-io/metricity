@@ -79,6 +79,29 @@ parser mode shown above. Notable fields:
   as a truncated frame when the peer closes the stream. This helps avoid losing partial messages
   on orderly shutdowns while keeping the default behavior unchanged.
 
+### Stdin source
+
+Metricity now ships with a native stdin source for quick prototyping and piping log streams:
+
+```toml
+[sources.stdin]
+type = "stdin"
+codec = "text" # or "ndjson", "raw"
+
+multiline.mode = "disabled" # "pattern" or "stanza" when aggregation is needed
+queue_capacity = 1024
+when_full = "drop_oldest"
+flush_partial_on_close = true
+```
+
+Key options:
+
+- `codec` — `text` keeps raw lines, `ndjson` decodes JSON objects, `raw` bypasses UTF-8 checks.
+- `multiline.*` — optional aggregation facilities (pattern-based or stanza mode).
+- `queue_capacity` / `when_full` — backpressure behavior shared with other sources.
+- `rate_limit_per_sec` / `rate_limit_burst` — token bucket limiter for bursty producers.
+- `flush_partial_on_close` — emit partially buffered data when the upstream closes stdin.
+
 ### Metrics
 
 When `pipeline.Options.metrics` is set to a `source.Metrics` sink, the pipeline exports the
