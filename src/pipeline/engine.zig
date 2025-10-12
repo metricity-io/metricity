@@ -265,6 +265,14 @@ pub const Pipeline = struct {
         }
     }
 
+    fn hasDownstreamTransform(self: *Pipeline, from_index: usize) bool {
+        const downstream = self.nodes[from_index].downstream;
+        for (downstream) |target_index| {
+            if (self.nodes[target_index].kind == .transform) return true;
+        }
+        return false;
+    }
+
     fn sendRowFromTransform(self: *Pipeline, from_index: usize, row: sql_mod.runtime.Row, ctx: *EventContext) Error!void {
         const downstream = self.nodes[from_index].downstream;
         var sink_total: usize = 0;
@@ -500,20 +508,28 @@ fn handleTransformMessage(context: *TransformWorkerContext, message: EventMessag
     };
 
     if (produced) |row| {
-        // Row fan-out only targets sink nodes. The engine does not currently feed
-        // produced rows into downstream transforms, which means multi-stage
-        // transform chains only share the original event payload rather than
-        // composing intermediate rows.
-        pipeline.sendRowFromTransform(node_index, row, message.context) catch {
+        var owned_row = row;
+        const has_transforms = pipeline.hasDownstreamTransform(node_index);
+        if (has_transforms) {
+            const new_event = rowToEvent(
+                message.context.batchAllocator(),
+                &owned_row,
+                message.event,
+            ) catch {
+                owned_row.deinit();
+                message.context.releaseFailure();
+                return;
+            };
+            pipeline.forwardEventToTransforms(node_index, new_event, message.context);
+        }
+
+        // Row fan-out only targets sink nodes. Downstream transforms consume the
+        // synthesised event built above.
+        pipeline.sendRowFromTransform(node_index, owned_row, message.context) catch {
             message.context.releaseFailure();
             return;
         };
     }
-
-    // Downstream transforms are invoked with the original event rather than the
-    // materialised row produced above. This keeps transform execution side-effect
-    // free and clarifies that chaining transforms today does not compose results.
-    pipeline.forwardEventToTransforms(node_index, message.event, message.context);
 
     message.context.releaseSuccess();
 }
@@ -874,6 +890,14 @@ fn cloneRow(allocator: std.mem.Allocator, source: sql_mod.runtime.Row) !sql_mod.
     return sql_mod.runtime.Row{ .allocator = allocator, .values = entries };
 }
 
+fn copyBytes(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const buffer = try allocator.alloc(u8, input.len);
+    if (input.len != 0) {
+        std.mem.copyForwards(u8, buffer, input);
+    }
+    return buffer;
+}
+
 fn eventToRow(allocator: std.mem.Allocator, event: *const event_mod.Event) !sql_mod.runtime.Row {
     switch (event.payload) {
         .log => |log_event| {
@@ -891,6 +915,132 @@ fn eventToRow(allocator: std.mem.Allocator, event: *const event_mod.Event) !sql_
     }
 }
 
+fn rowToEvent(
+    allocator: std.mem.Allocator,
+    row: *const sql_mod.runtime.Row,
+    template: *const event_mod.Event,
+) !*event_mod.Event {
+    const ascii = std.ascii;
+
+    var message = switch (template.payload) {
+        .log => |log_event| log_event.message,
+    };
+
+    var field_total: usize = 0;
+    for (row.values) |entry| {
+        const is_message = ascii.eqlIgnoreCase(entry.name, "message");
+        if (is_message and entry.value == .string) {
+            message = entry.value.string;
+            continue;
+        }
+        field_total += 1;
+    }
+
+    const fields = try allocator.alloc(event_mod.Field, field_total);
+    var populated: usize = 0;
+    errdefer {
+        var idx = populated;
+        while (idx > 0) {
+            idx -= 1;
+            const field = fields[idx];
+            allocator.free(field.name);
+            if (field.value == .string) {
+                allocator.free(field.value.string);
+            }
+        }
+        allocator.free(fields);
+    }
+
+    var owned_message: ?[]u8 = null;
+    errdefer if (owned_message) |buffer| allocator.free(buffer);
+
+    var field_index: usize = 0;
+    for (row.values) |entry| {
+        const is_message = ascii.eqlIgnoreCase(entry.name, "message");
+        if (is_message and entry.value == .string) {
+            if (owned_message) |buffer| {
+                allocator.free(buffer);
+                owned_message = null;
+            }
+            owned_message = try copyBytes(allocator, entry.value.string);
+            message = owned_message.?;
+            continue;
+        }
+        if (field_index < fields.len) {
+            const name_copy = try copyBytes(allocator, entry.name);
+
+            var value = entry.value;
+            if (value == .string) {
+                const value_copy = try copyBytes(allocator, value.string);
+                value = .{ .string = value_copy };
+            }
+
+            fields[field_index] = .{ .name = name_copy, .value = value };
+            populated = field_index + 1;
+            field_index += 1;
+        }
+    }
+
+    const metadata = template.metadata;
+
+    const event_ptr = try allocator.create(event_mod.Event);
+    errdefer allocator.destroy(event_ptr);
+
+    event_ptr.* = .{
+        .metadata = metadata,
+        .payload = .{
+            .log = .{
+                .message = owned_message orelse message,
+                .fields = fields,
+            },
+        },
+    };
+    owned_message = null;
+    populated = 0;
+
+    return event_ptr;
+}
+
+test "rowToEvent clones row data" {
+    const allocator = testing.allocator;
+
+    var entries = try allocator.alloc(sql_mod.runtime.ValueEntry, 2);
+    var row = sql_mod.runtime.Row{ .allocator = allocator, .values = entries };
+    var row_deinited = false;
+    defer if (!row_deinited) row.deinit();
+
+    entries[0] = .{ .name = "message", .value = .{ .string = "overridden" } };
+    entries[1] = .{ .name = "custom", .value = .{ .string = "payload" } };
+
+    const template = event_mod.Event{
+        .metadata = .{},
+        .payload = .{ .log = .{ .message = "original", .fields = &[_]event_mod.Field{} } },
+    };
+
+    const event_ptr = try rowToEvent(allocator, &row, &template);
+    defer {
+        const payload = event_ptr.payload.log;
+        allocator.free(payload.message);
+        for (payload.fields) |field| {
+            allocator.free(field.name);
+            if (field.value == .string) {
+                allocator.free(field.value.string);
+            }
+        }
+        allocator.free(payload.fields);
+        allocator.destroy(event_ptr);
+    }
+
+    row.deinit();
+    row_deinited = true;
+
+    const payload = event_ptr.payload.log;
+    try testing.expectEqualStrings("overridden", payload.message);
+    try testing.expectEqualStrings("custom", payload.fields[0].name);
+    try testing.expect(payload.fields[0].value == .string);
+    try testing.expectEqualStrings("payload", payload.fields[0].value.string);
+}
+
 fn defaultSinkBuilder(allocator: std.mem.Allocator, node: config_mod.SinkNode) sink_mod.Error!sink_mod.Sink {
     return switch (node) {
         .console => |cfg| console_sink.build(allocator, cfg),
@@ -901,10 +1051,12 @@ const testing = std.testing;
 
 const TestSink = struct {
     const Context = struct {
+        allocator: std.mem.Allocator,
         mutex: std.Thread.Mutex = .{},
         seen: bool = false,
         severity: ?i64 = null,
         message: ?[]const u8 = null,
+        message_storage: ?[]u8 = null,
     };
 
     const Snapshot = struct {
@@ -917,7 +1069,14 @@ const TestSink = struct {
 
     fn builder(allocator: std.mem.Allocator, _: config_mod.SinkNode) sink_mod.Error!sink_mod.Sink {
         const ctx = try allocator.create(Context);
-        ctx.* = .{};
+        ctx.* = .{
+            .allocator = allocator,
+            .mutex = .{},
+            .seen = false,
+            .severity = null,
+            .message = null,
+            .message_storage = null,
+        };
         shared_context = ctx;
         return sink_mod.Sink{ .context = ctx, .vtable = &vtable };
     }
@@ -931,7 +1090,18 @@ const TestSink = struct {
             ctx.severity = row.values[0].value.integer;
         }
         if (row.values.len > 1 and row.values[1].value == .string) {
-            ctx.message = row.values[1].value.string;
+            if (ctx.message_storage) |existing| {
+                ctx.allocator.free(existing);
+                ctx.message_storage = null;
+                ctx.message = null;
+            }
+            const slice = row.values[1].value.string;
+            const copy = try ctx.allocator.alloc(u8, slice.len);
+            if (slice.len != 0) {
+                std.mem.copyForwards(u8, copy, slice);
+            }
+            ctx.message_storage = copy;
+            ctx.message = copy;
         }
     }
 
@@ -941,6 +1111,9 @@ const TestSink = struct {
 
     fn deinit(context: *anyopaque, allocator: std.mem.Allocator) void {
         const ctx: *Context = @ptrCast(@alignCast(context));
+        if (ctx.message_storage) |message| {
+            ctx.allocator.free(message);
+        }
         allocator.destroy(ctx);
     }
 
@@ -1108,6 +1281,65 @@ test "pipeline applies sql transform and emits to sink" {
         std.Thread.sleep(1 * std.time.ns_per_ms);
     } else {
         try testing.expect(false); // never observed
+    }
+
+    try pipeline.shutdown();
+    TestSink.reset();
+}
+
+test "pipeline composes sql transforms" {
+    TestSink.reset();
+    const allocator = testing.allocator;
+
+    const source_config = source_cfg.SourceConfig{
+        .id = "test_source",
+        .payload = .{ .syslog = .{ .address = "udp://127.0.0.1:0" } },
+    };
+
+    const pipeline_cfg = config_mod.PipelineConfig{
+        .sources = &[_]config_mod.SourceNode{
+            .{ .id = "test_source", .config = source_config, .outputs = &[_][]const u8{"sql_primary"} },
+        },
+        .transforms = &[_]config_mod.TransformNode{
+            .{ .sql = .{
+                .id = "sql_primary",
+                .inputs = &[_][]const u8{"test_source"},
+                .outputs = &[_][]const u8{"sql_secondary"},
+                .query = "SELECT syslog_severity AS severity, message FROM logs WHERE syslog_severity <= 4",
+            } },
+            .{ .sql = .{
+                .id = "sql_secondary",
+                .inputs = &[_][]const u8{"sql_primary"},
+                .outputs = &[_][]const u8{"sink"},
+                .query = "SELECT severity, message FROM logs WHERE severity = 4 AND source_id = 'test_source'",
+            } },
+        },
+        .sinks = &[_]config_mod.SinkNode{
+            .{ .console = .{ .id = "sink", .inputs = &[_][]const u8{"sql_secondary"} } },
+        },
+    };
+
+    const registry = source_mod.Registry{ .factories = &[_]source_mod.SourceFactory{TestSource.factory()} };
+
+    var pipeline = try Pipeline.init(allocator, &pipeline_cfg, .{ .collector = .{ .registry = registry }, .sink_builder = TestSink.builder });
+    defer pipeline.deinit();
+
+    try pipeline.start();
+
+    const processed = try pipeline.pollOnce();
+    try testing.expect(processed);
+
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        const snapshot = TestSink.snapshot();
+        if (snapshot.seen) {
+            try testing.expectEqual(@as(?i64, 4), snapshot.severity);
+            try testing.expectEqualStrings("hello", snapshot.message orelse "");
+            break;
+        }
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    } else {
+        try testing.expect(false);
     }
 
     try pipeline.shutdown();
