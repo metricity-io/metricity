@@ -136,6 +136,57 @@ const GroupState = struct {
     }
 };
 
+const GroupAcquisition = struct {
+    index: usize,
+    created: bool,
+};
+
+const Transaction = struct {
+    program: *Program,
+    group_index: usize,
+    created: bool,
+    snapshot: []AggregateState,
+    active: bool = true,
+
+    fn init(program: *Program, group_index: usize, created: bool, snapshot: []AggregateState) Transaction {
+        return Transaction{
+            .program = program,
+            .group_index = group_index,
+            .created = created,
+            .snapshot = snapshot,
+            .active = true,
+        };
+    }
+
+    fn commit(self: *Transaction, now_ns: u64) void {
+        if (!self.active) return;
+        if (self.created) {
+            self.program.groups.items[self.group_index].last_seen_ns = now_ns;
+        } else {
+            self.program.replaceGroupAggregates(self.group_index, self.snapshot);
+            self.program.groups.items[self.group_index].last_seen_ns = now_ns;
+            self.snapshot = &.{};
+        }
+        self.active = false;
+    }
+
+    fn rollback(self: *Transaction) void {
+        if (!self.active) return;
+        if (self.created) {
+            self.program.removeGroupAt(self.group_index);
+        } else {
+            self.program.destroyAggregateStateSlice(self.snapshot);
+            self.snapshot = &.{};
+        }
+        self.active = false;
+    }
+
+    fn release(self: *Transaction) void {
+        if (!self.active) return;
+        self.rollback();
+    }
+};
+
 pub const EvictionConfig = struct {
     ttl_ns: ?u64 = 15 * std.time.ns_per_min,
     max_groups: usize = 50_000,
@@ -198,15 +249,40 @@ pub const Program = struct {
             if (!predicate) return null;
         }
 
-        const group_state = try self.obtainGroupState(allocator, event, now_ns);
+        const acquisition = try self.obtainGroupState(allocator, event, now_ns);
+        var group_ptr = &self.groups.items[acquisition.index];
 
-        try self.updateAggregates(group_state, event, binding);
-        group_state.last_seen_ns = now_ns;
+        var cloned_states: []AggregateState = &.{};
+        if (!acquisition.created and group_ptr.aggregates.len != 0) {
+            cloned_states = try self.cloneAggregateStates(group_ptr.aggregates);
+        }
+
+        var txn = Transaction.init(self, acquisition.index, acquisition.created, cloned_states);
+        defer txn.release();
+
+        var working_group_storage = GroupState{
+            .key_values = group_ptr.key_values,
+            .aggregates = if (acquisition.created) group_ptr.aggregates else cloned_states,
+            .last_seen_ns = group_ptr.last_seen_ns,
+        };
+        const working_group = if (acquisition.created)
+            group_ptr
+        else
+            &working_group_storage;
+
+        try self.updateAggregates(working_group, event, binding);
+        working_group.last_seen_ns = now_ns;
 
         if (self.having) |expr| {
-            const keep = try self.evaluateHaving(expr, group_state);
-            if (!keep) return null;
+            const keep = try self.evaluateHaving(expr, working_group);
+            if (!keep) {
+                txn.commit(now_ns);
+                return null;
+            }
         }
+
+        txn.commit(now_ns);
+        group_ptr = &self.groups.items[acquisition.index];
 
         const total_columns = self.projection.len;
         var values = try allocator.alloc(ValueEntry, total_columns);
@@ -218,13 +294,13 @@ pub const Program = struct {
                 .group => |group_proj| {
                     values[idx] = .{
                         .name = group_proj.label,
-                        .value = try cloneRowValue(allocator, group_state.key_values[group_proj.column_index]),
+                        .value = try cloneRowValue(allocator, group_ptr.key_values[group_proj.column_index]),
                     };
                     idx += 1;
                 },
                 .aggregate => |agg_proj| {
                     const spec = &self.aggregates[agg_proj.aggregate_index];
-                    const value = try aggregateResultValue(&group_state.aggregates[agg_proj.aggregate_index], spec);
+                    const value = try aggregateResultValue(&group_ptr.aggregates[agg_proj.aggregate_index], spec);
                     values[idx] = .{
                         .name = agg_proj.label,
                         .value = try cloneRowValue(allocator, value),
@@ -239,7 +315,7 @@ pub const Program = struct {
         return Row{ .allocator = allocator, .values = values, .owns_strings = true };
     }
 
-    fn obtainGroupState(self: *Program, allocator: std.mem.Allocator, event: *const event_mod.Event, now_ns: u64) Error!*GroupState {
+    fn obtainGroupState(self: *Program, allocator: std.mem.Allocator, event: *const event_mod.Event, now_ns: u64) Error!GroupAcquisition {
         var temp_values: []event_mod.Value = &.{};
         if (self.group_columns.len != 0) {
             temp_values = try allocator.alloc(event_mod.Value, self.group_columns.len);
@@ -256,18 +332,15 @@ pub const Program = struct {
         }
 
         if (self.findGroup(temp_values)) |existing| {
-            existing.last_seen_ns = now_ns;
-            return existing;
+            return GroupAcquisition{ .index = existing, .created = false };
         }
 
         return self.createGroup(temp_values, now_ns);
     }
 
-    fn stateForGlobalGroup(self: *Program, now_ns: u64) Error!*GroupState {
+    fn stateForGlobalGroup(self: *Program, now_ns: u64) Error!GroupAcquisition {
         if (self.groups.items.len != 0) {
-            const existing = &self.groups.items[0];
-            existing.last_seen_ns = now_ns;
-            return existing;
+            return GroupAcquisition{ .index = 0, .created = false };
         }
 
         const aggregates = try self.createAggregateStateSlice();
@@ -277,19 +350,19 @@ pub const Program = struct {
             .aggregates = aggregates,
             .last_seen_ns = now_ns,
         };
-        return new_group;
+        return GroupAcquisition{ .index = self.groups.items.len - 1, .created = true };
     }
 
-    fn findGroup(self: *Program, values: []const event_mod.Value) ?*GroupState {
-        for (self.groups.items) |*group| {
+    fn findGroup(self: *Program, values: []const event_mod.Value) ?usize {
+        for (self.groups.items, 0..) |*group, idx| {
             if (valuesEqual(group.key_values, values)) {
-                return group;
+                return idx;
             }
         }
         return null;
     }
 
-    fn createGroup(self: *Program, values: []const event_mod.Value, now_ns: u64) Error!*GroupState {
+    fn createGroup(self: *Program, values: []const event_mod.Value, now_ns: u64) Error!GroupAcquisition {
         const copied = try self.copyKeyValues(values);
         errdefer {
             for (copied) |value| freeOwnedValue(self.allocator, value);
@@ -308,7 +381,7 @@ pub const Program = struct {
             .aggregates = aggregates,
             .last_seen_ns = now_ns,
         };
-        return group_ptr;
+        return GroupAcquisition{ .index = self.groups.items.len - 1, .created = true };
     }
 
     fn copyKeyValues(self: *Program, values: []const event_mod.Value) Error![]event_mod.Value {
@@ -429,6 +502,63 @@ pub const Program = struct {
         }
         self.last_sweep = now_ns;
         self.trimToLimit();
+    }
+
+    fn removeGroupAt(self: *Program, index: usize) void {
+        var removed = self.groups.swapRemove(index);
+        removed.deinit(self.allocator);
+    }
+
+    fn destroyAggregateStateSlice(self: *Program, states: []AggregateState) void {
+        if (states.len == 0) return;
+        for (states) |*agg| {
+            agg.deinit(self.allocator);
+        }
+        self.allocator.free(states);
+    }
+
+    fn replaceGroupAggregates(self: *Program, index: usize, new_states: []AggregateState) void {
+        var group = &self.groups.items[index];
+        self.destroyAggregateStateSlice(group.aggregates);
+        group.aggregates = new_states;
+    }
+
+    fn cloneAggregateStates(self: *Program, states: []AggregateState) Error![]AggregateState {
+        if (states.len == 0) return &.{};
+        var clones = try self.allocator.alloc(AggregateState, states.len);
+        var produced: usize = 0;
+        errdefer {
+            while (produced > 0) {
+                produced -= 1;
+                clones[produced].deinit(self.allocator);
+            }
+            self.allocator.free(clones);
+        }
+        for (states, 0..) |*state, idx| {
+            clones[idx] = try self.cloneAggregateState(state);
+            produced += 1;
+        }
+        return clones;
+    }
+
+    fn cloneAggregateState(self: *Program, state: *const AggregateState) Error!AggregateState {
+        return switch (state.*) {
+            .count => |value| AggregateState{ .count = value },
+            .sum => |value| AggregateState{ .sum = value },
+            .avg => |value| AggregateState{ .avg = value },
+            .min => |value| AggregateState{ .min = try self.cloneMinMaxState(value) },
+            .max => |value| AggregateState{ .max = try self.cloneMinMaxState(value) },
+        };
+    }
+
+    fn cloneMinMaxState(self: *Program, state: MinMaxState) Error!MinMaxState {
+        if (!state.has_value) {
+            return MinMaxState{ .value = .{ .null = {} }, .has_value = false };
+        }
+        return MinMaxState{
+            .value = try copyValueOwned(self.allocator, state.value),
+            .has_value = true,
+        };
     }
 
     fn trimToLimit(self: *Program) void {
@@ -1178,6 +1308,21 @@ fn freeEvent(allocator: std.mem.Allocator, ev: event_mod.Event) void {
     }
 }
 
+fn createValueEvent(allocator: std.mem.Allocator, value: event_mod.Value) !event_mod.Event {
+    const fields = try allocator.alloc(event_mod.Field, 1);
+    fields[0] = .{ .name = "value", .value = value };
+
+    return event_mod.Event{
+        .metadata = .{ .source_id = "value_source" },
+        .payload = .{
+            .log = .{
+                .message = "value_event",
+                .fields = fields,
+            },
+        },
+    };
+}
+
 fn nextTimestamp(counter: *u64) u64 {
     const value = counter.*;
     counter.* += 1;
@@ -1276,6 +1421,63 @@ test "sum integer field" {
     try testing.expectEqual(@as(usize, 2), row2.values.len);
     try testing.expectEqual(@as(i64, 2), row2.values[0].value.integer);
     try testing.expectEqual(@as(i64, 5), row2.values[1].value.integer);
+}
+
+test "rollback removes new group on error" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try @import("parser.zig").parseSelect(arena,
+        \\SELECT SUM(value) AS total
+        \\FROM logs
+    );
+
+    var program = try compile(testing.allocator, stmt, .{});
+    defer program.deinit();
+
+    var bad_event = try createValueEvent(testing.allocator, .{ .string = "oops" });
+    defer freeEvent(testing.allocator, bad_event);
+
+    var clock: u64 = 1;
+    try testing.expectError(Error.TypeMismatch, program.execute(testing.allocator, &bad_event, nextTimestamp(&clock)));
+    try testing.expectEqual(@as(usize, 0), program.groups.items.len);
+}
+
+test "rollback preserves existing aggregates on error" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try @import("parser.zig").parseSelect(arena,
+        \\SELECT SUM(value) AS total
+        \\FROM logs
+    );
+
+    var program = try compile(testing.allocator, stmt, .{});
+    defer program.deinit();
+
+    var good_event = try createValueEvent(testing.allocator, .{ .integer = 2 });
+    defer freeEvent(testing.allocator, good_event);
+
+    var bad_event = try createValueEvent(testing.allocator, .{ .string = "bad" });
+    defer freeEvent(testing.allocator, bad_event);
+
+    var next_event = try createValueEvent(testing.allocator, .{ .integer = 3 });
+    defer freeEvent(testing.allocator, next_event);
+
+    var clock: u64 = 1;
+
+    const first_row = try program.execute(testing.allocator, &good_event, nextTimestamp(&clock)) orelse return testing.expect(false);
+    defer first_row.deinit();
+    try testing.expectEqual(@as(i64, 2), first_row.values[0].value.integer);
+
+    try testing.expectError(Error.TypeMismatch, program.execute(testing.allocator, &bad_event, nextTimestamp(&clock)));
+    try testing.expectEqual(@as(usize, 1), program.groups.items.len);
+
+    const maybe_row = try program.execute(testing.allocator, &next_event, nextTimestamp(&clock)) orelse return testing.expect(false);
+    defer maybe_row.deinit();
+    try testing.expectEqual(@as(i64, 5), maybe_row.values[0].value.integer);
 }
 
 test "avg ignores nulls" {
