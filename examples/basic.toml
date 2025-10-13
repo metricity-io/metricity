@@ -5,7 +5,7 @@ address = "udp://127.0.0.1:5514"
 [transforms.sql_enrich]
 type = "sql"
 inputs = ["syslog_in"]
-query = "SELECT syslog_severity, message FROM logs WHERE syslog_severity <= 4"
+query = "SELECT message, COUNT(*) AS total FROM logs GROUP BY message"
 
 [sinks.console]
 type = "console"

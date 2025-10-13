@@ -48,7 +48,7 @@ pub fn testOne(ctx: *Context, input: []const u8) !void {
     };
     defer analysis.deinit(gpa);
 
-    var program = metricity.sql.runtime.compile(gpa, stmt) catch {
+    var program = metricity.sql.runtime.compile(gpa, stmt, .{}) catch {
         return;
     };
     defer program.deinit();

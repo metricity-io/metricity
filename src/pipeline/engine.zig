@@ -18,9 +18,62 @@ const backoff_ns: u64 = 5 * std.time.ns_per_ms;
 const atomic_order = std.builtin.AtomicOrder;
 const max_batch_size: usize = 64;
 
+/// Provides monotonically non-decreasing nanosecond timestamps for SQL eviction.
+/// Prefers `std.time.Instant` (monotonic clock) and falls back to clamped wall time.
+const MonotonicClock = struct {
+    var once = std.once(init);
+    var base: std.time.Instant = undefined;
+    var supported: bool = false;
+    var last_ns = std.atomic.Value(u64).init(0);
+
+    fn init() void {
+        const Self = @This();
+        const instant = std.time.Instant.now() catch {
+            Self.supported = false;
+            return;
+        };
+        Self.base = instant;
+        Self.supported = true;
+    }
+
+    fn now() u64 {
+        const Self = @This();
+        Self.once.call();
+        if (Self.supported) {
+            const current = std.time.Instant.now() catch return Self.fallback();
+            const elapsed = current.since(Self.base);
+            return Self.enforce(elapsed);
+        }
+        return Self.fallback();
+    }
+
+    fn enforce(candidate: u64) u64 {
+        const Self = @This();
+        const previous = Self.last_ns.fetchMax(candidate, .acq_rel);
+        return if (candidate > previous) candidate else previous;
+    }
+
+    fn fallback() u64 {
+        const Self = @This();
+        const raw = std.time.nanoTimestamp();
+        const positive = if (raw < 0) 0 else @as(u128, @intCast(raw));
+        const clamped = std.math.cast(u64, positive) orelse std.math.maxInt(u64);
+        return Self.enforce(clamped);
+    }
+};
+
 fn computeBatchCapacity(queue: config_mod.QueueConfig) usize {
     if (queue.capacity == 0) return 1;
     return @min(queue.capacity, max_batch_size);
+}
+
+fn secondsToNanoseconds(seconds: u64) u64 {
+    if (seconds == 0) return 0;
+    const product = @as(u128, seconds) * std.time.ns_per_s;
+    if (product > std.math.maxInt(u64)) {
+        return std.math.maxInt(u64);
+    }
+    return @intCast(product);
 }
 
 /// Aggregated failure surface for bring-up and steady-state runtime issues within the
@@ -78,15 +131,15 @@ pub const Pipeline = struct {
         const nodes = try allocator.alloc(NodeRuntime, graph.nodes.len);
         errdefer allocator.free(nodes);
 
-    var pipeline = Pipeline{
-        .allocator = allocator,
-        .collector = collector,
-        .collector_configs = collector_configs,
-        .graph = graph,
-        .nodes = nodes,
-        .sink_builder = options.sink_builder orelse defaultSinkBuilder,
-        .metrics = metrics_mod.PipelineMetrics.init(options.metrics),
-    };
+        var pipeline = Pipeline{
+            .allocator = allocator,
+            .collector = collector,
+            .collector_configs = collector_configs,
+            .graph = graph,
+            .nodes = nodes,
+            .sink_builder = options.sink_builder orelse defaultSinkBuilder,
+            .metrics = metrics_mod.PipelineMetrics.init(options.metrics),
+        };
 
         try pipeline.buildSourceLookup();
         try pipeline.initNodes(cfg);
@@ -360,6 +413,7 @@ const TransformRuntime = struct {
     batch_capacity: usize,
     arena: *std.heap.ArenaAllocator,
     program: sql_mod.runtime.Program,
+    program_mutex: std.Thread.Mutex = .{},
     config: *const config_mod.TransformNode,
     channel_metrics: metrics_mod.ChannelMetrics,
 
@@ -386,7 +440,23 @@ const TransformRuntime = struct {
         };
 
         const stmt = try sql_mod.parser.parseSelect(arena.allocator(), sql_cfg.query);
-        var program = try sql_mod.runtime.compile(pipeline.worker_allocator, stmt);
+
+        var eviction = sql_mod.runtime.EvictionConfig{};
+        if (sql_cfg.eviction.ttl_seconds) |ttl_secs| {
+            const ttl_u64: u64 = @intCast(ttl_secs);
+            eviction.ttl_ns = if (ttl_u64 == 0) null else secondsToNanoseconds(ttl_u64);
+        }
+        if (sql_cfg.eviction.max_groups) |max| {
+            eviction.max_groups = max;
+        }
+        if (sql_cfg.eviction.sweep_interval_seconds) |sweep_secs| {
+            const sweep_u64: u64 = @intCast(sweep_secs);
+            eviction.sweep_interval_ns = secondsToNanoseconds(sweep_u64);
+        }
+
+        var program = try sql_mod.runtime.compile(pipeline.worker_allocator, stmt, .{
+            .eviction = eviction,
+        });
         errdefer program.deinit();
 
         const workers = try pipeline.allocator.alloc(TransformWorker, exec.parallelism);
@@ -400,6 +470,7 @@ const TransformRuntime = struct {
             .batch_capacity = computeBatchCapacity(exec.queue),
             .arena = arena,
             .program = program,
+            .program_mutex = .{},
             .config = config,
             .channel_metrics = channel_metrics,
         };
@@ -502,10 +573,18 @@ fn handleTransformMessage(context: *TransformWorkerContext, message: EventMessag
     const runtime = context.runtime;
     const node_index = context.node_index;
 
-    const produced = runtime.program.execute(message.context.batchAllocator(), message.event) catch {
+    const now_ns = MonotonicClock.now();
+    runtime.program_mutex.lock();
+    const produced = runtime.program.execute(
+        message.context.batchAllocator(),
+        message.event,
+        now_ns,
+    ) catch {
+        runtime.program_mutex.unlock();
         message.context.releaseFailure();
         return;
     };
+    runtime.program_mutex.unlock();
 
     if (produced) |row| {
         var owned_row = row;
@@ -1054,14 +1133,14 @@ const TestSink = struct {
         allocator: std.mem.Allocator,
         mutex: std.Thread.Mutex = .{},
         seen: bool = false,
-        severity: ?i64 = null,
+        count: ?i64 = null,
         message: ?[]const u8 = null,
         message_storage: ?[]u8 = null,
     };
 
     const Snapshot = struct {
         seen: bool,
-        severity: ?i64,
+        count: ?i64,
         message: ?[]const u8,
     };
 
@@ -1073,7 +1152,7 @@ const TestSink = struct {
             .allocator = allocator,
             .mutex = .{},
             .seen = false,
-            .severity = null,
+            .count = null,
             .message = null,
             .message_storage = null,
         };
@@ -1086,22 +1165,20 @@ const TestSink = struct {
         ctx.mutex.lock();
         defer ctx.mutex.unlock();
         ctx.seen = true;
-        if (row.values.len > 0 and row.values[0].value == .integer) {
-            ctx.severity = row.values[0].value.integer;
-        }
-        if (row.values.len > 1 and row.values[1].value == .string) {
+        if (row.values.len > 0 and row.values[0].value == .string) {
             if (ctx.message_storage) |existing| {
                 ctx.allocator.free(existing);
                 ctx.message_storage = null;
                 ctx.message = null;
             }
-            const slice = row.values[1].value.string;
+            const slice = row.values[0].value.string;
             const copy = try ctx.allocator.alloc(u8, slice.len);
-            if (slice.len != 0) {
-                std.mem.copyForwards(u8, copy, slice);
-            }
+            if (slice.len != 0) std.mem.copyForwards(u8, copy, slice);
             ctx.message_storage = copy;
             ctx.message = copy;
+        }
+        if (row.values.len > 1 and row.values[1].value == .integer) {
+            ctx.count = row.values[1].value.integer;
         }
     }
 
@@ -1118,9 +1195,9 @@ const TestSink = struct {
     }
 
     fn snapshot() Snapshot {
-        const ctx = shared_context orelse return Snapshot{ .seen = false, .severity = null, .message = null };
+        const ctx = shared_context orelse return Snapshot{ .seen = false, .count = null, .message = null };
         ctx.mutex.lock();
-        const snap = Snapshot{ .seen = ctx.seen, .severity = ctx.severity, .message = ctx.message };
+        const snap = Snapshot{ .seen = ctx.seen, .count = ctx.count, .message = ctx.message };
         ctx.mutex.unlock();
         return snap;
     }
@@ -1252,7 +1329,7 @@ test "pipeline applies sql transform and emits to sink" {
                 .id = "sql",
                 .inputs = &[_][]const u8{"test_source"},
                 .outputs = &[_][]const u8{"sink"},
-                .query = "SELECT syslog_severity, message FROM logs WHERE syslog_severity <= 4",
+                .query = "SELECT message, COUNT(*) AS total FROM logs GROUP BY message",
             } },
         },
         .sinks = &[_]config_mod.SinkNode{
@@ -1274,7 +1351,7 @@ test "pipeline applies sql transform and emits to sink" {
     while (attempts < 100) : (attempts += 1) {
         const snapshot = TestSink.snapshot();
         if (snapshot.seen) {
-            try testing.expectEqual(@as(?i64, 4), snapshot.severity);
+            try testing.expectEqual(@as(?i64, 1), snapshot.count);
             try testing.expectEqualStrings("hello", snapshot.message orelse "");
             break;
         }
@@ -1305,13 +1382,13 @@ test "pipeline composes sql transforms" {
                 .id = "sql_primary",
                 .inputs = &[_][]const u8{"test_source"},
                 .outputs = &[_][]const u8{"sql_secondary"},
-                .query = "SELECT syslog_severity AS severity, message FROM logs WHERE syslog_severity <= 4",
+                .query = "SELECT message, COUNT(*) AS total FROM logs GROUP BY message",
             } },
             .{ .sql = .{
                 .id = "sql_secondary",
                 .inputs = &[_][]const u8{"sql_primary"},
                 .outputs = &[_][]const u8{"sink"},
-                .query = "SELECT severity, message FROM logs WHERE severity = 4 AND source_id = 'test_source'",
+                .query = "SELECT message, SUM(total) AS total_events FROM logs GROUP BY message",
             } },
         },
         .sinks = &[_]config_mod.SinkNode{
@@ -1333,7 +1410,7 @@ test "pipeline composes sql transforms" {
     while (attempts < 100) : (attempts += 1) {
         const snapshot = TestSink.snapshot();
         if (snapshot.seen) {
-            try testing.expectEqual(@as(?i64, 4), snapshot.severity);
+            try testing.expectEqual(@as(?i64, 1), snapshot.count);
             try testing.expectEqualStrings("hello", snapshot.message orelse "");
             break;
         }

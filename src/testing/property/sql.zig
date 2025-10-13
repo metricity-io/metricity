@@ -28,7 +28,7 @@ fn compileProgram(allocator: std.mem.Allocator, query: []const u8) !metricity.sq
     defer arena_inst.deinit();
 
     const stmt = try metricity.sql.parser.parseSelect(arena_inst.allocator(), query);
-    return try metricity.sql.runtime.compile(allocator, stmt);
+    return try metricity.sql.runtime.compile(allocator, stmt, .{});
 }
 
 const AssocSuite = struct {
@@ -37,8 +37,8 @@ const AssocSuite = struct {
 
     fn init(allocator: std.mem.Allocator) !AssocSuite {
         return AssocSuite{
-            .program_left = try compileProgram(allocator, "SELECT (a + (b + c)) AS value FROM logs"),
-            .program_right = try compileProgram(allocator, "SELECT ((a + b) + c) AS value FROM logs"),
+            .program_left = try compileProgram(allocator, "SELECT SUM(a + (b + c)) AS value FROM logs"),
+            .program_right = try compileProgram(allocator, "SELECT SUM((a + b) + c) AS value FROM logs"),
         };
     }
 
@@ -49,7 +49,8 @@ const AssocSuite = struct {
 };
 
 fn executeProgram(program: *metricity.sql.runtime.Program, event: *const event_mod.Event) !?metricity.sql.runtime.Row {
-    return try program.execute(std.testing.allocator, event);
+    const now_ns: u64 = @intCast(std.time.nanoTimestamp());
+    return try program.execute(std.testing.allocator, event, now_ns);
 }
 
 fn compareRows(left: ?metricity.sql.runtime.Row, right: ?metricity.sql.runtime.Row) !void {
@@ -87,5 +88,7 @@ test "integer addition associativity" {
         const left_row = try executeProgram(&suite.program_left, &event);
         const right_row = try executeProgram(&suite.program_right, &event);
         try compareRows(left_row, right_row);
+        suite.program_left.reset();
+        suite.program_right.reset();
     }
 }

@@ -4,6 +4,7 @@ const source_mod = @import("source");
 const event_mod = source_mod.event;
 
 const ascii = std.ascii;
+const math = std.math;
 
 const IdentifierBinding = struct {
     canonical: []const u8,
@@ -27,74 +28,449 @@ pub const Error = std.mem.Allocator.Error || error{
     ArithmeticOverflow,
 };
 
+const AggregateFunction = enum {
+    count,
+    sum,
+    avg,
+    min,
+    max,
+};
+
+const AggregateArgument = union(enum) {
+    star,
+    expression: *const ast.Expression,
+};
+
+const AggregateSpec = struct {
+    function: AggregateFunction,
+    argument: AggregateArgument,
+    call: *const ast.FunctionCall,
+};
+
+const GroupColumn = struct {
+    column: ast.ColumnRef,
+};
+
+const Projection = union(enum) {
+    group: GroupProjection,
+    aggregate: AggregateProjection,
+};
+
+const GroupProjection = struct {
+    label: []const u8,
+    column_index: usize,
+};
+
+const AggregateProjection = struct {
+    label: []const u8,
+    aggregate_index: usize,
+};
+
+const CountState = struct {
+    total: u64 = 0,
+};
+
+const SumState = struct {
+    has_value: bool = false,
+    kind: enum { integer, float } = .integer,
+    integer_total: i64 = 0,
+    float_total: f64 = 0.0,
+};
+
+const AvgState = struct {
+    sum: SumState = .{},
+    count: u64 = 0,
+};
+
+const MinMaxState = struct {
+    value: event_mod.Value = .{ .null = {} },
+    has_value: bool = false,
+};
+
+const AggregateState = union(enum) {
+    count: CountState,
+    sum: SumState,
+    avg: AvgState,
+    min: MinMaxState,
+    max: MinMaxState,
+
+    fn init(function: AggregateFunction) AggregateState {
+        return switch (function) {
+            .count => .{ .count = .{} },
+            .sum => .{ .sum = .{} },
+            .avg => .{ .avg = .{} },
+            .min => .{ .min = .{} },
+            .max => .{ .max = .{} },
+        };
+    }
+
+    fn deinit(self: *AggregateState, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .min, .max => |*state| {
+                if (state.has_value and state.value == .string) {
+                    allocator.free(state.value.string);
+                    state.value = .{ .null = {} };
+                    state.has_value = false;
+                }
+            },
+            else => {},
+        }
+    }
+};
+
+const GroupState = struct {
+    key_values: []event_mod.Value,
+    aggregates: []AggregateState,
+    last_seen_ns: u64,
+
+    fn deinit(self: *GroupState, allocator: std.mem.Allocator) void {
+        for (self.key_values) |value| {
+            freeOwnedValue(allocator, value);
+        }
+        if (self.key_values.len != 0) allocator.free(self.key_values);
+
+        for (self.aggregates) |*agg| {
+            agg.deinit(allocator);
+        }
+        if (self.aggregates.len != 0) allocator.free(self.aggregates);
+    }
+};
+
+pub const EvictionConfig = struct {
+    ttl_ns: ?u64 = 15 * std.time.ns_per_min,
+    max_groups: usize = 50_000,
+    sweep_interval_ns: u64 = 60 * std.time.ns_per_s,
+};
+
+pub const CompileOptions = struct {
+    eviction: EvictionConfig = .{},
+};
+
 /// Compiled representation of a SQL `SELECT` statement that can be executed
 /// against pipeline events.
 pub const Program = struct {
     allocator: std.mem.Allocator,
     projection: []const Projection,
     selection: ?*const ast.Expression,
+    having: ?*const ast.Expression,
     table_binding: ?TableBinding,
+    group_columns: []const GroupColumn,
+    aggregates: []const AggregateSpec,
+    groups: std.ArrayListUnmanaged(GroupState) = .{},
+    eviction: EvictionConfig,
+    last_sweep: u64 = 0,
 
-    /// Releases memory allocated for the projection metadata.
-    pub fn deinit(self: Program) void {
+    /// Releases memory allocated for the program metadata and accumulated state.
+    pub fn deinit(self: *Program) void {
+        for (self.groups.items) |*group| {
+            group.deinit(self.allocator);
+        }
+        self.groups.deinit(self.allocator);
+
         self.allocator.free(self.projection);
+        self.allocator.free(self.group_columns);
+        self.allocator.free(self.aggregates);
+    }
+
+    /// Clears accumulated aggregation state, preserving compiled metadata.
+    pub fn reset(self: *Program) void {
+        self.last_sweep = 0;
+        for (self.groups.items) |*group| {
+            group.deinit(self.allocator);
+        }
+        self.groups.clearRetainingCapacity();
     }
 
     /// Evaluates the program against a single event, returning an optional row.
-    /// When the `WHERE` clause filters out the event, `null` is returned.
-    pub fn execute(self: Program, allocator: std.mem.Allocator, event: *const event_mod.Event) Error!?Row {
+    /// When the `WHERE` or `HAVING` clause filters out the event, `null` is returned.
+    pub fn execute(
+        self: *Program,
+        allocator: std.mem.Allocator,
+        event: *const event_mod.Event,
+        now_ns: u64,
+    ) Error!?Row {
         const binding = self.table_binding;
+
+        self.maybeSweep(now_ns);
+
         if (self.selection) |expr| {
             const predicate = try evaluateBoolean(expr, event, binding);
             if (!predicate) return null;
         }
 
-        const total_columns = projectedColumnCount(self.projection, event);
+        const group_state = try self.obtainGroupState(allocator, event, now_ns);
+
+        try self.updateAggregates(group_state, event, binding);
+        group_state.last_seen_ns = now_ns;
+
+        if (self.having) |expr| {
+            const keep = try self.evaluateHaving(expr, group_state);
+            if (!keep) return null;
+        }
+
+        const total_columns = self.projection.len;
         var values = try allocator.alloc(ValueEntry, total_columns);
         var idx: usize = 0;
         errdefer allocator.free(values);
 
         for (self.projection) |proj| {
             switch (proj) {
-                .expression => |expr_proj| {
-                    const value = try evaluateExpression(expr_proj.expr, event, binding);
-                    values[idx] = .{ .name = expr_proj.label, .value = value };
+                .group => |group_proj| {
+                    values[idx] = .{
+                        .name = group_proj.label,
+                        .value = try cloneRowValue(allocator, group_state.key_values[group_proj.column_index]),
+                    };
                     idx += 1;
                 },
-                .star => |star_proj| {
-                    const emitted = try emitStarColumns(values[idx..], event, binding, star_proj);
-                    idx += emitted;
+                .aggregate => |agg_proj| {
+                    const spec = &self.aggregates[agg_proj.aggregate_index];
+                    const value = try aggregateResultValue(&group_state.aggregates[agg_proj.aggregate_index], spec);
+                    values[idx] = .{
+                        .name = agg_proj.label,
+                        .value = try cloneRowValue(allocator, value),
+                    };
+                    idx += 1;
                 },
             }
         }
 
         std.debug.assert(idx == total_columns);
-        return Row{ .allocator = allocator, .values = values };
+        self.trimToLimit();
+        return Row{ .allocator = allocator, .values = values, .owns_strings = true };
     }
-};
 
-/// Lightweight wrapper describing a compiled projection element.
-pub const Projection = union(enum) {
-    expression: Expression,
-    star: Star,
-};
+    fn obtainGroupState(self: *Program, allocator: std.mem.Allocator, event: *const event_mod.Event, now_ns: u64) Error!*GroupState {
+        var temp_values: []event_mod.Value = &.{};
+        if (self.group_columns.len != 0) {
+            temp_values = try allocator.alloc(event_mod.Value, self.group_columns.len);
+            errdefer allocator.free(temp_values);
+            for (self.group_columns, 0..) |group_col, idx| {
+                temp_values[idx] = try resolveColumn(event, group_col.column, self.table_binding);
+            }
+        }
 
-pub const Expression = struct {
-    label: []const u8,
-    expr: *const ast.Expression,
-};
+        defer if (temp_values.len != 0) allocator.free(temp_values);
 
-pub const Star = struct {
-    qualifier: ?IdentifierBinding,
+        if (self.group_columns.len == 0) {
+            return self.stateForGlobalGroup(now_ns);
+        }
+
+        if (self.findGroup(temp_values)) |existing| {
+            existing.last_seen_ns = now_ns;
+            return existing;
+        }
+
+        return self.createGroup(temp_values, now_ns);
+    }
+
+    fn stateForGlobalGroup(self: *Program, now_ns: u64) Error!*GroupState {
+        if (self.groups.items.len != 0) {
+            const existing = &self.groups.items[0];
+            existing.last_seen_ns = now_ns;
+            return existing;
+        }
+
+        const aggregates = try self.createAggregateStateSlice();
+        const new_group = try self.groups.addOne(self.allocator);
+        new_group.* = GroupState{
+            .key_values = &.{},
+            .aggregates = aggregates,
+            .last_seen_ns = now_ns,
+        };
+        return new_group;
+    }
+
+    fn findGroup(self: *Program, values: []const event_mod.Value) ?*GroupState {
+        for (self.groups.items) |*group| {
+            if (valuesEqual(group.key_values, values)) {
+                return group;
+            }
+        }
+        return null;
+    }
+
+    fn createGroup(self: *Program, values: []const event_mod.Value, now_ns: u64) Error!*GroupState {
+        const copied = try self.copyKeyValues(values);
+        errdefer {
+            for (copied) |value| freeOwnedValue(self.allocator, value);
+            self.allocator.free(copied);
+        }
+
+        const aggregates = try self.createAggregateStateSlice();
+        errdefer {
+            for (aggregates) |*agg| agg.deinit(self.allocator);
+            self.allocator.free(aggregates);
+        }
+
+        const group_ptr = try self.groups.addOne(self.allocator);
+        group_ptr.* = GroupState{
+            .key_values = copied,
+            .aggregates = aggregates,
+            .last_seen_ns = now_ns,
+        };
+        return group_ptr;
+    }
+
+    fn copyKeyValues(self: *Program, values: []const event_mod.Value) Error![]event_mod.Value {
+        if (values.len == 0) return &.{};
+        var output = try self.allocator.alloc(event_mod.Value, values.len);
+        var idx: usize = 0;
+        errdefer {
+            while (idx > 0) {
+                idx -= 1;
+                freeOwnedValue(self.allocator, output[idx]);
+            }
+            self.allocator.free(output);
+        }
+        for (values, 0..) |value, i| {
+            output[i] = try copyValueOwned(self.allocator, value);
+            idx += 1;
+        }
+        return output;
+    }
+
+    fn createAggregateStateSlice(self: *Program) Error![]AggregateState {
+        if (self.aggregates.len == 0) return &.{};
+        var states = try self.allocator.alloc(AggregateState, self.aggregates.len);
+        var idx: usize = 0;
+        errdefer {
+            while (idx > 0) {
+                idx -= 1;
+                states[idx].deinit(self.allocator);
+            }
+            self.allocator.free(states);
+        }
+        for (self.aggregates, 0..) |spec, i| {
+            states[i] = AggregateState.init(spec.function);
+            idx += 1;
+        }
+        return states;
+    }
+
+    fn updateAggregates(self: *Program, group: *GroupState, event: *const event_mod.Event, binding: ?TableBinding) Error!void {
+        for (self.aggregates, 0..) |spec, idx| {
+            const input = try evaluateAggregateArgument(spec, event, binding);
+            var state = &group.aggregates[idx];
+            switch (spec.function) {
+                .count => try updateCountState(&state.count, spec, input),
+                .sum => try updateSumState(&state.sum, spec, input),
+                .avg => try updateAvgState(&state.avg, spec, input),
+                .min => try updateMinMaxState(&state.min, self.allocator, spec, input, .min),
+                .max => try updateMinMaxState(&state.max, self.allocator, spec, input, .max),
+            }
+        }
+    }
+
+    fn evaluateHaving(self: *Program, expr: *const ast.Expression, group: *const GroupState) Error!bool {
+        const value = try self.evaluateAggregateExpression(expr, group);
+        return switch (value) {
+            .boolean => |b| b,
+            else => Error.TypeMismatch,
+        };
+    }
+
+    fn evaluateAggregateExpression(self: *Program, expr: *const ast.Expression, group: *const GroupState) Error!event_mod.Value {
+        return switch (expr.*) {
+            .literal => |lit| valueFromLiteral(lit),
+            .column => |col| self.resolveGroupColumn(group, col),
+            .unary => |un| {
+                const operand = try self.evaluateAggregateExpression(un.operand, group);
+                return applyUnary(un.op, operand);
+            },
+            .binary => |bin| {
+                const left = try self.evaluateAggregateExpression(bin.left, group);
+                const right = try self.evaluateAggregateExpression(bin.right, group);
+                return applyBinary(bin.op, left, right);
+            },
+            .function_call => |*call| {
+                const index = self.aggregateIndexForCall(call) orelse return Error.UnsupportedFunction;
+                const spec = &self.aggregates[index];
+                return aggregateResultValue(&group.aggregates[index], spec);
+            },
+            .star => Error.UnsupportedFeature,
+        };
+    }
+
+    fn resolveGroupColumn(self: *Program, group: *const GroupState, col: ast.ColumnRef) Error!event_mod.Value {
+        for (self.group_columns, 0..) |group_col, idx| {
+            if (columnsEquivalent(group_col.column, col)) {
+                return group.key_values[idx];
+            }
+        }
+        return Error.UnknownColumn;
+    }
+
+    fn aggregateIndexForCall(self: *Program, call: *const ast.FunctionCall) ?usize {
+        for (self.aggregates, 0..) |spec, idx| {
+            if (spec.call == call) return idx;
+        }
+        return null;
+    }
+
+    fn maybeSweep(self: *Program, now_ns: u64) void {
+        const interval = self.eviction.sweep_interval_ns;
+        if (interval == 0) return;
+        if (self.last_sweep != 0 and now_ns - self.last_sweep < interval) return;
+        self.sweep(now_ns);
+    }
+
+    fn sweep(self: *Program, now_ns: u64) void {
+        if (self.eviction.ttl_ns) |ttl| {
+            var idx: usize = 0;
+            while (idx < self.groups.items.len) {
+                const group = self.groups.items[idx];
+                if (now_ns - group.last_seen_ns > ttl) {
+                    var removed = self.groups.swapRemove(idx);
+                    removed.deinit(self.allocator);
+                    continue;
+                }
+                idx += 1;
+            }
+        }
+        self.last_sweep = now_ns;
+        self.trimToLimit();
+    }
+
+    fn trimToLimit(self: *Program) void {
+        const limit = self.eviction.max_groups;
+        if (limit == 0) return;
+        while (self.groups.items.len > limit) {
+            const idx = self.oldestGroupIndex();
+            var removed = self.groups.swapRemove(idx);
+            removed.deinit(self.allocator);
+        }
+    }
+
+    fn oldestGroupIndex(self: *Program) usize {
+        var oldest_index: usize = 0;
+        var oldest_seen = self.groups.items[0].last_seen_ns;
+        var idx: usize = 1;
+        while (idx < self.groups.items.len) : (idx += 1) {
+            const group = self.groups.items[idx];
+            if (group.last_seen_ns < oldest_seen) {
+                oldest_seen = group.last_seen_ns;
+                oldest_index = idx;
+            }
+        }
+        return oldest_index;
+    }
 };
 
 /// Result row consumed by sink implementations.
 pub const Row = struct {
     allocator: std.mem.Allocator,
     values: []ValueEntry,
+    owns_strings: bool = false,
 
     /// Releases ownership of value entries.
     pub fn deinit(self: Row) void {
+        if (self.owns_strings) {
+            for (self.values) |entry| {
+                if (entry.value == .string) {
+                    self.allocator.free(entry.value.string);
+                }
+            }
+        }
         self.allocator.free(self.values);
     }
 };
@@ -105,85 +481,418 @@ pub const ValueEntry = struct {
     value: event_mod.Value,
 };
 
-pub fn compile(allocator: std.mem.Allocator, stmt: *const ast.SelectStatement) Error!Program {
+pub fn compile(allocator: std.mem.Allocator, stmt: *const ast.SelectStatement, options: CompileOptions) Error!Program {
     if (stmt.distinct) return Error.UnsupportedFeature;
-    if (stmt.group_by.len != 0) return Error.UnsupportedFeature;
     if (stmt.order_by.len != 0) return Error.UnsupportedFeature;
-    if (stmt.having) |_| return Error.UnsupportedFeature;
     if (stmt.from.len > 1) return Error.UnsupportedFeature;
 
-    var projections = std.ArrayListUnmanaged(Projection){};
-    defer projections.deinit(allocator);
+    var group_columns_builder = std.ArrayListUnmanaged(GroupColumn){};
+    defer group_columns_builder.deinit(allocator);
+
+    for (stmt.group_by) |expr| {
+        switch (expr.*) {
+            .column => |col| try group_columns_builder.append(allocator, .{ .column = col }),
+            else => return Error.UnsupportedFeature,
+        }
+    }
+
+    const table_binding = try determineTableBinding(stmt);
+
+    var aggregates_builder = std.ArrayListUnmanaged(AggregateSpec){};
+    defer aggregates_builder.deinit(allocator);
+
+    var projection_builder = std.ArrayListUnmanaged(Projection){};
+    defer projection_builder.deinit(allocator);
 
     for (stmt.projection) |item| {
         switch (item.kind) {
-            .star => |star| {
-                const qualifier = if (star.qualifier) |ident| identifierBinding(ident) else null;
-                try projections.append(allocator, .{ .star = .{ .qualifier = qualifier } });
-            },
+            .star => return Error.UnsupportedFeature,
             .expression => |expr| {
-                const label = if (item.alias) |alias_ident| alias_ident.text() else deriveLabel(expr);
-                try projections.append(allocator, .{ .expression = .{ .label = label, .expr = expr } });
+                if (classifyAggregate(expr)) |call_info| {
+                    const index = try appendAggregateSpec(allocator, &aggregates_builder, call_info.call);
+                    const label = if (item.alias) |alias_ident| alias_ident.text() else call_info.default_label;
+                    try projection_builder.append(allocator, .{
+                        .aggregate = .{
+                            .label = label,
+                            .aggregate_index = index,
+                        },
+                    });
+                } else if (expr.* == .column) {
+                    const column = expr.column;
+                    const index = findGroupColumnIndex(group_columns_builder.items, column) orelse return Error.UnsupportedFeature;
+                    const label = if (item.alias) |alias_ident| alias_ident.text() else column.name.text();
+                    try projection_builder.append(allocator, .{
+                        .group = .{
+                            .label = label,
+                            .column_index = index,
+                        },
+                    });
+                } else {
+                    return Error.UnsupportedFeature;
+                }
             },
         }
     }
 
-    const projection_slice = try projections.toOwnedSlice(allocator);
-    const table_binding = try determineTableBinding(stmt);
-
-    return Program{
-        .allocator = allocator,
-        .projection = projection_slice,
-        .selection = stmt.selection,
-        .table_binding = table_binding,
-    };
-}
-
-fn deriveLabel(expr: *const ast.Expression) []const u8 {
-    return switch (expr.*) {
-        .column => |col| col.name.text(),
-        else => "<expr>",
-    };
-}
-
-fn projectedColumnCount(projection: []const Projection, event: *const event_mod.Event) usize {
-    var total: usize = 0;
-    for (projection) |proj| {
-        switch (proj) {
-            .expression => total += 1,
-            .star => |star_proj| total += starColumnCount(event, star_proj),
-        }
+    if (aggregates_builder.items.len == 0) {
+        return Error.UnsupportedFeature; // stateful engine requires at least one aggregate
     }
-    return total;
+
+    if (stmt.having) |expr| {
+        try registerAggregatesInExpression(allocator, expr, &aggregates_builder);
+    }
+
+    const group_columns = try group_columns_builder.toOwnedSlice(allocator);
+    errdefer allocator.free(group_columns);
+
+    const aggregates = try aggregates_builder.toOwnedSlice(allocator);
+    errdefer allocator.free(aggregates);
+
+    const projections = try projection_builder.toOwnedSlice(allocator);
+    errdefer allocator.free(projections);
+
+    const program = Program{
+        .allocator = allocator,
+        .projection = projections,
+        .selection = stmt.selection,
+        .having = stmt.having,
+        .table_binding = table_binding,
+        .group_columns = group_columns,
+        .aggregates = aggregates,
+        .groups = .{},
+        .eviction = options.eviction,
+    };
+    return program;
 }
 
-fn starColumnCount(event: *const event_mod.Event, star: Star) usize {
-    _ = star;
-    return switch (event.payload) {
-        .log => |log_event| 1 + log_event.fields.len,
+const AggregateCallInfo = struct {
+    call: *const ast.FunctionCall,
+    default_label: []const u8,
+};
+
+fn classifyAggregate(expr: *const ast.Expression) ?AggregateCallInfo {
+    switch (expr.*) {
+        .function_call => |*call| {
+            _ = aggregateFunctionFromName(call.name.canonical) orelse return null;
+            return AggregateCallInfo{ .call = call, .default_label = call.name.text() };
+        },
+        else => return null,
+    }
+}
+
+fn appendAggregateSpec(
+    allocator: std.mem.Allocator,
+    builder: *std.ArrayListUnmanaged(AggregateSpec),
+    call: *const ast.FunctionCall,
+) Error!usize {
+    if (call.distinct) return Error.UnsupportedFeature;
+
+    const function = aggregateFunctionFromName(call.name.canonical) orelse return Error.UnsupportedFunction;
+    const argument = switch (function) {
+        .count => try parseCountArgument(call),
+        else => try parseSingleArgument(call),
+    };
+
+    for (builder.items, 0..) |spec, idx| {
+        if (spec.call == call) return idx;
+    }
+
+    try builder.append(allocator, AggregateSpec{
+        .function = function,
+        .argument = argument,
+        .call = call,
+    });
+    return builder.items.len - 1;
+}
+
+fn registerAggregatesInExpression(
+    allocator: std.mem.Allocator,
+    expr: *const ast.Expression,
+    builder: *std.ArrayListUnmanaged(AggregateSpec),
+) Error!void {
+    switch (expr.*) {
+        .function_call => |*call| {
+            if (aggregateFunctionFromName(call.name.canonical)) |_| {
+                _ = try appendAggregateSpec(allocator, builder, call);
+                return;
+            }
+            return Error.UnsupportedFunction;
+        },
+        .binary => |bin| {
+            try registerAggregatesInExpression(allocator, bin.left, builder);
+            try registerAggregatesInExpression(allocator, bin.right, builder);
+        },
+        .unary => |un| try registerAggregatesInExpression(allocator, un.operand, builder),
+        .column, .literal, .star => {},
+    }
+}
+
+fn parseCountArgument(call: *const ast.FunctionCall) Error!AggregateArgument {
+    if (call.arguments.len == 0) return AggregateArgument.star;
+    if (call.arguments.len == 1) {
+        const arg = call.arguments[0];
+        if (arg.* == .star) return AggregateArgument.star;
+        return AggregateArgument{ .expression = arg };
+    }
+    return Error.UnsupportedFeature;
+}
+
+fn parseSingleArgument(call: *const ast.FunctionCall) Error!AggregateArgument {
+    if (call.arguments.len != 1) return Error.UnsupportedFeature;
+    const arg = call.arguments[0];
+    if (arg.* == .star) return Error.UnsupportedFeature;
+    return AggregateArgument{ .expression = arg };
+}
+
+fn aggregateFunctionFromName(name: []const u8) ?AggregateFunction {
+    if (std.mem.eql(u8, name, "count")) return .count;
+    if (std.mem.eql(u8, name, "sum")) return .sum;
+    if (std.mem.eql(u8, name, "avg")) return .avg;
+    if (std.mem.eql(u8, name, "min")) return .min;
+    if (std.mem.eql(u8, name, "max")) return .max;
+    return null;
+}
+
+fn findGroupColumnIndex(columns: []const GroupColumn, column: ast.ColumnRef) ?usize {
+    for (columns, 0..) |group_col, idx| {
+        if (columnsEquivalent(group_col.column, column)) return idx;
+    }
+    return null;
+}
+
+fn columnsEquivalent(a: ast.ColumnRef, b: ast.ColumnRef) bool {
+    if (!identifiersEqual(a.name, b.name)) return false;
+    return qualifiersEqual(a.table, b.table);
+}
+
+fn identifiersEqual(a: ast.Identifier, b: ast.Identifier) bool {
+    if (a.quoted or b.quoted) {
+        if (a.quoted != b.quoted) return false;
+        return std.mem.eql(u8, a.value, b.value);
+    }
+    return std.mem.eql(u8, a.canonical, b.canonical);
+}
+
+fn qualifiersEqual(a: ?ast.Identifier, b: ?ast.Identifier) bool {
+    if (a) |lhs| {
+        if (b) |rhs| {
+            return identifiersEqual(lhs, rhs);
+        }
+        return false;
+    }
+    return b == null;
+}
+
+fn evaluateAggregateArgument(
+    spec: AggregateSpec,
+    event: *const event_mod.Event,
+    binding: ?TableBinding,
+) Error!AggregateInput {
+    return switch (spec.argument) {
+        .star => AggregateInput.count_all,
+        .expression => |expr| blk: {
+            const value = try evaluateExpression(expr, event, binding);
+            if (value == .null and spec.function != .count) {
+                break :blk AggregateInput.skip;
+            }
+            if (spec.function == .count and value == .null) {
+                break :blk AggregateInput.skip;
+            }
+            break :blk AggregateInput{ .value = value };
+        },
     };
 }
 
-fn emitStarColumns(dest: []ValueEntry, event: *const event_mod.Event, binding: ?TableBinding, star: Star) Error!usize {
-    if (star.qualifier) |qualifier| {
-        if (!starQualifierAllowed(binding, qualifier)) {
+const AggregateInput = union(enum) {
+    count_all,
+    value: event_mod.Value,
+    skip,
+};
+
+fn updateCountState(state: *CountState, spec: AggregateSpec, input: AggregateInput) Error!void {
+    _ = spec;
+    switch (input) {
+        .count_all, .value => {
+            if (state.total == math.maxInt(u64)) return Error.ArithmeticOverflow;
+            state.total += 1;
+        },
+        .skip => {},
+    }
+}
+
+fn updateSumState(state: *SumState, spec: AggregateSpec, input: AggregateInput) Error!void {
+    _ = spec;
+    switch (input) {
+        .skip => return,
+        .count_all => unreachable,
+        .value => |value| {
+            switch (value) {
+                .integer => |int_value| {
+                    if (!state.has_value) {
+                        state.has_value = true;
+                        state.kind = .integer;
+                        state.integer_total = int_value;
+                        return;
+                    }
+                    switch (state.kind) {
+                        .integer => {
+                            const ov = @addWithOverflow(state.integer_total, int_value);
+                            if (ov[1] != 0) return Error.ArithmeticOverflow;
+                            state.integer_total = ov[0];
+                        },
+                        .float => {
+                            state.float_total += @as(f64, @floatFromInt(int_value));
+                        },
+                    }
+                },
+                .float => |float_value| {
+                    if (!state.has_value) {
+                        state.has_value = true;
+                        state.kind = .float;
+                        state.float_total = float_value;
+                        return;
+                    }
+                    switch (state.kind) {
+                        .integer => {
+                            state.kind = .float;
+                            state.float_total = @as(f64, @floatFromInt(state.integer_total)) + float_value;
+                        },
+                        .float => state.float_total += float_value,
+                    }
+                },
+                else => return Error.TypeMismatch,
+            }
+        },
+    }
+}
+
+fn updateAvgState(state: *AvgState, spec: AggregateSpec, input: AggregateInput) Error!void {
+    switch (input) {
+        .skip => return,
+        .count_all => unreachable,
+        .value => |value| {
+            try updateSumState(&state.sum, spec, AggregateInput{ .value = value });
+            if (state.count == math.maxInt(u64)) return Error.ArithmeticOverflow;
+            state.count += 1;
+        },
+    }
+}
+
+fn updateMinMaxState(
+    state: *MinMaxState,
+    allocator: std.mem.Allocator,
+    spec: AggregateSpec,
+    input: AggregateInput,
+    mode: enum { min, max },
+) Error!void {
+    _ = spec;
+    switch (input) {
+        .skip => return,
+        .count_all => unreachable,
+        .value => |value| {
+            if (!state.has_value) {
+                state.value = try copyValueOwned(allocator, value);
+                state.has_value = true;
+                return;
+            }
+            const should_replace = switch (mode) {
+                .min => try compareOrder(.greater, state.value, value),
+                .max => try compareOrder(.less, state.value, value),
+            };
+            if (should_replace) {
+                freeOwnedValue(allocator, state.value);
+                state.value = try copyValueOwned(allocator, value);
+                state.has_value = true;
+            }
+        },
+    }
+}
+
+fn aggregateResultValue(state: *const AggregateState, spec: *const AggregateSpec) Error!event_mod.Value {
+    return switch (spec.function) {
+        .count => blk: {
+            const total = state.count.total;
+            if (total > math.maxInt(i64)) return Error.ArithmeticOverflow;
+            break :blk event_mod.Value{ .integer = @intCast(total) };
+        },
+        .sum => blk: {
+            if (!state.sum.has_value) break :blk event_mod.Value{ .null = {} };
+            break :blk switch (state.sum.kind) {
+                .integer => event_mod.Value{ .integer = state.sum.integer_total },
+                .float => event_mod.Value{ .float = state.sum.float_total },
+            };
+        },
+        .avg => blk: {
+            if (state.avg.count == 0) break :blk event_mod.Value{ .null = {} };
+            const total_float: f64 = switch (state.avg.sum.kind) {
+                .integer => @as(f64, @floatFromInt(state.avg.sum.integer_total)),
+                .float => state.avg.sum.float_total,
+            };
+            const average = total_float / @as(f64, @floatFromInt(state.avg.count));
+            break :blk event_mod.Value{ .float = average };
+        },
+        .min => blk: {
+            if (!state.min.has_value) break :blk event_mod.Value{ .null = {} };
+            break :blk state.min.value;
+        },
+        .max => blk: {
+            if (!state.max.has_value) break :blk event_mod.Value{ .null = {} };
+            break :blk state.max.value;
+        },
+    };
+}
+
+fn valueFromLiteral(lit: ast.Literal) Error!event_mod.Value {
+    return switch (lit.value) {
+        .integer => |value| event_mod.Value{ .integer = value },
+        .float => |text| {
+            const parsed = std.fmt.parseFloat(f64, text) catch return Error.TypeMismatch;
+            return event_mod.Value{ .float = parsed };
+        },
+        .string => |text| event_mod.Value{ .string = text },
+        .boolean => |b| event_mod.Value{ .boolean = b },
+        .null => event_mod.Value{ .null = {} },
+    };
+}
+
+fn resolveColumn(event: *const event_mod.Event, col: ast.ColumnRef, binding: ?TableBinding) Error!event_mod.Value {
+    if (col.table) |qualifier| {
+        if (!qualifierAllowed(binding, qualifier)) {
             return Error.UnknownColumn;
         }
     }
 
     return switch (event.payload) {
-        .log => |log_event| {
-            std.debug.assert(dest.len >= 1 + log_event.fields.len);
-            var filled: usize = 0;
-            dest[filled] = .{ .name = "message", .value = .{ .string = log_event.message } };
-            filled += 1;
-            for (log_event.fields) |field| {
-                dest[filled] = .{ .name = field.name, .value = field.value };
-                filled += 1;
-            }
-            return filled;
-        },
+        .log => |log_event| resolveLogColumn(event, log_event, col),
     };
+}
+
+fn resolveLogColumn(ev: *const event_mod.Event, log_event: event_mod.LogEvent, col: ast.ColumnRef) Error!event_mod.Value {
+    const identifier = col.name;
+    const canonical = identifier.canonical;
+
+    if (!identifier.quoted and std.mem.eql(u8, canonical, "message")) {
+        return event_mod.Value{ .string = log_event.message };
+    }
+
+    if (!identifier.quoted and std.mem.eql(u8, canonical, "source_id")) {
+        if (ev.metadata.source_id) |source_id| {
+            return event_mod.Value{ .string = source_id };
+        }
+        return event_mod.Value{ .null = {} };
+    }
+
+    for (log_event.fields) |field| {
+        if (identifier.quoted) {
+            if (std.mem.eql(u8, field.name, identifier.value)) {
+                return field.value;
+            }
+        } else if (ascii.eqlIgnoreCase(field.name, canonical)) {
+            return field.value;
+        }
+    }
+
+    return event_mod.Value{ .null = {} };
 }
 
 fn evaluateBoolean(expr: *const ast.Expression, event: *const event_mod.Event, binding: ?TableBinding) Error!bool {
@@ -205,64 +914,13 @@ fn evaluateExpression(expr: *const ast.Expression, event: *const event_mod.Event
     };
 }
 
-fn valueFromLiteral(lit: ast.Literal) Error!event_mod.Value {
-    return switch (lit.value) {
-        .integer => |value| event_mod.Value{ .integer = value },
-        .float => |text| {
-            const parsed = std.fmt.parseFloat(f64, text) catch return Error.TypeMismatch;
-            return event_mod.Value{ .float = parsed };
-        },
-        .string => |text| event_mod.Value{ .string = text },
-        .boolean => |b| event_mod.Value{ .boolean = b },
-        .null => event_mod.Value{ .null = {} },
-    };
-}
-
-fn resolveColumn(event: *const event_mod.Event, col: ast.ColumnRef, binding: ?TableBinding) Error!event_mod.Value {
-    return switch (event.payload) {
-        .log => |log_event| resolveLogColumn(event, log_event, col, binding),
-    };
-}
-
-fn resolveLogColumn(ev: *const event_mod.Event, log_event: event_mod.LogEvent, col: ast.ColumnRef, binding: ?TableBinding) Error!event_mod.Value {
-    if (col.table) |qualifier| {
-        if (!qualifierAllowed(binding, qualifier)) {
-            return Error.UnknownColumn;
-        }
-    }
-
-    const identifier = col.name;
-    const canonical = identifier.canonical;
-
-    if (!identifier.quoted and std.mem.eql(u8, canonical, "message")) {
-        return event_mod.Value{ .string = log_event.message };
-    }
-
-    if (!identifier.quoted and std.mem.eql(u8, canonical, "source_id")) {
-        if (ev.metadata.source_id) |source_id| {
-            return event_mod.Value{ .string = source_id };
-        }
-        return event_mod.Value{ .null = {} };
-    }
-
-    for (log_event.fields) |field| {
-        if (identifier.quoted) {
-            if (std.mem.eql(u8, field.name, identifier.value)) {
-                return field.value;
-            }
-        } else {
-            if (ascii.eqlIgnoreCase(field.name, canonical)) {
-                return field.value;
-            }
-        }
-    }
-
-    return event_mod.Value{ .null = {} };
-}
-
 fn evalUnary(unary: ast.UnaryExpr, event: *const event_mod.Event, binding: ?TableBinding) Error!event_mod.Value {
     const operand = try evaluateExpression(unary.operand, event, binding);
-    return switch (unary.op) {
+    return applyUnary(unary.op, operand);
+}
+
+fn applyUnary(op: ast.UnaryOperator, operand: event_mod.Value) Error!event_mod.Value {
+    return switch (op) {
         .plus => operand,
         .minus => switch (operand) {
             .integer => |value| event_mod.Value{ .integer = -value },
@@ -279,8 +937,11 @@ fn evalUnary(unary: ast.UnaryExpr, event: *const event_mod.Event, binding: ?Tabl
 fn evalBinary(binary: ast.BinaryExpr, event: *const event_mod.Event, binding: ?TableBinding) Error!event_mod.Value {
     const left = try evaluateExpression(binary.left, event, binding);
     const right = try evaluateExpression(binary.right, event, binding);
+    return applyBinary(binary.op, left, right);
+}
 
-    return switch (binary.op) {
+fn applyBinary(op: ast.BinaryOperator, left: event_mod.Value, right: event_mod.Value) Error!event_mod.Value {
+    return switch (op) {
         .add => try addValues(left, right),
         .subtract => try subtractValues(left, right),
         .multiply => try multiplyValues(left, right),
@@ -408,20 +1069,39 @@ fn compareEqual(left: event_mod.Value, right: event_mod.Value) bool {
     }
 }
 
-const testing = std.testing;
+fn valuesEqual(a: []const event_mod.Value, b: []const event_mod.Value) bool {
+    if (a.len != b.len) return false;
+    for (a, 0..) |value, idx| {
+        if (!compareEqual(value, b[idx])) return false;
+    }
+    return true;
+}
 
-fn testEvent(allocator: std.mem.Allocator) !event_mod.Event {
-    const fields = try allocator.alloc(event_mod.Field, 1);
-    fields[0] = .{ .name = "syslog_severity", .value = .{ .integer = 4 } };
-
-    return event_mod.Event{
-        .metadata = .{ .source_id = "syslog" },
-        .payload = .{
-            .log = .{
-                .message = "hello",
-                .fields = fields,
-            },
+fn copyValueOwned(allocator: std.mem.Allocator, value: event_mod.Value) Error!event_mod.Value {
+    return switch (value) {
+        .string => |text| blk: {
+            const buffer = try allocator.alloc(u8, text.len);
+            if (text.len != 0) std.mem.copyForwards(u8, buffer, text);
+            break :blk event_mod.Value{ .string = buffer };
         },
+        else => value,
+    };
+}
+
+fn freeOwnedValue(allocator: std.mem.Allocator, value: event_mod.Value) void {
+    if (value == .string) {
+        allocator.free(value.string);
+    }
+}
+
+fn cloneRowValue(allocator: std.mem.Allocator, value: event_mod.Value) Error!event_mod.Value {
+    return switch (value) {
+        .string => |text| blk: {
+            const buffer = try allocator.alloc(u8, text.len);
+            if (text.len != 0) std.mem.copyForwards(u8, buffer, text);
+            break :blk event_mod.Value{ .string = buffer };
+        },
+        else => value,
     };
 }
 
@@ -441,29 +1121,11 @@ fn qualifierMatches(binding: IdentifierBinding, qualifier: ast.Identifier) bool 
     return std.mem.eql(u8, binding.canonical, qualifier.canonical);
 }
 
-fn qualifierBindingsEqual(left: IdentifierBinding, right: IdentifierBinding) bool {
-    if (left.quoted or right.quoted) {
-        if (left.quoted != right.quoted) return false;
-        return std.mem.eql(u8, left.value, right.value);
-    }
-    return std.mem.eql(u8, left.canonical, right.canonical);
-}
-
 fn qualifierAllowed(binding_opt: ?TableBinding, qualifier: ast.Identifier) bool {
     if (binding_opt) |binding| {
         if (qualifierMatches(binding.table, qualifier)) return true;
         if (binding.alias) |alias_binding| {
             if (qualifierMatches(alias_binding, qualifier)) return true;
-        }
-    }
-    return false;
-}
-
-fn starQualifierAllowed(binding_opt: ?TableBinding, qualifier: IdentifierBinding) bool {
-    if (binding_opt) |binding| {
-        if (qualifierBindingsEqual(binding.table, qualifier)) return true;
-        if (binding.alias) |alias_binding| {
-            if (qualifierBindingsEqual(alias_binding, qualifier)) return true;
         }
     }
     return false;
@@ -485,10 +1147,288 @@ fn determineTableBinding(stmt: *const ast.SelectStatement) Error!?TableBinding {
     };
 }
 
+const testing = std.testing;
+
+fn createEventWithSeverity(
+    allocator: std.mem.Allocator,
+    message: []const u8,
+    severity: event_mod.Value,
+) !event_mod.Event {
+    const fields = try allocator.alloc(event_mod.Field, 1);
+    fields[0] = .{ .name = "syslog_severity", .value = severity };
+
+    return event_mod.Event{
+        .metadata = .{ .source_id = "syslog" },
+        .payload = .{
+            .log = .{
+                .message = message,
+                .fields = fields,
+            },
+        },
+    };
+}
+
+fn testEvent(allocator: std.mem.Allocator, message: []const u8, severity: i64) !event_mod.Event {
+    return createEventWithSeverity(allocator, message, .{ .integer = severity });
+}
+
 fn freeEvent(allocator: std.mem.Allocator, ev: event_mod.Event) void {
     switch (ev.payload) {
         .log => |log_event| allocator.free(log_event.fields),
     }
+}
+
+fn nextTimestamp(counter: *u64) u64 {
+    const value = counter.*;
+    counter.* += 1;
+    return value;
+}
+
+test "count all messages without groups" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try @import("parser.zig").parseSelect(arena, "SELECT COUNT(*) AS total FROM logs");
+
+    var program = try compile(testing.allocator, stmt, .{});
+    defer program.deinit();
+
+    var event1 = try testEvent(testing.allocator, "hello", 4);
+    defer freeEvent(testing.allocator, event1);
+    var event2 = try testEvent(testing.allocator, "world", 5);
+    defer freeEvent(testing.allocator, event2);
+
+    var clock: u64 = 1;
+
+    const row1 = try program.execute(testing.allocator, &event1, nextTimestamp(&clock)) orelse return testing.expect(false);
+    defer row1.deinit();
+    try testing.expectEqual(@as(usize, 1), row1.values.len);
+    try testing.expectEqualStrings("total", row1.values[0].name);
+    try testing.expect(row1.values[0].value == .integer);
+    try testing.expectEqual(@as(i64, 1), row1.values[0].value.integer);
+
+    const row2 = try program.execute(testing.allocator, &event2, nextTimestamp(&clock)) orelse return testing.expect(false);
+    defer row2.deinit();
+    try testing.expectEqual(@as(i64, 2), row2.values[0].value.integer);
+}
+
+test "count per message with having filter" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try @import("parser.zig").parseSelect(arena,
+        \\SELECT message, COUNT(*) AS total
+        \\FROM logs
+        \\GROUP BY message
+        \\HAVING COUNT(*) > 1
+    );
+
+    var program = try compile(testing.allocator, stmt, .{});
+    defer program.deinit();
+
+    var event1 = try testEvent(testing.allocator, "hello", 4);
+    defer freeEvent(testing.allocator, event1);
+    var event2 = try testEvent(testing.allocator, "hello", 3);
+    defer freeEvent(testing.allocator, event2);
+
+    var clock: u64 = 1;
+
+    const row1 = try program.execute(testing.allocator, &event1, nextTimestamp(&clock));
+    try testing.expect(row1 == null);
+
+    const row2 = try program.execute(testing.allocator, &event2, nextTimestamp(&clock)) orelse return testing.expect(false);
+    defer row2.deinit();
+    try testing.expectEqual(@as(usize, 2), row2.values.len);
+    try testing.expectEqualStrings("message", row2.values[0].name);
+    try testing.expectEqualStrings("hello", row2.values[0].value.string);
+    try testing.expectEqual(@as(i64, 2), row2.values[1].value.integer);
+}
+
+test "sum integer field" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try @import("parser.zig").parseSelect(arena,
+        \\SELECT COUNT(*) AS total, SUM(syslog_severity) AS severity_sum
+        \\FROM logs
+    );
+
+    var program = try compile(testing.allocator, stmt, .{});
+    defer program.deinit();
+
+    var event1 = try testEvent(testing.allocator, "first", 2);
+    defer freeEvent(testing.allocator, event1);
+    var event2 = try testEvent(testing.allocator, "second", 3);
+    defer freeEvent(testing.allocator, event2);
+
+    var clock: u64 = 1;
+
+    const row1 = try program.execute(testing.allocator, &event1, nextTimestamp(&clock)) orelse return testing.expect(false);
+    defer row1.deinit();
+    try testing.expectEqual(@as(i64, 1), row1.values[0].value.integer);
+    try testing.expectEqual(@as(i64, 2), row1.values[1].value.integer);
+
+    const row2 = try program.execute(testing.allocator, &event2, nextTimestamp(&clock)) orelse return testing.expect(false);
+    defer row2.deinit();
+    try testing.expectEqual(@as(usize, 2), row2.values.len);
+    try testing.expectEqual(@as(i64, 2), row2.values[0].value.integer);
+    try testing.expectEqual(@as(i64, 5), row2.values[1].value.integer);
+}
+
+test "avg ignores nulls" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try @import("parser.zig").parseSelect(arena,
+        \\SELECT AVG(syslog_severity) AS avg_severity
+        \\FROM logs
+    );
+
+    var program = try compile(testing.allocator, stmt, .{});
+    defer program.deinit();
+
+    var event_with_value = try testEvent(testing.allocator, "first", 4);
+    defer freeEvent(testing.allocator, event_with_value);
+
+    var event_null = try createEventWithSeverity(testing.allocator, "first_null", .{ .null = {} });
+    defer freeEvent(testing.allocator, event_null);
+
+    var clock: u64 = 1;
+
+    const row1 = try program.execute(testing.allocator, &event_null, nextTimestamp(&clock)) orelse return testing.expect(false);
+    defer row1.deinit();
+    try testing.expect(row1.values[0].value == .null);
+
+    const row2 = try program.execute(testing.allocator, &event_with_value, nextTimestamp(&clock)) orelse return testing.expect(false);
+    defer row2.deinit();
+    try testing.expectApproxEqAbs(@as(f64, 4.0), row2.values[0].value.float, 0.0001);
+}
+
+test "min and max update correctly" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try @import("parser.zig").parseSelect(arena,
+        \\SELECT MIN(syslog_severity) AS min_sev, MAX(syslog_severity) AS max_sev
+        \\FROM logs
+    );
+
+    var program = try compile(testing.allocator, stmt, .{});
+    defer program.deinit();
+
+    var event_low = try testEvent(testing.allocator, "low", 1);
+    defer freeEvent(testing.allocator, event_low);
+    var event_high = try testEvent(testing.allocator, "high", 5);
+    defer freeEvent(testing.allocator, event_high);
+
+    var clock: u64 = 1;
+
+    const row1 = try program.execute(testing.allocator, &event_high, nextTimestamp(&clock)) orelse return testing.expect(false);
+    defer row1.deinit();
+    try testing.expectEqual(@as(i64, 5), row1.values[1].value.integer);
+
+    const row2 = try program.execute(testing.allocator, &event_low, nextTimestamp(&clock)) orelse return testing.expect(false);
+    defer row2.deinit();
+    try testing.expectEqual(@as(i64, 1), row2.values[0].value.integer);
+    try testing.expectEqual(@as(i64, 5), row2.values[1].value.integer);
+}
+
+test "reject non aggregate projections" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try @import("parser.zig").parseSelect(arena,
+        \\SELECT message
+        \\FROM logs
+        \\GROUP BY message
+    );
+    try testing.expectError(Error.UnsupportedFeature, compile(testing.allocator, stmt, .{}));
+}
+
+test "evicts stale groups after ttl" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try @import("parser.zig").parseSelect(arena,
+        \\SELECT message, COUNT(*) AS total
+        \\FROM logs
+        \\GROUP BY message
+    );
+
+    var program = try compile(testing.allocator, stmt, .{
+        .eviction = .{
+            .ttl_ns = 10,
+            .max_groups = 10,
+            .sweep_interval_ns = 1,
+        },
+    });
+    defer program.deinit();
+
+    var event = try testEvent(testing.allocator, "alpha", 4);
+    defer freeEvent(testing.allocator, event);
+
+    const first = try program.execute(testing.allocator, &event, 100) orelse return testing.expect(false);
+    defer first.deinit();
+    try testing.expectEqual(@as(i64, 1), first.values[1].value.integer);
+
+    const second = try program.execute(testing.allocator, &event, 200) orelse return testing.expect(false);
+    defer second.deinit();
+    try testing.expectEqual(@as(i64, 1), second.values[1].value.integer);
+}
+
+test "evicts least recently used group when limit exceeded" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try @import("parser.zig").parseSelect(arena,
+        \\SELECT message, COUNT(*) AS total
+        \\FROM logs
+        \\GROUP BY message
+    );
+
+    var program = try compile(testing.allocator, stmt, .{
+        .eviction = .{
+            .ttl_ns = null,
+            .max_groups = 2,
+            .sweep_interval_ns = 0,
+        },
+    });
+    defer program.deinit();
+
+    var event_a = try testEvent(testing.allocator, "a", 1);
+    defer freeEvent(testing.allocator, event_a);
+    var event_b = try testEvent(testing.allocator, "b", 2);
+    defer freeEvent(testing.allocator, event_b);
+    var event_c = try testEvent(testing.allocator, "c", 3);
+    defer freeEvent(testing.allocator, event_c);
+
+    const row_a1 = try program.execute(testing.allocator, &event_a, 10) orelse return testing.expect(false);
+    defer row_a1.deinit();
+    try testing.expectEqual(@as(i64, 1), row_a1.values[1].value.integer);
+
+    const row_b1 = try program.execute(testing.allocator, &event_b, 11) orelse return testing.expect(false);
+    defer row_b1.deinit();
+    try testing.expectEqual(@as(i64, 1), row_b1.values[1].value.integer);
+
+    const row_c1 = try program.execute(testing.allocator, &event_c, 12) orelse return testing.expect(false);
+    defer row_c1.deinit();
+    try testing.expectEqual(@as(i64, 1), row_c1.values[1].value.integer);
+
+    const row_a2 = try program.execute(testing.allocator, &event_a, 13) orelse return testing.expect(false);
+    defer row_a2.deinit();
+    try testing.expectEqual(@as(i64, 1), row_a2.values[1].value.integer);
+
+    const row_b2 = try program.execute(testing.allocator, &event_b, 14) orelse return testing.expect(false);
+    defer row_b2.deinit();
+    try testing.expectEqual(@as(i64, 1), row_b2.values[1].value.integer);
 }
 
 test "execute projection" {
@@ -496,25 +1436,31 @@ test "execute projection" {
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
 
-    const stmt = try @import("parser.zig").parseSelect(arena, "SELECT syslog_severity, message FROM logs WHERE syslog_severity <= 4");
+    const stmt = try @import("parser.zig").parseSelect(arena,
+        \\SELECT message, COUNT(*) AS total
+        \\FROM logs
+        \\WHERE syslog_severity <= 4
+        \\GROUP BY message
+    );
 
-    var program = try compile(testing.allocator, stmt);
+    var program = try compile(testing.allocator, stmt, .{});
     defer program.deinit();
 
-    var event = try testEvent(testing.allocator);
+    var event = try testEvent(testing.allocator, "hello", 4);
     defer freeEvent(testing.allocator, event);
 
-    const maybe_row = try program.execute(testing.allocator, &event);
+    var clock: u64 = 1;
+    const maybe_row = try program.execute(testing.allocator, &event, nextTimestamp(&clock));
     defer if (maybe_row) |row| row.deinit();
     try testing.expect(maybe_row != null);
     const row = maybe_row.?;
     try testing.expectEqual(@as(usize, 2), row.values.len);
-    try testing.expectEqualStrings("syslog_severity", row.values[0].name);
-    try testing.expect(row.values[0].value == .integer);
-    try testing.expect(row.values[0].value.integer == 4);
-    try testing.expectEqualStrings("message", row.values[1].name);
-    try testing.expect(row.values[1].value == .string);
-    try testing.expectEqualStrings("hello", row.values[1].value.string);
+    try testing.expectEqualStrings("message", row.values[0].name);
+    try testing.expect(row.values[0].value == .string);
+    try testing.expectEqualStrings("hello", row.values[0].value.string);
+    try testing.expectEqualStrings("total", row.values[1].name);
+    try testing.expect(row.values[1].value == .integer);
+    try testing.expectEqual(@as(i64, 1), row.values[1].value.integer);
 }
 
 test "filter out non matching event" {
@@ -522,14 +1468,19 @@ test "filter out non matching event" {
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
 
-    const stmt = try @import("parser.zig").parseSelect(arena, "SELECT message FROM logs WHERE syslog_severity <= 2");
-    var program = try compile(testing.allocator, stmt);
+    const stmt = try @import("parser.zig").parseSelect(arena,
+        \\SELECT message, COUNT(*) AS total
+        \\FROM logs
+        \\WHERE syslog_severity <= 2
+        \\GROUP BY message
+    );
+    var program = try compile(testing.allocator, stmt, .{});
     defer program.deinit();
 
-    var event = try testEvent(testing.allocator);
+    var event = try testEvent(testing.allocator, "hello", 4);
     defer freeEvent(testing.allocator, event);
 
-    const maybe_row = try program.execute(testing.allocator, &event);
+    const maybe_row = try program.execute(testing.allocator, &event, 1);
     try testing.expect(maybe_row == null);
 }
 
@@ -538,26 +1489,22 @@ test "missing column yields null" {
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
 
-    const stmt = try @import("parser.zig").parseSelect(arena, "SELECT missing FROM logs");
-    var program = try compile(testing.allocator, stmt);
+    const stmt = try @import("parser.zig").parseSelect(arena,
+        \\SELECT SUM(missing) AS total
+        \\FROM logs
+    );
+    var program = try compile(testing.allocator, stmt, .{});
     defer program.deinit();
 
-    var event = try testEvent(testing.allocator);
+    var event = try testEvent(testing.allocator, "hello", 4);
     defer freeEvent(testing.allocator, event);
 
-    const maybe_row = try program.execute(testing.allocator, &event);
+    const maybe_row = try program.execute(testing.allocator, &event, 1);
     defer if (maybe_row) |row| row.deinit();
 
     const row = maybe_row orelse return testing.expect(false);
     try testing.expectEqual(@as(usize, 1), row.values.len);
     try testing.expect(row.values[0].value == .null);
-}
-
-test "integer arithmetic overflow yields error" {
-    const max = std.math.maxInt(i64);
-    try testing.expectError(Error.ArithmeticOverflow, addValues(.{ .integer = max }, .{ .integer = 1 }));
-    try testing.expectError(Error.ArithmeticOverflow, subtractValues(.{ .integer = std.math.minInt(i64) }, .{ .integer = 1 }));
-    try testing.expectError(Error.ArithmeticOverflow, multiplyValues(.{ .integer = max }, .{ .integer = 2 }));
 }
 
 test "execute star projection expands fields" {
@@ -566,23 +1513,7 @@ test "execute star projection expands fields" {
     const arena = arena_inst.allocator();
 
     const stmt = try @import("parser.zig").parseSelect(arena, "SELECT * FROM logs");
-    var program = try compile(testing.allocator, stmt);
-    defer program.deinit();
-
-    var event = try testEvent(testing.allocator);
-    defer freeEvent(testing.allocator, event);
-
-    const maybe_row = try program.execute(testing.allocator, &event);
-    defer if (maybe_row) |row| row.deinit();
-
-    const row = maybe_row orelse return testing.expect(false);
-    try testing.expectEqual(@as(usize, 2), row.values.len);
-    try testing.expectEqualStrings("message", row.values[0].name);
-    try testing.expect(row.values[0].value == .string);
-    try testing.expectEqualStrings("hello", row.values[0].value.string);
-    try testing.expectEqualStrings("syslog_severity", row.values[1].name);
-    try testing.expect(row.values[1].value == .integer);
-    try testing.expectEqual(@as(i64, 4), row.values[1].value.integer);
+    try testing.expectError(Error.UnsupportedFeature, compile(testing.allocator, stmt, .{}));
 }
 
 test "resolve qualified column reference" {
@@ -590,21 +1521,28 @@ test "resolve qualified column reference" {
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
 
-    const stmt = try @import("parser.zig").parseSelect(arena, "SELECT logs.message FROM logs");
-    var program = try compile(testing.allocator, stmt);
+    const stmt = try @import("parser.zig").parseSelect(arena,
+        \\SELECT logs.message, COUNT(*) AS total
+        \\FROM logs
+        \\GROUP BY logs.message
+    );
+    var program = try compile(testing.allocator, stmt, .{});
     defer program.deinit();
 
-    var event = try testEvent(testing.allocator);
+    var event = try testEvent(testing.allocator, "hello", 4);
     defer freeEvent(testing.allocator, event);
 
-    const maybe_row = try program.execute(testing.allocator, &event);
+    const maybe_row = try program.execute(testing.allocator, &event, 1);
     defer if (maybe_row) |row| row.deinit();
 
     const row = maybe_row orelse return testing.expect(false);
-    try testing.expectEqual(@as(usize, 1), row.values.len);
+    try testing.expectEqual(@as(usize, 2), row.values.len);
     try testing.expectEqualStrings("message", row.values[0].name);
     try testing.expect(row.values[0].value == .string);
     try testing.expectEqualStrings("hello", row.values[0].value.string);
+    try testing.expectEqualStrings("total", row.values[1].name);
+    try testing.expect(row.values[1].value == .integer);
+    try testing.expectEqual(@as(i64, 1), row.values[1].value.integer);
 }
 
 test "unknown table qualifier yields error" {
@@ -612,14 +1550,18 @@ test "unknown table qualifier yields error" {
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
 
-    const stmt = try @import("parser.zig").parseSelect(arena, "SELECT foo.message FROM logs");
-    var program = try compile(testing.allocator, stmt);
+    const stmt = try @import("parser.zig").parseSelect(arena,
+        \\SELECT foo.message, COUNT(*) AS total
+        \\FROM logs
+        \\GROUP BY foo.message
+    );
+    var program = try compile(testing.allocator, stmt, .{});
     defer program.deinit();
 
-    var event = try testEvent(testing.allocator);
+    var event = try testEvent(testing.allocator, "hello", 4);
     defer freeEvent(testing.allocator, event);
 
-    try testing.expectError(Error.UnknownColumn, program.execute(testing.allocator, &event));
+    try testing.expectError(Error.UnknownColumn, program.execute(testing.allocator, &event, 1));
 }
 
 test "unknown star qualifier yields error" {
@@ -628,13 +1570,7 @@ test "unknown star qualifier yields error" {
     const arena = arena_inst.allocator();
 
     const stmt = try @import("parser.zig").parseSelect(arena, "SELECT foo.* FROM logs");
-    var program = try compile(testing.allocator, stmt);
-    defer program.deinit();
-
-    var event = try testEvent(testing.allocator);
-    defer freeEvent(testing.allocator, event);
-
-    try testing.expectError(Error.UnknownColumn, program.execute(testing.allocator, &event));
+    try testing.expectError(Error.UnsupportedFeature, compile(testing.allocator, stmt, .{}));
 }
 
 test "execute mixed star and expression projection" {
@@ -643,20 +1579,5 @@ test "execute mixed star and expression projection" {
     const arena = arena_inst.allocator();
 
     const stmt = try @import("parser.zig").parseSelect(arena, "SELECT *, syslog_severity + 1 AS severity_plus_one FROM logs");
-    var program = try compile(testing.allocator, stmt);
-    defer program.deinit();
-
-    var event = try testEvent(testing.allocator);
-    defer freeEvent(testing.allocator, event);
-
-    const maybe_row = try program.execute(testing.allocator, &event);
-    defer if (maybe_row) |row| row.deinit();
-
-    const row = maybe_row orelse return testing.expect(false);
-    try testing.expectEqual(@as(usize, 3), row.values.len);
-    try testing.expectEqualStrings("message", row.values[0].name);
-    try testing.expectEqualStrings("syslog_severity", row.values[1].name);
-    try testing.expectEqualStrings("severity_plus_one", row.values[2].name);
-    try testing.expect(row.values[2].value == .integer);
-    try testing.expectEqual(@as(i64, 5), row.values[2].value.integer);
+    try testing.expectError(Error.UnsupportedFeature, compile(testing.allocator, stmt, .{}));
 }

@@ -57,10 +57,13 @@ sinks list their upstream producers the same way.
 
 ### SQL transforms
 
-The SQL transform accepts a `SELECT` statement. The projection is evaluated against each event and
-produces a row of name/value pairs. `WHERE` clauses can be used to drop events that do not match.
-The runtime currently understands column references that map to log-event fields and the message
-body.
+The SQL transform now implements streaming aggregation. Every statement must contain at least one
+aggregate (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`). Incoming events update the state of their group and
+immediately emit the latest aggregate values, making it easy to track counters or running totals
+per key. `WHERE` filters still apply before aggregation, while `HAVING` filters use the aggregated
+values. Group keys are limited to column references.
+
+See `docs/sql.md` for a full reference of the supported syntax, semantics and error modes.
 
 ### Console sink
 

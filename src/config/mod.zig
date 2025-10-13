@@ -86,6 +86,12 @@ pub const TransformType = enum {
     sql,
 };
 
+pub const SqlEvictionConfig = struct {
+    ttl_seconds: ?u64 = null,
+    max_groups: ?usize = null,
+    sweep_interval_seconds: ?u64 = null,
+};
+
 pub const SqlTransform = struct {
     id: []const u8,
     inputs: []const []const u8,
@@ -93,6 +99,7 @@ pub const SqlTransform = struct {
     query: []const u8,
     parallelism: usize = 1,
     queue: QueueConfig = .{},
+    eviction: SqlEvictionConfig = .{},
 };
 
 pub const TransformNode = union(TransformType) {

@@ -52,7 +52,7 @@ pub fn testOne(ctx: *Context, input: []const u8) !void {
 }
 
 const corpus = [_][]const u8{
-    "[sources]\n[sources.syslog]\naddress = \"udp://127.0.0.1:0\"\noutputs = [\"sql\"]\n\n[transforms]\n[transforms.sql]\ninputs = [\"syslog\"]\noutputs = [\"sink\"]\nquery = \"SELECT message FROM logs\"\n\n[sinks]\n[sinks.console]\ninputs = [\"sql\"]\n\n",
+    "[sources]\n[sources.syslog]\naddress = \"udp://127.0.0.1:0\"\noutputs = [\"sql\"]\n\n[transforms]\n[transforms.sql]\ninputs = [\"syslog\"]\noutputs = [\"sink\"]\nquery = \"SELECT message, COUNT(*) AS total FROM logs GROUP BY message\"\n\n[sinks]\n[sinks.console]\ninputs = [\"sql\"]\n\n",
 };
 
 test "config parser fuzz" {
@@ -93,7 +93,7 @@ fn generateStructured(prng: *std.Random.DefaultPrng, allocator: std.mem.Allocato
         try writer.writeAll("type = \"sql\"\n");
         try writer.print("inputs = [\"{s}\"]\n", .{source_name});
         try writer.print("outputs = [\"{s}\"]\n", .{sink_name});
-        try writer.writeAll("query = \"SELECT message, value + 1 AS next_value FROM logs\"\n");
+        try writer.writeAll("query = \"SELECT message, COUNT(*) AS total FROM logs GROUP BY message\"\n");
         if (prng.random().boolean()) {
             const parallelism = prng.random().intRangeLessThan(u8, 1, 4);
             try writer.print("parallelism = {d}\n", .{parallelism});

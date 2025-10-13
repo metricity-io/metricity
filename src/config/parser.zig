@@ -45,6 +45,9 @@ const TransformDraft = struct {
     parallelism: ?usize = null,
     queue_capacity: ?usize = null,
     queue_strategy: ?cfg.QueueStrategy = null,
+    eviction_ttl_seconds: ?usize = null,
+    eviction_max_groups: ?usize = null,
+    eviction_sweep_seconds: ?usize = null,
 };
 
 const SinkDraft = struct {
@@ -165,6 +168,11 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !cfg.OwnedPipelin
                             .capacity = draft.queue_capacity orelse default_queue.capacity,
                             .strategy = draft.queue_strategy orelse default_queue.strategy,
                         },
+                        .eviction = .{
+                            .ttl_seconds = if (draft.eviction_ttl_seconds) |ttl| @intCast(ttl) else null,
+                            .max_groups = draft.eviction_max_groups,
+                            .sweep_interval_seconds = if (draft.eviction_sweep_seconds) |seconds| @intCast(seconds) else null,
+                        },
                     },
                 });
             },
@@ -269,6 +277,24 @@ fn applyTransformKV(arena: std.mem.Allocator, draft: *TransformDraft, key: []con
         if (draft.queue_strategy != null) return ParseError.DuplicateKey;
         const strategy_name = try parseStringValue(arena, value);
         draft.queue_strategy = try parseQueueStrategy(strategy_name);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "eviction_ttl_seconds")) {
+        if (draft.eviction_ttl_seconds != null) return ParseError.DuplicateKey;
+        draft.eviction_ttl_seconds = try parseNonNegativeInt(value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "eviction_max_groups")) {
+        if (draft.eviction_max_groups != null) return ParseError.DuplicateKey;
+        draft.eviction_max_groups = try parseNonNegativeInt(value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "eviction_sweep_seconds")) {
+        if (draft.eviction_sweep_seconds != null) return ParseError.DuplicateKey;
+        draft.eviction_sweep_seconds = try parseNonNegativeInt(value);
         return;
     }
 
@@ -387,6 +413,11 @@ fn parsePositiveInt(raw: []const u8) !usize {
     const value = std.fmt.parseInt(usize, raw, 10) catch return ParseError.InvalidValue;
     if (value == 0) return ParseError.InvalidValue;
     return value;
+}
+
+fn parseNonNegativeInt(raw: []const u8) !usize {
+    if (raw.len == 0) return ParseError.InvalidValue;
+    return std.fmt.parseInt(usize, raw, 10) catch ParseError.InvalidValue;
 }
 
 fn parseQueueStrategy(name: []const u8) !cfg.QueueStrategy {
