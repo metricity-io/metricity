@@ -51,6 +51,26 @@ example, that a query such as `HAVING COUNT(*) > 10` will begin emitting rows on
 matching event arrives for the group. State can be cleared programatically via `metricity check
 --once` (which reinitializes the transform) or, in tests, by calling `Program.reset()`.
 
+## Execution Plan
+
+During compilation each statement materialises a physical pipeline:
+
+```
+Source → Filter → Project → GroupAggregate → Having → Window? → Route?
+```
+
+- **Filter** evaluates the `WHERE` predicate against each incoming event.
+- **Project** computes grouped key values and a stable hash using the batch arena, avoiding
+  steady-state heap traffic.
+- **GroupAggregate** acquires group state (creating it if necessary) and updates aggregate
+  functions in place.
+- **Having** performs a zero-copy check on the freshly updated state before a row is emitted.
+- **Window** and **Route** are optional stages reserved for time-based semantics and downstream
+  fan-out; they execute as non-blocking no-ops today.
+
+The plan runs entirely with arena-backed allocations and does not introduce blocking calls, keeping
+throughput predictable under load.
+
 ## State Retention & Eviction
 
 Each transform worker keeps group state in memory. To prevent unbounded growth, the runtime applies

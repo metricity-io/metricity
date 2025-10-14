@@ -1,10 +1,13 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const source_mod = @import("source");
+const plan = @import("plan.zig");
 const event_mod = source_mod.event;
 
 const ascii = std.ascii;
 const math = std.math;
+const hash = std.hash;
+const meta = std.meta;
 
 const IdentifierBinding = struct {
     canonical: []const u8,
@@ -28,43 +31,13 @@ pub const Error = std.mem.Allocator.Error || error{
     ArithmeticOverflow,
 };
 
-const AggregateFunction = enum {
-    count,
-    sum,
-    avg,
-    min,
-    max,
-};
-
-const AggregateArgument = union(enum) {
-    star,
-    expression: *const ast.Expression,
-};
-
-const AggregateSpec = struct {
-    function: AggregateFunction,
-    argument: AggregateArgument,
-    call: *const ast.FunctionCall,
-};
-
-const GroupColumn = struct {
-    column: ast.ColumnRef,
-};
-
-const Projection = union(enum) {
-    group: GroupProjection,
-    aggregate: AggregateProjection,
-};
-
-const GroupProjection = struct {
-    label: []const u8,
-    column_index: usize,
-};
-
-const AggregateProjection = struct {
-    label: []const u8,
-    aggregate_index: usize,
-};
+const AggregateFunction = plan.AggregateFunction;
+const AggregateArgument = plan.AggregateArgument;
+const AggregateSpec = plan.AggregateSpec;
+const GroupColumn = plan.GroupColumn;
+const Projection = plan.Projection;
+const GroupProjection = plan.GroupProjection;
+const AggregateProjection = plan.AggregateProjection;
 
 const CountState = struct {
     total: u64 = 0,
@@ -122,6 +95,7 @@ const GroupState = struct {
     key_values: []event_mod.Value,
     aggregates: []AggregateState,
     last_seen_ns: u64,
+    key_hash: u64,
 
     fn deinit(self: *GroupState, allocator: std.mem.Allocator) void {
         for (self.key_values) |value| {
@@ -139,6 +113,40 @@ const GroupState = struct {
 const GroupAcquisition = struct {
     index: usize,
     created: bool,
+};
+
+const ProjectedKeys = struct {
+    allocator: std.mem.Allocator,
+    values: []event_mod.Value,
+    hash: u64,
+    allocated: bool,
+
+    fn empty(allocator: std.mem.Allocator) ProjectedKeys {
+        return ProjectedKeys{
+            .allocator = allocator,
+            .values = &.{},
+            .hash = 0,
+            .allocated = false,
+        };
+    }
+
+    fn fromValues(allocator: std.mem.Allocator, values: []event_mod.Value, hashed: u64) ProjectedKeys {
+        return ProjectedKeys{
+            .allocator = allocator,
+            .values = values,
+            .hash = hashed,
+            .allocated = values.len != 0,
+        };
+    }
+
+    fn deinit(self: *ProjectedKeys) void {
+        if (self.allocated and self.values.len != 0) {
+            self.allocator.free(self.values);
+        }
+        self.values = &.{};
+        self.hash = 0;
+        self.allocated = false;
+    }
 };
 
 const Transaction = struct {
@@ -201,12 +209,8 @@ pub const CompileOptions = struct {
 /// against pipeline events.
 pub const Program = struct {
     allocator: std.mem.Allocator,
-    projection: []const Projection,
-    selection: ?*const ast.Expression,
-    having: ?*const ast.Expression,
+    plan: plan.PhysicalPlan,
     table_binding: ?TableBinding,
-    group_columns: []const GroupColumn,
-    aggregates: []const AggregateSpec,
     groups: std.ArrayListUnmanaged(GroupState) = .{},
     eviction: EvictionConfig,
     last_sweep: u64 = 0,
@@ -218,9 +222,9 @@ pub const Program = struct {
         }
         self.groups.deinit(self.allocator);
 
-        self.allocator.free(self.projection);
-        self.allocator.free(self.group_columns);
-        self.allocator.free(self.aggregates);
+        self.allocator.free(self.plan.project.projections);
+        self.allocator.free(self.plan.project.group_columns);
+        self.allocator.free(self.plan.group_aggregate.aggregates);
     }
 
     /// Clears accumulated aggregation state, preserving compiled metadata.
@@ -244,12 +248,15 @@ pub const Program = struct {
 
         self.maybeSweep(now_ns);
 
-        if (self.selection) |expr| {
-            const predicate = try evaluateBoolean(expr, event, binding);
+        if (self.plan.filter) |filter_stage| {
+            const predicate = try evaluateBoolean(filter_stage.predicate, event, binding);
             if (!predicate) return null;
         }
 
-        const acquisition = try self.obtainGroupState(allocator, event, now_ns);
+        var projected_keys = try self.runProjectStage(allocator, event, binding);
+        defer projected_keys.deinit();
+
+        const acquisition = try self.runGroupAggregateStage(&projected_keys, now_ns);
         var group_ptr = &self.groups.items[acquisition.index];
 
         var cloned_states: []AggregateState = &.{};
@@ -264,6 +271,7 @@ pub const Program = struct {
             .key_values = group_ptr.key_values,
             .aggregates = if (acquisition.created) group_ptr.aggregates else cloned_states,
             .last_seen_ns = group_ptr.last_seen_ns,
+            .key_hash = group_ptr.key_hash,
         };
         const working_group = if (acquisition.created)
             group_ptr
@@ -273,23 +281,27 @@ pub const Program = struct {
         try self.updateAggregates(working_group, event, binding);
         working_group.last_seen_ns = now_ns;
 
-        if (self.having) |expr| {
-            const keep = try self.evaluateHaving(expr, working_group);
+        if (self.plan.having) |having_stage| {
+            const keep = try self.evaluateHaving(having_stage.predicate, working_group);
             if (!keep) {
                 txn.commit(now_ns);
+                self.trimToLimit();
                 return null;
             }
         }
 
         txn.commit(now_ns);
         group_ptr = &self.groups.items[acquisition.index];
+        group_ptr.key_hash = projected_keys.hash;
 
-        const total_columns = self.projection.len;
+        const project_stage = self.plan.project;
+        const aggregate_stage = self.plan.group_aggregate;
+        const total_columns = project_stage.projections.len;
         var values = try allocator.alloc(ValueEntry, total_columns);
         var idx: usize = 0;
         errdefer allocator.free(values);
 
-        for (self.projection) |proj| {
+        for (project_stage.projections) |proj| {
             switch (proj) {
                 .group => |group_proj| {
                     values[idx] = .{
@@ -299,7 +311,7 @@ pub const Program = struct {
                     idx += 1;
                 },
                 .aggregate => |agg_proj| {
-                    const spec = &self.aggregates[agg_proj.aggregate_index];
+                    const spec = &aggregate_stage.aggregates[agg_proj.aggregate_index];
                     const value = try aggregateResultValue(&group_ptr.aggregates[agg_proj.aggregate_index], spec);
                     values[idx] = .{
                         .name = agg_proj.label,
@@ -312,30 +324,61 @@ pub const Program = struct {
 
         std.debug.assert(idx == total_columns);
         self.trimToLimit();
-        return Row{ .allocator = allocator, .values = values, .owns_strings = true };
-    }
+        var row = Row{ .allocator = allocator, .values = values, .owns_strings = true };
 
-    fn obtainGroupState(self: *Program, allocator: std.mem.Allocator, event: *const event_mod.Event, now_ns: u64) Error!GroupAcquisition {
-        var temp_values: []event_mod.Value = &.{};
-        if (self.group_columns.len != 0) {
-            temp_values = try allocator.alloc(event_mod.Value, self.group_columns.len);
-            errdefer allocator.free(temp_values);
-            for (self.group_columns, 0..) |group_col, idx| {
-                temp_values[idx] = try resolveColumn(event, group_col.column, self.table_binding);
-            }
+        if (self.plan.window) |window_stage| {
+            try self.runWindowStage(window_stage, &row, now_ns);
         }
 
-        defer if (temp_values.len != 0) allocator.free(temp_values);
+        if (self.plan.route) |route_stage| {
+            try self.runRouteStage(route_stage, &row);
+        }
 
-        if (self.group_columns.len == 0) {
+        return row;
+    }
+
+    fn runProjectStage(self: *Program, allocator: std.mem.Allocator, event: *const event_mod.Event, binding: ?TableBinding) Error!ProjectedKeys {
+        const group_columns = self.plan.project.group_columns;
+        if (group_columns.len == 0) {
+            return ProjectedKeys.empty(allocator);
+        }
+
+        var values = try allocator.alloc(event_mod.Value, group_columns.len);
+        var ok = false;
+        errdefer if (!ok) allocator.free(values);
+
+        for (group_columns, 0..) |group_col, idx| {
+            values[idx] = try resolveColumn(event, group_col.column, binding);
+        }
+
+        const hashed = hashGroupValues(values);
+        ok = true;
+        return ProjectedKeys.fromValues(allocator, values, hashed);
+    }
+
+    fn runGroupAggregateStage(self: *Program, projected: *const ProjectedKeys, now_ns: u64) Error!GroupAcquisition {
+        if (projected.values.len == 0) {
             return self.stateForGlobalGroup(now_ns);
         }
 
-        if (self.findGroup(temp_values)) |existing| {
+        if (self.findGroup(projected.values, projected.hash)) |existing| {
             return GroupAcquisition{ .index = existing, .created = false };
         }
 
-        return self.createGroup(temp_values, now_ns);
+        return self.createGroup(projected.values, projected.hash, now_ns);
+    }
+
+    fn runWindowStage(self: *Program, stage: plan.WindowStage, row: *Row, now_ns: u64) Error!void {
+        _ = self;
+        _ = now_ns;
+        if (!stage.enabled) return;
+        _ = row;
+    }
+
+    fn runRouteStage(self: *Program, stage: plan.RouteStage, row: *Row) Error!void {
+        _ = self;
+        _ = stage;
+        _ = row;
     }
 
     fn stateForGlobalGroup(self: *Program, now_ns: u64) Error!GroupAcquisition {
@@ -349,12 +392,14 @@ pub const Program = struct {
             .key_values = &.{},
             .aggregates = aggregates,
             .last_seen_ns = now_ns,
+            .key_hash = 0,
         };
         return GroupAcquisition{ .index = self.groups.items.len - 1, .created = true };
     }
 
-    fn findGroup(self: *Program, values: []const event_mod.Value) ?usize {
+    fn findGroup(self: *Program, values: []const event_mod.Value, hash_value: u64) ?usize {
         for (self.groups.items, 0..) |*group, idx| {
+            if (group.key_hash != hash_value) continue;
             if (valuesEqual(group.key_values, values)) {
                 return idx;
             }
@@ -362,7 +407,7 @@ pub const Program = struct {
         return null;
     }
 
-    fn createGroup(self: *Program, values: []const event_mod.Value, now_ns: u64) Error!GroupAcquisition {
+    fn createGroup(self: *Program, values: []const event_mod.Value, key_hash: u64, now_ns: u64) Error!GroupAcquisition {
         const copied = try self.copyKeyValues(values);
         errdefer {
             for (copied) |value| freeOwnedValue(self.allocator, value);
@@ -380,6 +425,7 @@ pub const Program = struct {
             .key_values = copied,
             .aggregates = aggregates,
             .last_seen_ns = now_ns,
+            .key_hash = key_hash,
         };
         return GroupAcquisition{ .index = self.groups.items.len - 1, .created = true };
     }
@@ -403,8 +449,9 @@ pub const Program = struct {
     }
 
     fn createAggregateStateSlice(self: *Program) Error![]AggregateState {
-        if (self.aggregates.len == 0) return &.{};
-        var states = try self.allocator.alloc(AggregateState, self.aggregates.len);
+        const aggregates = self.plan.group_aggregate.aggregates;
+        if (aggregates.len == 0) return &.{};
+        var states = try self.allocator.alloc(AggregateState, aggregates.len);
         var idx: usize = 0;
         errdefer {
             while (idx > 0) {
@@ -413,7 +460,7 @@ pub const Program = struct {
             }
             self.allocator.free(states);
         }
-        for (self.aggregates, 0..) |spec, i| {
+        for (aggregates, 0..) |spec, i| {
             states[i] = AggregateState.init(spec.function);
             idx += 1;
         }
@@ -421,7 +468,7 @@ pub const Program = struct {
     }
 
     fn updateAggregates(self: *Program, group: *GroupState, event: *const event_mod.Event, binding: ?TableBinding) Error!void {
-        for (self.aggregates, 0..) |spec, idx| {
+        for (self.plan.group_aggregate.aggregates, 0..) |spec, idx| {
             const input = try evaluateAggregateArgument(spec, event, binding);
             var state = &group.aggregates[idx];
             switch (spec.function) {
@@ -438,6 +485,7 @@ pub const Program = struct {
         const value = try self.evaluateAggregateExpression(expr, group);
         return switch (value) {
             .boolean => |b| b,
+            .null => false,
             else => Error.TypeMismatch,
         };
     }
@@ -457,7 +505,7 @@ pub const Program = struct {
             },
             .function_call => |*call| {
                 const index = self.aggregateIndexForCall(call) orelse return Error.UnsupportedFunction;
-                const spec = &self.aggregates[index];
+                const spec = &self.plan.group_aggregate.aggregates[index];
                 return aggregateResultValue(&group.aggregates[index], spec);
             },
             .star => Error.UnsupportedFeature,
@@ -465,8 +513,8 @@ pub const Program = struct {
     }
 
     fn resolveGroupColumn(self: *Program, group: *const GroupState, col: ast.ColumnRef) Error!event_mod.Value {
-        for (self.group_columns, 0..) |group_col, idx| {
-            if (columnsEquivalent(group_col.column, col)) {
+        for (self.plan.project.group_columns, 0..) |group_col, idx| {
+            if (columnsEquivalent(group_col.column, col, self.table_binding)) {
                 return group.key_values[idx];
             }
         }
@@ -474,7 +522,7 @@ pub const Program = struct {
     }
 
     fn aggregateIndexForCall(self: *Program, call: *const ast.FunctionCall) ?usize {
-        for (self.aggregates, 0..) |spec, idx| {
+        for (self.plan.group_aggregate.aggregates, 0..) |spec, idx| {
             if (spec.call == call) return idx;
         }
         return null;
@@ -619,14 +667,19 @@ pub fn compile(allocator: std.mem.Allocator, stmt: *const ast.SelectStatement, o
     var group_columns_builder = std.ArrayListUnmanaged(GroupColumn){};
     defer group_columns_builder.deinit(allocator);
 
+    const table_binding = try determineTableBinding(stmt);
+
     for (stmt.group_by) |expr| {
         switch (expr.*) {
-            .column => |col| try group_columns_builder.append(allocator, .{ .column = col }),
+            .column => |col| {
+                if (col.table) |qualifier| {
+                    if (!qualifierAllowed(table_binding, qualifier)) return Error.UnknownColumn;
+                }
+                try group_columns_builder.append(allocator, .{ .column = col });
+            },
             else => return Error.UnsupportedFeature,
         }
     }
-
-    const table_binding = try determineTableBinding(stmt);
 
     var aggregates_builder = std.ArrayListUnmanaged(AggregateSpec){};
     defer aggregates_builder.deinit(allocator);
@@ -649,7 +702,12 @@ pub fn compile(allocator: std.mem.Allocator, stmt: *const ast.SelectStatement, o
                     });
                 } else if (expr.* == .column) {
                     const column = expr.column;
-                    const index = findGroupColumnIndex(group_columns_builder.items, column) orelse return Error.UnsupportedFeature;
+                    const index = findGroupColumnIndex(group_columns_builder.items, column, table_binding) orelse {
+                        if (column.table) |qualifier| {
+                            if (!qualifierAllowed(table_binding, qualifier)) return Error.UnknownColumn;
+                        }
+                        return Error.UnsupportedFeature;
+                    };
                     const label = if (item.alias) |alias_ident| alias_ident.text() else column.name.text();
                     try projection_builder.append(allocator, .{
                         .group = .{
@@ -681,14 +739,38 @@ pub fn compile(allocator: std.mem.Allocator, stmt: *const ast.SelectStatement, o
     const projections = try projection_builder.toOwnedSlice(allocator);
     errdefer allocator.free(projections);
 
+    const filter_stage = if (stmt.selection) |expr|
+        plan.FilterStage{ .predicate = expr }
+    else
+        null;
+
+    const having_stage = if (stmt.having) |expr|
+        plan.HavingStage{ .predicate = expr }
+    else
+        null;
+
+    const project_stage = plan.ProjectStage{
+        .projections = projections,
+        .group_columns = group_columns,
+    };
+
+    const aggregate_stage = plan.GroupAggregateStage{
+        .aggregates = aggregates,
+    };
+
+    const physical_plan = plan.PhysicalPlan{
+        .filter = filter_stage,
+        .project = project_stage,
+        .group_aggregate = aggregate_stage,
+        .having = having_stage,
+        .window = null,
+        .route = null,
+    };
+
     const program = Program{
         .allocator = allocator,
-        .projection = projections,
-        .selection = stmt.selection,
-        .having = stmt.having,
+        .plan = physical_plan,
         .table_binding = table_binding,
-        .group_columns = group_columns,
-        .aggregates = aggregates,
         .groups = .{},
         .eviction = options.eviction,
     };
@@ -783,16 +865,16 @@ fn aggregateFunctionFromName(name: []const u8) ?AggregateFunction {
     return null;
 }
 
-fn findGroupColumnIndex(columns: []const GroupColumn, column: ast.ColumnRef) ?usize {
+fn findGroupColumnIndex(columns: []const GroupColumn, column: ast.ColumnRef, binding: ?TableBinding) ?usize {
     for (columns, 0..) |group_col, idx| {
-        if (columnsEquivalent(group_col.column, column)) return idx;
+        if (columnsEquivalent(group_col.column, column, binding)) return idx;
     }
     return null;
 }
 
-fn columnsEquivalent(a: ast.ColumnRef, b: ast.ColumnRef) bool {
+fn columnsEquivalent(a: ast.ColumnRef, b: ast.ColumnRef, binding: ?TableBinding) bool {
     if (!identifiersEqual(a.name, b.name)) return false;
-    return qualifiersEqual(a.table, b.table);
+    return qualifiersEqual(a.table, b.table, binding);
 }
 
 fn identifiersEqual(a: ast.Identifier, b: ast.Identifier) bool {
@@ -803,14 +885,62 @@ fn identifiersEqual(a: ast.Identifier, b: ast.Identifier) bool {
     return std.mem.eql(u8, a.canonical, b.canonical);
 }
 
-fn qualifiersEqual(a: ?ast.Identifier, b: ?ast.Identifier) bool {
+fn qualifiersEqual(a: ?ast.Identifier, b: ?ast.Identifier, binding: ?TableBinding) bool {
     if (a) |lhs| {
         if (b) |rhs| {
-            return identifiersEqual(lhs, rhs);
+            if (!identifiersEqual(lhs, rhs)) return false;
+            return qualifierAllowed(binding, lhs);
         }
-        return false;
+        // Allow qualified GROUP BY column to match unqualified reference when the qualifier is valid.
+        return qualifierAllowed(binding, lhs);
     }
-    return b == null;
+    if (b) |rhs| {
+        return qualifierAllowed(binding, rhs);
+    }
+    return true;
+}
+
+fn hashGroupValues(values: []const event_mod.Value) u64 {
+    var hasher = hash.Fnv1a_64.init();
+    for (values) |value| {
+        hashGroupValue(&hasher, value);
+    }
+    return hasher.final();
+}
+
+fn hashGroupValue(hasher: *hash.Fnv1a_64, value: event_mod.Value) void {
+    const tag = meta.activeTag(value);
+    const tag_byte: u8 = @intCast(@intFromEnum(tag));
+    hasher.update(&[_]u8{tag_byte});
+    switch (value) {
+        .string => |bytes| {
+            hasher.update(bytes);
+        },
+        .integer => |int_value| {
+            var buffer: [8]u8 = undefined;
+            std.mem.writeInt(i64, &buffer, int_value, .little);
+            hasher.update(&buffer);
+        },
+        .float => |float_value| {
+            const canonical = if (math.isNan(float_value))
+                math.nan(f64)
+            else if (float_value == 0.0)
+                0.0
+            else
+                float_value;
+            const bits: u64 = @bitCast(canonical);
+            var buffer: [8]u8 = undefined;
+            std.mem.writeInt(u64, &buffer, bits, .little);
+            hasher.update(&buffer);
+        },
+        .boolean => |flag| {
+            const byte: u8 = if (flag) 1 else 0;
+            hasher.update(&[_]u8{byte});
+        },
+        .null => {
+            hasher.update(&[_]u8{0xff});
+        },
+    }
 }
 
 fn evaluateAggregateArgument(
@@ -1151,6 +1281,8 @@ fn toFloat(value: event_mod.Value) Error!f64 {
 const OrderOp = enum { less, less_equal, greater, greater_equal };
 
 fn compareOrder(op: OrderOp, left: event_mod.Value, right: event_mod.Value) Error!bool {
+    if (left == .null or right == .null) return false;
+
     if (left == .string and right == .string) {
         const cmp = std.mem.order(u8, left.string, right.string);
         return switch (op) {
@@ -1158,6 +1290,17 @@ fn compareOrder(op: OrderOp, left: event_mod.Value, right: event_mod.Value) Erro
             .less_equal => cmp == .lt or cmp == .eq,
             .greater => cmp == .gt,
             .greater_equal => cmp == .gt or cmp == .eq,
+        };
+    }
+
+    if (left == .integer and right == .integer) {
+        const li = left.integer;
+        const ri = right.integer;
+        return switch (op) {
+            .less => li < ri,
+            .less_equal => li <= ri,
+            .greater => li > ri,
+            .greater_equal => li >= ri,
         };
     }
 
@@ -1181,7 +1324,10 @@ fn compareEqual(left: event_mod.Value, right: event_mod.Value) bool {
         },
         .float => |l| switch (right) {
             .integer => |r| return l == @as(f64, @floatFromInt(r)),
-            .float => |r| return l == r,
+            .float => |r| {
+                if (math.isNan(l) and math.isNan(r)) return true;
+                return l == r;
+            },
             else => return false,
         },
         .boolean => |l| switch (right) {
@@ -1391,6 +1537,159 @@ test "count per message with having filter" {
     try testing.expectEqual(@as(i64, 2), row2.values[1].value.integer);
 }
 
+test "having treats null aggregate as false" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try @import("parser.zig").parseSelect(arena,
+        \\SELECT message, SUM(value) AS total
+        \\FROM logs
+        \\GROUP BY message
+        \\HAVING SUM(value) > 0
+    );
+
+    var program = try compile(testing.allocator, stmt, .{});
+    defer program.deinit();
+
+    var null_event = try createValueEvent(testing.allocator, .{ .null = {} });
+    defer freeEvent(testing.allocator, null_event);
+    var value_event = try createValueEvent(testing.allocator, .{ .integer = 5 });
+    defer freeEvent(testing.allocator, value_event);
+
+    var clock: u64 = 1;
+
+    const maybe_row_null = try program.execute(testing.allocator, &null_event, nextTimestamp(&clock));
+    try testing.expect(maybe_row_null == null);
+    try testing.expectEqual(@as(usize, 1), program.groups.items.len);
+
+    const row = try program.execute(testing.allocator, &value_event, nextTimestamp(&clock)) orelse return testing.expect(false);
+    defer row.deinit();
+    try testing.expectEqual(@as(usize, 2), row.values.len);
+    try testing.expectEqualStrings("message", row.values[0].name);
+    try testing.expectEqualStrings("value_event", row.values[0].value.string);
+    try testing.expectEqual(@as(i64, 5), row.values[1].value.integer);
+}
+
+test "group by float treats negative zero as zero" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try @import("parser.zig").parseSelect(arena,
+        \\SELECT value, COUNT(*) AS total
+        \\FROM logs
+        \\GROUP BY value
+    );
+
+    var program = try compile(testing.allocator, stmt, .{});
+    defer program.deinit();
+
+    var zero_event = try createValueEvent(testing.allocator, .{ .float = 0.0 });
+    defer freeEvent(testing.allocator, zero_event);
+    var negative_zero_event = try createValueEvent(testing.allocator, .{ .float = -0.0 });
+    defer freeEvent(testing.allocator, negative_zero_event);
+
+    var clock: u64 = 1;
+
+    const first_row = try program.execute(testing.allocator, &zero_event, nextTimestamp(&clock)) orelse return testing.expect(false);
+    defer first_row.deinit();
+    try testing.expectEqual(@as(usize, 1), program.groups.items.len);
+    try testing.expectEqual(@as(usize, 2), first_row.values.len);
+    try testing.expect(first_row.values[0].value == .float);
+    try testing.expectEqual(@as(f64, 0.0), first_row.values[0].value.float);
+    try testing.expectEqual(@as(i64, 1), first_row.values[1].value.integer);
+
+    const second_row = try program.execute(testing.allocator, &negative_zero_event, nextTimestamp(&clock)) orelse return testing.expect(false);
+    defer second_row.deinit();
+    try testing.expectEqual(@as(usize, 1), program.groups.items.len);
+    try testing.expectEqual(@as(usize, 2), second_row.values.len);
+    try testing.expect(second_row.values[0].value == .float);
+    try testing.expectEqual(@as(f64, 0.0), second_row.values[0].value.float);
+    try testing.expectEqual(@as(i64, 2), second_row.values[1].value.integer);
+}
+
+test "group by float groups NaNs together" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try @import("parser.zig").parseSelect(arena,
+        \\SELECT value, COUNT(*) AS total
+        \\FROM logs
+        \\GROUP BY value
+    );
+
+    var program = try compile(testing.allocator, stmt, .{});
+    defer program.deinit();
+
+    var first_nan_event = try createValueEvent(testing.allocator, .{ .float = math.nan(f64) });
+    defer freeEvent(testing.allocator, first_nan_event);
+    var second_nan_event = try createValueEvent(testing.allocator, .{ .float = math.nan(f64) });
+    defer freeEvent(testing.allocator, second_nan_event);
+
+    var clock: u64 = 1;
+
+    const first_row = try program.execute(testing.allocator, &first_nan_event, nextTimestamp(&clock)) orelse return testing.expect(false);
+    defer first_row.deinit();
+    try testing.expectEqual(@as(usize, 1), program.groups.items.len);
+    try testing.expectEqual(@as(usize, 2), first_row.values.len);
+    try testing.expect(first_row.values[0].value == .float);
+    try testing.expect(math.isNan(first_row.values[0].value.float));
+    try testing.expectEqual(@as(i64, 1), first_row.values[1].value.integer);
+
+    const second_row = try program.execute(testing.allocator, &second_nan_event, nextTimestamp(&clock)) orelse return testing.expect(false);
+    defer second_row.deinit();
+    try testing.expectEqual(@as(usize, 1), program.groups.items.len);
+    try testing.expectEqual(@as(usize, 2), second_row.values.len);
+    try testing.expect(second_row.values[0].value == .float);
+    try testing.expect(math.isNan(second_row.values[0].value.float));
+    try testing.expectEqual(@as(i64, 2), second_row.values[1].value.integer);
+}
+
+test "enforces max groups when having filters rows" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try @import("parser.zig").parseSelect(arena,
+        \\SELECT message, COUNT(*) AS total
+        \\FROM logs
+        \\GROUP BY message
+        \\HAVING COUNT(*) > 1
+    );
+
+    var program = try compile(testing.allocator, stmt, .{
+        .eviction = .{
+            .ttl_ns = null,
+            .max_groups = 2,
+            .sweep_interval_ns = 0,
+        },
+    });
+    defer program.deinit();
+
+    var event_a = try testEvent(testing.allocator, "a", 1);
+    defer freeEvent(testing.allocator, event_a);
+    var event_b = try testEvent(testing.allocator, "b", 1);
+    defer freeEvent(testing.allocator, event_b);
+    var event_c = try testEvent(testing.allocator, "c", 1);
+    defer freeEvent(testing.allocator, event_c);
+
+    var clock: u64 = 1;
+
+    const maybe_row_a = try program.execute(testing.allocator, &event_a, nextTimestamp(&clock));
+    try testing.expect(maybe_row_a == null);
+    try testing.expectEqual(@as(usize, 1), program.groups.items.len);
+
+    const maybe_row_b = try program.execute(testing.allocator, &event_b, nextTimestamp(&clock));
+    try testing.expect(maybe_row_b == null);
+    try testing.expectEqual(@as(usize, 2), program.groups.items.len);
+
+    const maybe_row_c = try program.execute(testing.allocator, &event_c, nextTimestamp(&clock));
+    try testing.expect(maybe_row_c == null);
+    try testing.expectEqual(@as(usize, 2), program.groups.items.len);
+}
+
 test "sum integer field" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();
@@ -1538,6 +1837,75 @@ test "min and max update correctly" {
     defer row2.deinit();
     try testing.expectEqual(@as(i64, 1), row2.values[0].value.integer);
     try testing.expectEqual(@as(i64, 5), row2.values[1].value.integer);
+}
+
+test "min and max preserve precision for large integers" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try @import("parser.zig").parseSelect(arena,
+        \\SELECT MIN(syslog_severity) AS min_sev, MAX(syslog_severity) AS max_sev
+        \\FROM logs
+    );
+
+    const base: i64 = 9_007_199_254_740_992;
+    const larger = base + 1;
+
+    {
+        var program = try compile(testing.allocator, stmt, .{});
+        defer program.deinit();
+
+        var event_base = try testEvent(testing.allocator, "base", base);
+        defer freeEvent(testing.allocator, event_base);
+        var event_larger = try testEvent(testing.allocator, "larger", larger);
+        defer freeEvent(testing.allocator, event_larger);
+
+        var clock: u64 = 1;
+
+        const row1 = try program.execute(testing.allocator, &event_base, nextTimestamp(&clock)) orelse return testing.expect(false);
+        defer row1.deinit();
+        try testing.expectEqual(base, row1.values[0].value.integer);
+        try testing.expectEqual(base, row1.values[1].value.integer);
+
+        const row2 = try program.execute(testing.allocator, &event_larger, nextTimestamp(&clock)) orelse return testing.expect(false);
+        defer row2.deinit();
+        try testing.expectEqual(base, row2.values[0].value.integer);
+        try testing.expectEqual(larger, row2.values[1].value.integer);
+    }
+
+    {
+        var program = try compile(testing.allocator, stmt, .{});
+        defer program.deinit();
+
+        var event_larger = try testEvent(testing.allocator, "larger_first", larger);
+        defer freeEvent(testing.allocator, event_larger);
+        var event_base = try testEvent(testing.allocator, "base_second", base);
+        defer freeEvent(testing.allocator, event_base);
+
+        var clock: u64 = 1;
+
+        const row1 = try program.execute(testing.allocator, &event_larger, nextTimestamp(&clock)) orelse return testing.expect(false);
+        defer row1.deinit();
+        try testing.expectEqual(larger, row1.values[0].value.integer);
+        try testing.expectEqual(larger, row1.values[1].value.integer);
+
+        const row2 = try program.execute(testing.allocator, &event_base, nextTimestamp(&clock)) orelse return testing.expect(false);
+        defer row2.deinit();
+        try testing.expectEqual(base, row2.values[0].value.integer);
+        try testing.expectEqual(larger, row2.values[1].value.integer);
+    }
+}
+
+test "compareOrder preserves precision for large integers" {
+    const base: i64 = 9_007_199_254_740_992;
+    const larger = base + 1;
+
+    try testing.expect(try compareOrder(.less, .{ .integer = base }, .{ .integer = larger }));
+    try testing.expect(try compareOrder(.greater, .{ .integer = larger }, .{ .integer = base }));
+    try testing.expect(try compareOrder(.less_equal, .{ .integer = base }, .{ .integer = base }));
+    try testing.expect(try compareOrder(.greater_equal, .{ .integer = larger }, .{ .integer = larger }));
+    try testing.expect(!try compareOrder(.less, .{ .integer = larger }, .{ .integer = base }));
 }
 
 test "reject non aggregate projections" {
@@ -1747,6 +2115,37 @@ test "resolve qualified column reference" {
     try testing.expectEqual(@as(i64, 1), row.values[1].value.integer);
 }
 
+test "group by matches qualified alias" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try @import("parser.zig").parseSelect(arena,
+        \\SELECT message, COUNT(*) AS total
+        \\FROM logs AS l
+        \\GROUP BY l.message
+    );
+    var program = try compile(testing.allocator, stmt, .{});
+    defer program.deinit();
+
+    var event = try testEvent(testing.allocator, "hello", 4);
+    defer freeEvent(testing.allocator, event);
+
+    var clock: u64 = 1;
+
+    const maybe_row = try program.execute(testing.allocator, &event, nextTimestamp(&clock));
+    defer if (maybe_row) |row| row.deinit();
+
+    const row = maybe_row orelse return testing.expect(false);
+    try testing.expectEqual(@as(usize, 2), row.values.len);
+    try testing.expectEqualStrings("message", row.values[0].name);
+    try testing.expect(row.values[0].value == .string);
+    try testing.expectEqualStrings("hello", row.values[0].value.string);
+    try testing.expectEqualStrings("total", row.values[1].name);
+    try testing.expect(row.values[1].value == .integer);
+    try testing.expectEqual(@as(i64, 1), row.values[1].value.integer);
+}
+
 test "unknown table qualifier yields error" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();
@@ -1757,13 +2156,7 @@ test "unknown table qualifier yields error" {
         \\FROM logs
         \\GROUP BY foo.message
     );
-    var program = try compile(testing.allocator, stmt, .{});
-    defer program.deinit();
-
-    var event = try testEvent(testing.allocator, "hello", 4);
-    defer freeEvent(testing.allocator, event);
-
-    try testing.expectError(Error.UnknownColumn, program.execute(testing.allocator, &event, 1));
+    try testing.expectError(Error.UnknownColumn, compile(testing.allocator, stmt, .{}));
 }
 
 test "unknown star qualifier yields error" {

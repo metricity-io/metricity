@@ -573,18 +573,29 @@ fn handleTransformMessage(context: *TransformWorkerContext, message: EventMessag
     const runtime = context.runtime;
     const node_index = context.node_index;
 
-    const now_ns = MonotonicClock.now();
-    runtime.program_mutex.lock();
-    const produced = runtime.program.execute(
-        message.context.batchAllocator(),
-        message.event,
-        now_ns,
-    ) catch {
-        runtime.program_mutex.unlock();
+    var produced: ?sql_mod.runtime.Row = null;
+    var exec_failed = false;
+
+    exec_scope: {
+        runtime.program_mutex.lock();
+        defer runtime.program_mutex.unlock();
+
+        const now_ns = MonotonicClock.now();
+        produced = runtime.program.execute(
+            message.context.batchAllocator(),
+            message.event,
+            now_ns,
+        ) catch {
+            exec_failed = true;
+            produced = null;
+            break :exec_scope;
+        };
+    }
+
+    if (exec_failed) {
         message.context.releaseFailure();
         return;
-    };
-    runtime.program_mutex.unlock();
+    }
 
     if (produced) |row| {
         var owned_row = row;
@@ -963,10 +974,39 @@ const EventContext = struct {
 
 fn cloneRow(allocator: std.mem.Allocator, source: sql_mod.runtime.Row) !sql_mod.runtime.Row {
     var entries = try allocator.alloc(sql_mod.runtime.ValueEntry, source.values.len);
-    for (source.values, 0..) |value, idx| {
-        entries[idx] = value;
+    var copied: usize = 0;
+    var success = false;
+    errdefer {
+        if (!success) {
+            if (source.owns_strings) {
+                var idx = copied;
+                while (idx > 0) {
+                    idx -= 1;
+                    const entry = entries[idx];
+                    if (entry.value == .string) {
+                        allocator.free(entry.value.string);
+                    }
+                }
+            }
+            allocator.free(entries);
+        }
     }
-    return sql_mod.runtime.Row{ .allocator = allocator, .values = entries };
+
+    while (copied < source.values.len) : (copied += 1) {
+        var entry = source.values[copied];
+        if (source.owns_strings and entry.value == .string) {
+            const buffer = try copyBytes(allocator, entry.value.string);
+            entry.value = .{ .string = buffer };
+        }
+        entries[copied] = entry;
+    }
+
+    success = true;
+    return sql_mod.runtime.Row{
+        .allocator = allocator,
+        .values = entries,
+        .owns_strings = source.owns_strings,
+    };
 }
 
 fn copyBytes(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
@@ -1118,6 +1158,35 @@ test "rowToEvent clones row data" {
     try testing.expectEqualStrings("custom", payload.fields[0].name);
     try testing.expect(payload.fields[0].value == .string);
     try testing.expectEqualStrings("payload", payload.fields[0].value.string);
+}
+
+test "cloneRow deep copies string values" {
+    const allocator = testing.allocator;
+
+    var entries = try allocator.alloc(sql_mod.runtime.ValueEntry, 1);
+    entries[0] = .{ .name = "message", .value = .{ .string = try copyBytes(allocator, "hello") } };
+
+    var original = sql_mod.runtime.Row{
+        .allocator = allocator,
+        .values = entries,
+        .owns_strings = true,
+    };
+    var original_deinited = false;
+    defer if (!original_deinited) original.deinit();
+
+    const original_ptr = original.values[0].value.string.ptr;
+
+    var clone = try cloneRow(allocator, original);
+    defer clone.deinit();
+
+    try testing.expect(clone.owns_strings);
+    try testing.expect(clone.values[0].value == .string);
+    try testing.expect(clone.values[0].value.string.ptr != original_ptr);
+
+    original.deinit();
+    original_deinited = true;
+
+    try testing.expectEqualStrings("hello", clone.values[0].value.string);
 }
 
 fn defaultSinkBuilder(allocator: std.mem.Allocator, node: config_mod.SinkNode) sink_mod.Error!sink_mod.Sink {
