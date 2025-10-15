@@ -93,6 +93,14 @@ const AggregateState = union(enum) {
     }
 };
 
+const AggregateJournalEntry = struct {
+    index: usize,
+    function: AggregateFunction,
+    previous: AggregateState,
+};
+
+const AggregateJournal = std.ArrayListUnmanaged(AggregateJournalEntry);
+
 const GroupState = struct {
     key_values: []event_mod.Value,
     aggregates: []AggregateState,
@@ -604,46 +612,97 @@ const Transaction = struct {
     program: *Program,
     group_index: usize,
     created: bool,
-    snapshot: []AggregateState,
+    journal_start: usize,
     active: bool = true,
 
-    fn init(program: *Program, group_index: usize, created: bool, snapshot: []AggregateState) Transaction {
+    fn init(program: *Program, group_index: usize, created: bool) Transaction {
         return Transaction{
             .program = program,
             .group_index = group_index,
             .created = created,
-            .snapshot = snapshot,
+            .journal_start = program.aggregate_journal.items.len,
             .active = true,
         };
     }
 
     fn commit(self: *Transaction, now_ns: u64) void {
         if (!self.active) return;
+
         const entry = self.program.group_store.getEntry(self.group_index);
-        if (self.created) {
-            entry.state.last_seen_ns = now_ns;
-        } else {
-            self.program.replaceGroupAggregates(self.group_index, self.snapshot);
-            entry.state.last_seen_ns = now_ns;
-            self.snapshot = &.{};
+        entry.state.last_seen_ns = now_ns;
+
+        const journal_slice = self.program.aggregate_journal.items[self.journal_start..self.program.aggregate_journal.items.len];
+        for (journal_slice) |journal_record| {
+            switch (journal_record.function) {
+                .min => {
+                    const snapshot = journal_record.previous.min;
+                    if (snapshot.has_value) {
+                        freeOwnedValue(self.program.allocator, snapshot.value);
+                    }
+                },
+                .max => {
+                    const snapshot = journal_record.previous.max;
+                    if (snapshot.has_value) {
+                        freeOwnedValue(self.program.allocator, snapshot.value);
+                    }
+                },
+                else => {},
+            }
         }
+
+        self.program.aggregate_journal.items.len = self.journal_start;
         self.active = false;
     }
 
     fn rollback(self: *Transaction) void {
         if (!self.active) return;
+
+        const journal = self.program.aggregate_journal.items[self.journal_start..self.program.aggregate_journal.items.len];
         if (self.created) {
             self.program.group_store.remove(self.group_index);
         } else {
-            self.program.destroyAggregateStateSlice(self.snapshot);
-            self.snapshot = &.{};
+            var idx: usize = journal.len;
+            const entry = self.program.group_store.getEntry(self.group_index);
+            while (idx > 0) {
+                idx -= 1;
+                const journal_entry = journal[idx];
+                const state = &entry.state.aggregates[journal_entry.index];
+                switch (journal_entry.function) {
+                    .count => state.count = journal_entry.previous.count,
+                    .sum => state.sum = journal_entry.previous.sum,
+                    .avg => state.avg = journal_entry.previous.avg,
+                    .min => {
+                        if (state.min.has_value) {
+                            freeOwnedValue(self.program.allocator, state.min.value);
+                        }
+                        state.min = journal_entry.previous.min;
+                    },
+                    .max => {
+                        if (state.max.has_value) {
+                            freeOwnedValue(self.program.allocator, state.max.value);
+                        }
+                        state.max = journal_entry.previous.max;
+                    },
+                }
+            }
         }
+
+        self.program.aggregate_journal.items.len = self.journal_start;
         self.active = false;
     }
 
     fn release(self: *Transaction) void {
         if (!self.active) return;
         self.rollback();
+    }
+
+    fn record(self: *Transaction, function: AggregateFunction, index: usize, state: *const AggregateState) void {
+        if (!self.active) return;
+        self.program.aggregate_journal.appendAssumeCapacity(.{
+            .index = index,
+            .function = function,
+            .previous = state.*,
+        });
     }
 };
 
@@ -669,6 +728,7 @@ pub const Program = struct {
     having_program: ?expr_ir.Program = null,
     aggregate_argument_programs: []?expr_ir.Program = &.{},
     group_key_bindings: []expr_ir.EventBinding = &.{},
+    aggregate_journal: AggregateJournal = .{},
 
     /// Releases memory allocated for the program metadata and accumulated state.
     pub fn deinit(self: *Program) void {
@@ -692,6 +752,10 @@ pub const Program = struct {
             self.allocator.free(self.group_key_bindings);
         }
 
+        if (self.aggregate_journal.capacity != 0) {
+            self.aggregate_journal.deinit(self.allocator);
+        }
+
         self.allocator.free(self.plan.project.projections);
         self.allocator.free(self.plan.project.group_columns);
         self.allocator.free(self.plan.group_aggregate.aggregates);
@@ -700,6 +764,7 @@ pub const Program = struct {
     /// Clears accumulated aggregation state, preserving compiled metadata.
     pub fn reset(self: *Program) void {
         self.group_store.clear();
+        self.aggregate_journal.items.len = 0;
     }
 
     /// Evaluates the program against a single event, returning an optional row.
@@ -732,35 +797,18 @@ pub const Program = struct {
         var entry = acquisition.entry;
         var group_ptr = &entry.state;
 
-        var cloned_states: []AggregateState = &.{};
-        if (!acquisition.created and group_ptr.aggregates.len != 0) {
-            cloned_states = try self.cloneAggregateStates(group_ptr.aggregates);
-        }
-
-        var txn = Transaction.init(self, acquisition.index, acquisition.created, cloned_states);
+        var txn = Transaction.init(self, acquisition.index, acquisition.created);
         defer txn.release();
 
-        var working_group_storage = GroupState{
-            .key_values = group_ptr.key_values,
-            .aggregates = if (acquisition.created) group_ptr.aggregates else cloned_states,
-            .last_seen_ns = group_ptr.last_seen_ns,
-            .key_hash = group_ptr.key_hash,
-        };
-        const working_group: *GroupState = if (acquisition.created)
-            group_ptr
-        else
-            &working_group_storage;
-
-        try self.updateAggregates(working_group, event);
-        working_group.last_seen_ns = now_ns;
+        try self.updateAggregates(&txn, group_ptr, event);
 
         if (self.having_program) |*program| {
             var aggregate_ctx = AggregateAccessorContext{
                 .program = self,
-                .group = working_group,
+                .group = group_ptr,
             };
             const exec_ctx = expr_ir.ExecutionContext{
-                .group_values = working_group.key_values,
+                .group_values = group_ptr.key_values,
                 .aggregate_accessor = expr_ir.AggregateAccessor{
                     .context = @ptrCast(@constCast(&aggregate_ctx)),
                     .load_fn = loadAggregateValue,
@@ -935,16 +983,16 @@ pub const Program = struct {
         entry.state.key_hash = hash_value;
     }
 
-    fn updateAggregates(self: *Program, group: *GroupState, event: *const event_mod.Event) Error!void {
+    fn updateAggregates(self: *Program, txn: *Transaction, group: *GroupState, event: *const event_mod.Event) Error!void {
         for (self.plan.group_aggregate.aggregates, 0..) |spec, idx| {
             const input = try self.evaluateAggregateArgument(idx, spec, event);
-            var state = &group.aggregates[idx];
+            const state = &group.aggregates[idx];
             switch (spec.function) {
-                .count => try updateCountState(&state.count, spec, input),
-                .sum => try updateSumState(&state.sum, spec, input),
-                .avg => try updateAvgState(&state.avg, spec, input),
-                .min => try updateMinMaxState(&state.min, self.allocator, spec, input, .min),
-                .max => try updateMinMaxState(&state.max, self.allocator, spec, input, .max),
+                .count => try updateCountState(txn, idx, state, spec, input),
+                .sum => try updateSumState(txn, idx, state, spec, input),
+                .avg => try updateAvgState(txn, idx, state, input),
+                .min => try updateMinMaxState(txn, idx, state, self.allocator, input, .min),
+                .max => try updateMinMaxState(txn, idx, state, self.allocator, input, .max),
             }
         }
     }
@@ -996,57 +1044,12 @@ pub const Program = struct {
         };
     }
 
-
     fn destroyAggregateStateSlice(self: *Program, states: []AggregateState) void {
         if (states.len == 0) return;
         for (states) |*agg| {
             agg.deinit(self.allocator);
         }
         self.allocator.free(states);
-    }
-
-    fn replaceGroupAggregates(self: *Program, index: usize, new_states: []AggregateState) void {
-        const entry = self.group_store.getEntry(index);
-        self.destroyAggregateStateSlice(entry.state.aggregates);
-        entry.state.aggregates = new_states;
-    }
-
-    fn cloneAggregateStates(self: *Program, states: []AggregateState) Error![]AggregateState {
-        if (states.len == 0) return &.{};
-        var clones = try self.allocator.alloc(AggregateState, states.len);
-        var produced: usize = 0;
-        errdefer {
-            while (produced > 0) {
-                produced -= 1;
-                clones[produced].deinit(self.allocator);
-            }
-            self.allocator.free(clones);
-        }
-        for (states, 0..) |*state, idx| {
-            clones[idx] = try self.cloneAggregateState(state);
-            produced += 1;
-        }
-        return clones;
-    }
-
-    fn cloneAggregateState(self: *Program, state: *const AggregateState) Error!AggregateState {
-        return switch (state.*) {
-            .count => |value| AggregateState{ .count = value },
-            .sum => |value| AggregateState{ .sum = value },
-            .avg => |value| AggregateState{ .avg = value },
-            .min => |value| AggregateState{ .min = try self.cloneMinMaxState(value) },
-            .max => |value| AggregateState{ .max = try self.cloneMinMaxState(value) },
-        };
-    }
-
-    fn cloneMinMaxState(self: *Program, state: MinMaxState) Error!MinMaxState {
-        if (!state.has_value) {
-            return MinMaxState{ .value = .{ .null = {} }, .has_value = false };
-        }
-        return MinMaxState{
-            .value = try copyValueOwned(self.allocator, state.value),
-            .has_value = true,
-        };
     }
 };
 
@@ -1279,7 +1282,7 @@ pub fn compile(allocator: std.mem.Allocator, stmt: *const ast.SelectStatement, o
     });
     errdefer store.deinit();
 
-    return Program{
+    var program = Program{
         .allocator = allocator,
         .plan = physical_plan,
         .table_binding = table_binding,
@@ -1290,6 +1293,12 @@ pub fn compile(allocator: std.mem.Allocator, stmt: *const ast.SelectStatement, o
         .aggregate_argument_programs = aggregate_argument_programs,
         .group_key_bindings = group_key_bindings,
     };
+
+    if (aggregate_stage.aggregates.len != 0) {
+        try program.aggregate_journal.ensureTotalCapacity(allocator, aggregate_stage.aggregates.len);
+    }
+
+    return program;
 }
 
 const AggregateCallInfo = struct {
@@ -1477,101 +1486,171 @@ const AggregateInput = union(enum) {
     skip,
 };
 
-fn updateCountState(state: *CountState, spec: AggregateSpec, input: AggregateInput) Error!void {
-    _ = spec;
-    switch (input) {
-        .count_all, .value => {
-            if (state.total == math.maxInt(u64)) return Error.ArithmeticOverflow;
-            state.total += 1;
-        },
-        .skip => {},
-    }
-}
-
-fn updateSumState(state: *SumState, spec: AggregateSpec, input: AggregateInput) Error!void {
-    _ = spec;
-    switch (input) {
-        .skip => return,
-        .count_all => unreachable,
-        .value => |value| {
-            switch (value) {
-                .integer => |int_value| {
-                    if (!state.has_value) {
-                        state.has_value = true;
-                        state.kind = .integer;
-                        state.integer_total = int_value;
-                        return;
-                    }
-                    switch (state.kind) {
-                        .integer => {
-                            const ov = @addWithOverflow(state.integer_total, int_value);
-                            if (ov[1] != 0) return Error.ArithmeticOverflow;
-                            state.integer_total = ov[0];
-                        },
-                        .float => {
-                            state.float_total += @as(f64, @floatFromInt(int_value));
-                        },
-                    }
-                },
-                .float => |float_value| {
-                    if (!state.has_value) {
-                        state.has_value = true;
-                        state.kind = .float;
-                        state.float_total = float_value;
-                        return;
-                    }
-                    switch (state.kind) {
-                        .integer => {
-                            state.kind = .float;
-                            state.float_total = @as(f64, @floatFromInt(state.integer_total)) + float_value;
-                        },
-                        .float => state.float_total += float_value,
-                    }
-                },
-                else => return Error.TypeMismatch,
-            }
-        },
-    }
-}
-
-fn updateAvgState(state: *AvgState, spec: AggregateSpec, input: AggregateInput) Error!void {
-    switch (input) {
-        .skip => return,
-        .count_all => unreachable,
-        .value => |value| {
-            try updateSumState(&state.sum, spec, AggregateInput{ .value = value });
-            if (state.count == math.maxInt(u64)) return Error.ArithmeticOverflow;
-            state.count += 1;
-        },
-    }
-}
-
-fn updateMinMaxState(
-    state: *MinMaxState,
-    allocator: std.mem.Allocator,
+fn updateCountState(
+    txn: *Transaction,
+    index: usize,
+    state: *AggregateState,
     spec: AggregateSpec,
     input: AggregateInput,
-    mode: enum { min, max },
+) Error!void {
+    _ = spec;
+    switch (input) {
+        .skip => {},
+        .count_all, .value => {
+            var count_state = &state.count;
+            if (count_state.total == math.maxInt(u64)) return Error.ArithmeticOverflow;
+            txn.record(.count, index, state);
+            count_state.total += 1;
+        },
+    }
+}
+
+fn updateSumState(
+    txn: *Transaction,
+    index: usize,
+    state: *AggregateState,
+    spec: AggregateSpec,
+    input: AggregateInput,
 ) Error!void {
     _ = spec;
     switch (input) {
         .skip => return,
         .count_all => unreachable,
+        .value => |value| switch (value) {
+            .integer => |int_value| {
+                txn.record(.sum, index, state);
+                var sum_state = &state.sum;
+                if (!sum_state.has_value) {
+                    sum_state.has_value = true;
+                    sum_state.kind = .integer;
+                    sum_state.integer_total = int_value;
+                    return;
+                }
+                switch (sum_state.kind) {
+                    .integer => {
+                        const ov = @addWithOverflow(sum_state.integer_total, int_value);
+                        if (ov[1] != 0) return Error.ArithmeticOverflow;
+                        sum_state.integer_total = ov[0];
+                    },
+                    .float => sum_state.float_total += @as(f64, @floatFromInt(int_value)),
+                }
+            },
+            .float => |float_value| {
+                txn.record(.sum, index, state);
+                var sum_state = &state.sum;
+                if (!sum_state.has_value) {
+                    sum_state.has_value = true;
+                    sum_state.kind = .float;
+                    sum_state.float_total = float_value;
+                    return;
+                }
+                switch (sum_state.kind) {
+                    .integer => {
+                        sum_state.kind = .float;
+                        sum_state.float_total = @as(f64, @floatFromInt(sum_state.integer_total)) + float_value;
+                    },
+                    .float => sum_state.float_total += float_value,
+                }
+            },
+            else => return Error.TypeMismatch,
+        },
+    }
+}
+
+fn updateAvgState(
+    txn: *Transaction,
+    index: usize,
+    state: *AggregateState,
+    input: AggregateInput,
+) Error!void {
+    switch (input) {
+        .skip => return,
+        .count_all => unreachable,
         .value => |value| {
-            if (!state.has_value) {
-                state.value = try copyValueOwned(allocator, value);
-                state.has_value = true;
+            switch (value) {
+                .integer, .float => {},
+                else => return Error.TypeMismatch,
+            }
+
+            txn.record(.avg, index, state);
+
+            var avg_state = &state.avg;
+            switch (value) {
+                .integer => |int_value| {
+                    if (!avg_state.sum.has_value) {
+                        avg_state.sum.has_value = true;
+                        avg_state.sum.kind = .integer;
+                        avg_state.sum.integer_total = int_value;
+                    } else switch (avg_state.sum.kind) {
+                        .integer => {
+                            const ov = @addWithOverflow(avg_state.sum.integer_total, int_value);
+                            if (ov[1] != 0) return Error.ArithmeticOverflow;
+                            avg_state.sum.integer_total = ov[0];
+                        },
+                        .float => avg_state.sum.float_total += @as(f64, @floatFromInt(int_value)),
+                    }
+                },
+                .float => |float_value| {
+                    if (!avg_state.sum.has_value) {
+                        avg_state.sum.has_value = true;
+                        avg_state.sum.kind = .float;
+                        avg_state.sum.float_total = float_value;
+                    } else switch (avg_state.sum.kind) {
+                        .integer => {
+                            avg_state.sum.kind = .float;
+                            avg_state.sum.float_total = @as(f64, @floatFromInt(avg_state.sum.integer_total)) + float_value;
+                        },
+                        .float => avg_state.sum.float_total += float_value,
+                    }
+                },
+                else => unreachable,
+            }
+
+            if (avg_state.count == math.maxInt(u64)) return Error.ArithmeticOverflow;
+            avg_state.count += 1;
+        },
+    }
+}
+
+fn updateMinMaxState(
+    txn: *Transaction,
+    index: usize,
+    state: *AggregateState,
+    allocator: std.mem.Allocator,
+    input: AggregateInput,
+    mode: enum { min, max },
+) Error!void {
+    switch (input) {
+        .skip => return,
+        .count_all => unreachable,
+        .value => |value| {
+            const function = switch (mode) {
+                .min => AggregateFunction.min,
+                .max => AggregateFunction.max,
+            };
+            var target = switch (mode) {
+                .min => &state.min,
+                .max => &state.max,
+            };
+
+            if (!target.has_value) {
+                const new_value = try copyValueOwned(allocator, value);
+                txn.record(function, index, state);
+                target.value = new_value;
+                target.has_value = true;
                 return;
             }
+
             const should_replace = switch (mode) {
-                .min => try compareOrder(.greater, state.value, value),
-                .max => try compareOrder(.less, state.value, value),
+                .min => try compareOrder(.greater, target.value, value),
+                .max => try compareOrder(.less, target.value, value),
             };
-            if (should_replace) {
-                freeOwnedValue(allocator, state.value);
-                state.value = try copyValueOwned(allocator, value);
-                state.has_value = true;
-            }
+            if (!should_replace) return;
+
+            const new_value = try copyValueOwned(allocator, value);
+            txn.record(function, index, state);
+            target.value = new_value;
+            target.has_value = true;
         },
     }
 }
@@ -2449,7 +2528,7 @@ test "group store releases interned strings on eviction" {
     defer store.deinit();
 
     const key_a_bytes = "alpha";
-    const values_a = [_]event_mod.Value{ event_mod.Value{ .string = key_a_bytes } };
+    const values_a = [_]event_mod.Value{event_mod.Value{ .string = key_a_bytes }};
     const encoded_a = try encodeGroupValues(&store, testing.allocator, &values_a);
     defer if (encoded_a.len != 0) testing.allocator.free(encoded_a);
     const hash_a = hash.XxHash3.hash(0, encoded_a);
@@ -2457,7 +2536,7 @@ test "group store releases interned strings on eviction" {
     try testing.expect(acquisition_a.created);
 
     const key_b_bytes = "beta";
-    const values_b = [_]event_mod.Value{ event_mod.Value{ .string = key_b_bytes } };
+    const values_b = [_]event_mod.Value{event_mod.Value{ .string = key_b_bytes }};
     const encoded_b = try encodeGroupValues(&store, testing.allocator, &values_b);
     defer if (encoded_b.len != 0) testing.allocator.free(encoded_b);
     const hash_b = hash.XxHash3.hash(0, encoded_b);
