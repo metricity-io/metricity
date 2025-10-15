@@ -3,6 +3,7 @@ const ast = @import("ast.zig");
 const source_mod = @import("source");
 const plan = @import("plan.zig");
 const event_mod = source_mod.event;
+const expr_ir = @import("expr_ir.zig");
 
 const ascii = std.ascii;
 const math = std.math;
@@ -664,10 +665,32 @@ pub const Program = struct {
     table_binding: ?TableBinding,
     group_store: GroupStore,
     eviction: EvictionConfig,
+    filter_program: ?expr_ir.Program = null,
+    having_program: ?expr_ir.Program = null,
+    aggregate_argument_programs: []?expr_ir.Program = &.{},
+    group_key_bindings: []expr_ir.EventBinding = &.{},
 
     /// Releases memory allocated for the program metadata and accumulated state.
     pub fn deinit(self: *Program) void {
         self.group_store.deinit();
+
+        if (self.filter_program) |program| {
+            program.deinit(self.allocator);
+        }
+        if (self.having_program) |program| {
+            program.deinit(self.allocator);
+        }
+        for (self.aggregate_argument_programs) |maybe_program| {
+            if (maybe_program) |program| {
+                program.deinit(self.allocator);
+            }
+        }
+        if (self.aggregate_argument_programs.len != 0) {
+            self.allocator.free(self.aggregate_argument_programs);
+        }
+        if (self.group_key_bindings.len != 0) {
+            self.allocator.free(self.group_key_bindings);
+        }
 
         self.allocator.free(self.plan.project.projections);
         self.allocator.free(self.plan.project.group_columns);
@@ -687,16 +710,22 @@ pub const Program = struct {
         event: *const event_mod.Event,
         now_ns: u64,
     ) Error!?Row {
-        const binding = self.table_binding;
-
         self.group_store.maybeSweep(now_ns);
 
-        if (self.plan.filter) |filter_stage| {
-            const predicate = try evaluateBoolean(filter_stage.predicate, event, binding);
+        var event_accessor_ctx = EventAccessorContext{ .event = event };
+
+        if (self.filter_program) |*program| {
+            const exec_ctx = expr_ir.ExecutionContext{
+                .event_accessor = expr_ir.EventAccessor{
+                    .context = @ptrCast(@constCast(&event_accessor_ctx)),
+                    .load_fn = loadEventValue,
+                },
+            };
+            const predicate = try self.executePredicateProgram(program, exec_ctx, false);
             if (!predicate) return null;
         }
 
-        var projected_keys = try self.runProjectStage(allocator, event, binding);
+        var projected_keys = try self.runProjectStage(allocator, event);
         defer projected_keys.deinit();
 
         const acquisition = try self.runGroupAggregateStage(&projected_keys, now_ns);
@@ -722,11 +751,22 @@ pub const Program = struct {
         else
             &working_group_storage;
 
-        try self.updateAggregates(working_group, event, binding);
+        try self.updateAggregates(working_group, event);
         working_group.last_seen_ns = now_ns;
 
-        if (self.plan.having) |having_stage| {
-            const keep = try self.evaluateHaving(having_stage.predicate, working_group);
+        if (self.having_program) |*program| {
+            var aggregate_ctx = AggregateAccessorContext{
+                .program = self,
+                .group = working_group,
+            };
+            const exec_ctx = expr_ir.ExecutionContext{
+                .group_values = working_group.key_values,
+                .aggregate_accessor = expr_ir.AggregateAccessor{
+                    .context = @ptrCast(@constCast(&aggregate_ctx)),
+                    .load_fn = loadAggregateValue,
+                },
+            };
+            const keep = try self.executePredicateProgram(program, exec_ctx, true);
             if (!keep) {
                 txn.commit(now_ns);
                 return null;
@@ -780,7 +820,7 @@ pub const Program = struct {
         return row;
     }
 
-    fn runProjectStage(self: *Program, allocator: std.mem.Allocator, event: *const event_mod.Event, binding: ?TableBinding) Error!ProjectedKeys {
+    fn runProjectStage(self: *Program, allocator: std.mem.Allocator, event: *const event_mod.Event) Error!ProjectedKeys {
         const group_columns = self.plan.project.group_columns;
         if (group_columns.len == 0) {
             return ProjectedKeys.empty(allocator);
@@ -790,8 +830,10 @@ pub const Program = struct {
         var ok = false;
         errdefer if (!ok) allocator.free(values);
 
-        for (group_columns, 0..) |group_col, idx| {
-            values[idx] = try resolveColumn(event, group_col.column, binding);
+        var event_ctx = EventAccessorContext{ .event = event };
+        const context_ptr = @as(*anyopaque, @ptrCast(@constCast(&event_ctx)));
+        for (self.group_key_bindings, 0..) |binding_desc, idx| {
+            values[idx] = try loadEventValue(context_ptr, binding_desc);
         }
 
         ok = true;
@@ -893,9 +935,9 @@ pub const Program = struct {
         entry.state.key_hash = hash_value;
     }
 
-    fn updateAggregates(self: *Program, group: *GroupState, event: *const event_mod.Event, binding: ?TableBinding) Error!void {
+    fn updateAggregates(self: *Program, group: *GroupState, event: *const event_mod.Event) Error!void {
         for (self.plan.group_aggregate.aggregates, 0..) |spec, idx| {
-            const input = try evaluateAggregateArgument(spec, event, binding);
+            const input = try self.evaluateAggregateArgument(idx, spec, event);
             var state = &group.aggregates[idx];
             switch (spec.function) {
                 .count => try updateCountState(&state.count, spec, input),
@@ -907,52 +949,53 @@ pub const Program = struct {
         }
     }
 
-    fn evaluateHaving(self: *Program, expr: *const ast.Expression, group: *const GroupState) Error!bool {
-        const value = try self.evaluateAggregateExpression(expr, group);
+    fn executePredicateProgram(
+        self: *Program,
+        program: *const expr_ir.Program,
+        exec_context: expr_ir.ExecutionContext,
+        treat_null_as_false: bool,
+    ) Error!bool {
+        _ = self;
+        const value = try expr_ir.execute(program, exec_context);
         return switch (value) {
             .boolean => |b| b,
-            .null => false,
+            .null => if (treat_null_as_false) false else Error.TypeMismatch,
             else => Error.TypeMismatch,
         };
     }
 
-    fn evaluateAggregateExpression(self: *Program, expr: *const ast.Expression, group: *const GroupState) Error!event_mod.Value {
-        return switch (expr.*) {
-            .literal => |lit| valueFromLiteral(lit),
-            .column => |col| self.resolveGroupColumn(group, col),
-            .unary => |un| {
-                const operand = try self.evaluateAggregateExpression(un.operand, group);
-                return applyUnary(un.op, operand);
+    fn evaluateAggregateArgument(
+        self: *Program,
+        index: usize,
+        spec: AggregateSpec,
+        event: *const event_mod.Event,
+    ) Error!AggregateInput {
+        return switch (spec.argument) {
+            .star => AggregateInput.count_all,
+            .expression => {
+                if (index >= self.aggregate_argument_programs.len) return Error.UnsupportedFeature;
+                if (self.aggregate_argument_programs[index]) |*program| {
+                    var event_ctx = EventAccessorContext{ .event = event };
+                    const exec_ctx = expr_ir.ExecutionContext{
+                        .event_accessor = expr_ir.EventAccessor{
+                            .context = @ptrCast(@constCast(&event_ctx)),
+                            .load_fn = loadEventValue,
+                        },
+                    };
+                    const value = try expr_ir.execute(program, exec_ctx);
+                    if (value == .null and spec.function != .count) {
+                        return AggregateInput.skip;
+                    }
+                    if (spec.function == .count and value == .null) {
+                        return AggregateInput.skip;
+                    }
+                    return AggregateInput{ .value = value };
+                }
+                return Error.UnsupportedFeature;
             },
-            .binary => |bin| {
-                const left = try self.evaluateAggregateExpression(bin.left, group);
-                const right = try self.evaluateAggregateExpression(bin.right, group);
-                return applyBinary(bin.op, left, right);
-            },
-            .function_call => |*call| {
-                const index = self.aggregateIndexForCall(call) orelse return Error.UnsupportedFunction;
-                const spec = &self.plan.group_aggregate.aggregates[index];
-                return aggregateResultValue(&group.aggregates[index], spec);
-            },
-            .star => Error.UnsupportedFeature,
         };
     }
 
-    fn resolveGroupColumn(self: *Program, group: *const GroupState, col: ast.ColumnRef) Error!event_mod.Value {
-        for (self.plan.project.group_columns, 0..) |group_col, idx| {
-            if (columnsEquivalent(group_col.column, col, self.table_binding)) {
-                return group.key_values[idx];
-            }
-        }
-        return Error.UnknownColumn;
-    }
-
-    fn aggregateIndexForCall(self: *Program, call: *const ast.FunctionCall) ?usize {
-        for (self.plan.group_aggregate.aggregates, 0..) |spec, idx| {
-            if (spec.call == call) return idx;
-        }
-        return null;
-    }
 
     fn destroyAggregateStateSlice(self: *Program, states: []AggregateState) void {
         if (states.len == 0) return;
@@ -1131,6 +1174,95 @@ pub fn compile(allocator: std.mem.Allocator, stmt: *const ast.SelectStatement, o
         .aggregates = aggregates,
     };
 
+    var filter_program_opt: ?expr_ir.Program = null;
+    var having_program_opt: ?expr_ir.Program = null;
+    var aggregate_argument_programs: []?expr_ir.Program = &.{};
+    var group_key_bindings: []expr_ir.EventBinding = &.{};
+    errdefer {
+        if (filter_program_opt) |program| program.deinit(allocator);
+        if (having_program_opt) |program| program.deinit(allocator);
+        if (aggregate_argument_programs.len != 0) {
+            for (aggregate_argument_programs) |maybe_program| {
+                if (maybe_program) |program| program.deinit(allocator);
+            }
+            allocator.free(aggregate_argument_programs);
+        }
+        if (group_key_bindings.len != 0) {
+            allocator.free(group_key_bindings);
+        }
+    }
+
+    if (group_columns.len != 0) {
+        group_key_bindings = try allocator.alloc(expr_ir.EventBinding, group_columns.len);
+        var event_ctx = EventResolverContext{ .table_binding = table_binding };
+        const context_ptr = @as(*anyopaque, @ptrCast(@constCast(&event_ctx)));
+        for (group_columns, 0..) |group_col, idx| {
+            group_key_bindings[idx] = try resolveEventBinding(context_ptr, group_col.column);
+        }
+    }
+
+    if (filter_stage) |stage| {
+        var event_ctx = EventResolverContext{ .table_binding = table_binding };
+        const env = expr_ir.Environment{
+            .event_resolver = expr_ir.EventResolver{
+                .context = @ptrCast(@constCast(&event_ctx)),
+                .resolve_fn = resolveEventBinding,
+            },
+        };
+        const filter_options = expr_ir.CompileOptions{
+            .allow_event_columns = true,
+            .expect_boolean_result = true,
+        };
+        filter_program_opt = try expr_ir.compileExpression(allocator, stage.predicate, filter_options, env);
+    }
+
+    if (having_stage) |stage| {
+        var group_ctx = GroupResolverContext{
+            .columns = group_columns,
+            .table_binding = table_binding,
+        };
+        var aggregate_ctx = AggregateResolverContext{
+            .specs = aggregates,
+        };
+        const env = expr_ir.Environment{
+            .group_resolver = expr_ir.GroupResolver{
+                .context = @ptrCast(@constCast(&group_ctx)),
+                .resolve_fn = resolveGroupBinding,
+            },
+            .aggregate_resolver = expr_ir.AggregateResolver{
+                .context = @ptrCast(@constCast(&aggregate_ctx)),
+                .resolve_fn = resolveAggregateBinding,
+            },
+        };
+        const having_options = expr_ir.CompileOptions{
+            .allow_group_columns = true,
+            .allow_aggregate_refs = true,
+            .expect_boolean_result = true,
+        };
+        having_program_opt = try expr_ir.compileExpression(allocator, stage.predicate, having_options, env);
+    }
+
+    if (aggregates.len != 0) {
+        aggregate_argument_programs = try allocator.alloc(?expr_ir.Program, aggregates.len);
+        for (aggregate_argument_programs, 0..) |*slot, idx| {
+            slot.* = null;
+            const spec = aggregates[idx];
+            if (spec.argument == .expression) {
+                var event_ctx = EventResolverContext{ .table_binding = table_binding };
+                const env = expr_ir.Environment{
+                    .event_resolver = expr_ir.EventResolver{
+                        .context = @ptrCast(@constCast(&event_ctx)),
+                        .resolve_fn = resolveEventBinding,
+                    },
+                };
+                const argument_options = expr_ir.CompileOptions{
+                    .allow_event_columns = true,
+                };
+                slot.* = try expr_ir.compileExpression(allocator, spec.argument.expression, argument_options, env);
+            }
+        }
+    }
+
     const physical_plan = plan.PhysicalPlan{
         .filter = filter_stage,
         .project = project_stage,
@@ -1153,6 +1285,10 @@ pub fn compile(allocator: std.mem.Allocator, stmt: *const ast.SelectStatement, o
         .table_binding = table_binding,
         .group_store = store,
         .eviction = options.eviction,
+        .filter_program = filter_program_opt,
+        .having_program = having_program_opt,
+        .aggregate_argument_programs = aggregate_argument_programs,
+        .group_key_bindings = group_key_bindings,
     };
 }
 
@@ -1335,26 +1471,6 @@ fn encodeGroupValue(
     }
 }
 
-fn evaluateAggregateArgument(
-    spec: AggregateSpec,
-    event: *const event_mod.Event,
-    binding: ?TableBinding,
-) Error!AggregateInput {
-    return switch (spec.argument) {
-        .star => AggregateInput.count_all,
-        .expression => |expr| blk: {
-            const value = try evaluateExpression(expr, event, binding);
-            if (value == .null and spec.function != .count) {
-                break :blk AggregateInput.skip;
-            }
-            if (spec.function == .count and value == .null) {
-                break :blk AggregateInput.skip;
-            }
-            break :blk AggregateInput{ .value = value };
-        },
-    };
-}
-
 const AggregateInput = union(enum) {
     count_all,
     value: event_mod.Value,
@@ -1492,174 +1608,6 @@ fn aggregateResultValue(state: *const AggregateState, spec: *const AggregateSpec
             break :blk state.max.value;
         },
     };
-}
-
-fn valueFromLiteral(lit: ast.Literal) Error!event_mod.Value {
-    return switch (lit.value) {
-        .integer => |value| event_mod.Value{ .integer = value },
-        .float => |text| {
-            const parsed = std.fmt.parseFloat(f64, text) catch return Error.TypeMismatch;
-            return event_mod.Value{ .float = parsed };
-        },
-        .string => |text| event_mod.Value{ .string = text },
-        .boolean => |b| event_mod.Value{ .boolean = b },
-        .null => event_mod.Value{ .null = {} },
-    };
-}
-
-fn resolveColumn(event: *const event_mod.Event, col: ast.ColumnRef, binding: ?TableBinding) Error!event_mod.Value {
-    if (col.table) |qualifier| {
-        if (!qualifierAllowed(binding, qualifier)) {
-            return Error.UnknownColumn;
-        }
-    }
-
-    return switch (event.payload) {
-        .log => |log_event| resolveLogColumn(event, log_event, col),
-    };
-}
-
-fn resolveLogColumn(ev: *const event_mod.Event, log_event: event_mod.LogEvent, col: ast.ColumnRef) Error!event_mod.Value {
-    const identifier = col.name;
-    const canonical = identifier.canonical;
-
-    if (!identifier.quoted and std.mem.eql(u8, canonical, "message")) {
-        return event_mod.Value{ .string = log_event.message };
-    }
-
-    if (!identifier.quoted and std.mem.eql(u8, canonical, "source_id")) {
-        if (ev.metadata.source_id) |source_id| {
-            return event_mod.Value{ .string = source_id };
-        }
-        return event_mod.Value{ .null = {} };
-    }
-
-    for (log_event.fields) |field| {
-        if (identifier.quoted) {
-            if (std.mem.eql(u8, field.name, identifier.value)) {
-                return field.value;
-            }
-        } else if (ascii.eqlIgnoreCase(field.name, canonical)) {
-            return field.value;
-        }
-    }
-
-    return event_mod.Value{ .null = {} };
-}
-
-fn evaluateBoolean(expr: *const ast.Expression, event: *const event_mod.Event, binding: ?TableBinding) Error!bool {
-    const value = try evaluateExpression(expr, event, binding);
-    return switch (value) {
-        .boolean => |b| b,
-        else => Error.TypeMismatch,
-    };
-}
-
-fn evaluateExpression(expr: *const ast.Expression, event: *const event_mod.Event, binding: ?TableBinding) Error!event_mod.Value {
-    return switch (expr.*) {
-        .literal => |lit| valueFromLiteral(lit),
-        .column => |col| resolveColumn(event, col, binding),
-        .unary => |unary| try evalUnary(unary, event, binding),
-        .binary => |binary| try evalBinary(binary, event, binding),
-        .function_call => |_| Error.UnsupportedFunction,
-        .star => Error.UnsupportedFeature,
-    };
-}
-
-fn evalUnary(unary: ast.UnaryExpr, event: *const event_mod.Event, binding: ?TableBinding) Error!event_mod.Value {
-    const operand = try evaluateExpression(unary.operand, event, binding);
-    return applyUnary(unary.op, operand);
-}
-
-fn applyUnary(op: ast.UnaryOperator, operand: event_mod.Value) Error!event_mod.Value {
-    return switch (op) {
-        .plus => operand,
-        .minus => switch (operand) {
-            .integer => |value| event_mod.Value{ .integer = -value },
-            .float => |value| event_mod.Value{ .float = -value },
-            else => Error.TypeMismatch,
-        },
-        .not => switch (operand) {
-            .boolean => |value| event_mod.Value{ .boolean = !value },
-            else => Error.TypeMismatch,
-        },
-    };
-}
-
-fn evalBinary(binary: ast.BinaryExpr, event: *const event_mod.Event, binding: ?TableBinding) Error!event_mod.Value {
-    const left = try evaluateExpression(binary.left, event, binding);
-    const right = try evaluateExpression(binary.right, event, binding);
-    return applyBinary(binary.op, left, right);
-}
-
-fn applyBinary(op: ast.BinaryOperator, left: event_mod.Value, right: event_mod.Value) Error!event_mod.Value {
-    return switch (op) {
-        .add => try addValues(left, right),
-        .subtract => try subtractValues(left, right),
-        .multiply => try multiplyValues(left, right),
-        .divide => try divideValues(left, right),
-        .equal => event_mod.Value{ .boolean = compareEqual(left, right) },
-        .not_equal => event_mod.Value{ .boolean = !compareEqual(left, right) },
-        .less => event_mod.Value{ .boolean = try compareOrder(.less, left, right) },
-        .less_equal => event_mod.Value{ .boolean = try compareOrder(.less_equal, left, right) },
-        .greater => event_mod.Value{ .boolean = try compareOrder(.greater, left, right) },
-        .greater_equal => event_mod.Value{ .boolean = try compareOrder(.greater_equal, left, right) },
-        .logical_and => event_mod.Value{ .boolean = try logicalAnd(left, right) },
-        .logical_or => event_mod.Value{ .boolean = try logicalOr(left, right) },
-    };
-}
-
-fn addValues(left: event_mod.Value, right: event_mod.Value) Error!event_mod.Value {
-    if (left == .integer and right == .integer) {
-        const ov = @addWithOverflow(left.integer, right.integer);
-        if (ov[1] != 0) return Error.ArithmeticOverflow;
-        return event_mod.Value{ .integer = ov[0] };
-    }
-
-    const lf = try toFloat(left);
-    const rf = try toFloat(right);
-    return event_mod.Value{ .float = lf + rf };
-}
-
-fn subtractValues(left: event_mod.Value, right: event_mod.Value) Error!event_mod.Value {
-    if (left == .integer and right == .integer) {
-        const ov = @subWithOverflow(left.integer, right.integer);
-        if (ov[1] != 0) return Error.ArithmeticOverflow;
-        return event_mod.Value{ .integer = ov[0] };
-    }
-
-    const lf = try toFloat(left);
-    const rf = try toFloat(right);
-    return event_mod.Value{ .float = lf - rf };
-}
-
-fn multiplyValues(left: event_mod.Value, right: event_mod.Value) Error!event_mod.Value {
-    if (left == .integer and right == .integer) {
-        const ov = @mulWithOverflow(left.integer, right.integer);
-        if (ov[1] != 0) return Error.ArithmeticOverflow;
-        return event_mod.Value{ .integer = ov[0] };
-    }
-
-    const lf = try toFloat(left);
-    const rf = try toFloat(right);
-    return event_mod.Value{ .float = lf * rf };
-}
-
-fn divideValues(left: event_mod.Value, right: event_mod.Value) Error!event_mod.Value {
-    const denominator = try toFloat(right);
-    if (denominator == 0) return Error.DivideByZero;
-    const numerator = try toFloat(left);
-    return event_mod.Value{ .float = numerator / denominator };
-}
-
-fn logicalAnd(left: event_mod.Value, right: event_mod.Value) Error!bool {
-    if (left != .boolean or right != .boolean) return Error.TypeMismatch;
-    return left.boolean and right.boolean;
-}
-
-fn logicalOr(left: event_mod.Value, right: event_mod.Value) Error!bool {
-    if (left != .boolean or right != .boolean) return Error.TypeMismatch;
-    return left.boolean or right.boolean;
 }
 
 fn toFloat(value: event_mod.Value) Error!f64 {
@@ -1813,6 +1761,105 @@ fn determineTableBinding(stmt: *const ast.SelectStatement) Error!?TableBinding {
         },
         else => Error.UnsupportedFeature,
     };
+}
+
+const EventResolverContext = struct {
+    table_binding: ?TableBinding,
+};
+
+fn resolveEventBinding(context_ptr: *anyopaque, column: ast.ColumnRef) expr_ir.Error!expr_ir.EventBinding {
+    const context: *EventResolverContext = @ptrCast(@alignCast(context_ptr));
+    if (column.table) |qualifier| {
+        if (!qualifierAllowed(context.table_binding, qualifier)) {
+            return expr_ir.Error.UnknownColumn;
+        }
+    }
+
+    const identifier = column.name;
+    const canonical = identifier.canonical;
+
+    if (!identifier.quoted and std.mem.eql(u8, canonical, "message")) {
+        return expr_ir.EventBinding.message;
+    }
+
+    if (!identifier.quoted and std.mem.eql(u8, canonical, "source_id")) {
+        return expr_ir.EventBinding.source_id;
+    }
+
+    return expr_ir.EventBinding{
+        .field = .{
+            .name = identifier.value,
+            .canonical = identifier.canonical,
+            .quoted = identifier.quoted,
+        },
+    };
+}
+
+const GroupResolverContext = struct {
+    columns: []const GroupColumn,
+    table_binding: ?TableBinding,
+};
+
+fn resolveGroupBinding(context_ptr: *anyopaque, column: ast.ColumnRef) expr_ir.Error!?usize {
+    const context: *GroupResolverContext = @ptrCast(@alignCast(context_ptr));
+    return findGroupColumnIndex(context.columns, column, context.table_binding);
+}
+
+const AggregateResolverContext = struct {
+    specs: []const AggregateSpec,
+};
+
+fn resolveAggregateBinding(context_ptr: *anyopaque, call: *const ast.FunctionCall) expr_ir.Error!?usize {
+    const context: *AggregateResolverContext = @ptrCast(@alignCast(context_ptr));
+    for (context.specs, 0..) |spec, idx| {
+        if (spec.call == call) return idx;
+    }
+    return null;
+}
+
+const EventAccessorContext = struct {
+    event: *const event_mod.Event,
+};
+
+fn loadEventValue(context_ptr: *anyopaque, binding: expr_ir.EventBinding) expr_ir.Error!event_mod.Value {
+    const context: *EventAccessorContext = @ptrCast(@alignCast(context_ptr));
+    const event = context.event;
+
+    return switch (event.payload) {
+        .log => |log_event| switch (binding) {
+            .message => event_mod.Value{ .string = log_event.message },
+            .source_id => blk: {
+                if (event.metadata.source_id) |source_id| {
+                    break :blk event_mod.Value{ .string = source_id };
+                }
+                break :blk event_mod.Value{ .null = {} };
+            },
+            .field => |field| {
+                for (log_event.fields) |log_field| {
+                    if (field.quoted) {
+                        if (std.mem.eql(u8, log_field.name, field.name)) {
+                            return log_field.value;
+                        }
+                    } else if (ascii.eqlIgnoreCase(log_field.name, field.canonical)) {
+                        return log_field.value;
+                    }
+                }
+                return event_mod.Value{ .null = {} };
+            },
+        },
+    };
+}
+
+const AggregateAccessorContext = struct {
+    program: *Program,
+    group: *const GroupState,
+};
+
+fn loadAggregateValue(context_ptr: *anyopaque, aggregate_index: usize) expr_ir.Error!event_mod.Value {
+    const context: *AggregateAccessorContext = @ptrCast(@alignCast(context_ptr));
+    if (aggregate_index >= context.group.aggregates.len) return expr_ir.Error.UnknownColumn;
+    const spec = &context.program.plan.group_aggregate.aggregates[aggregate_index];
+    return aggregateResultValue(&context.group.aggregates[aggregate_index], spec);
 }
 
 const testing = std.testing;
