@@ -194,12 +194,14 @@ pub const WithClause = struct {
 pub const SelectStatement = struct {
     with_clause: ?WithClause = null,
     distinct: bool = false,
+    distinct_span: ?Span = null,
     projection: []const SelectItem,
     from: []const TableExpression = &[_]TableExpression{},
     selection: ?*const Expression = null,
     group_by: []const *const Expression = &[_]*const Expression{},
     having: ?*const Expression = null,
     order_by: []const OrderByItem = &[_]OrderByItem{},
+    order_by_span: ?Span = null,
     span: Span,
 };
 

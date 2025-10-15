@@ -41,6 +41,67 @@ const Projection = plan.Projection;
 const GroupProjection = plan.GroupProjection;
 const AggregateProjection = plan.AggregateProjection;
 
+pub const FeatureGate = enum {
+    distinct,
+    order_by,
+    multiple_from,
+    join,
+    projection_star,
+    projection_expression,
+    group_by_expression,
+    missing_aggregate,
+    aggregate_distinct,
+    aggregate_argument_arity,
+    aggregate_argument_star,
+    derived_table,
+};
+
+pub const FeatureGateDiagnostic = struct {
+    feature: FeatureGate,
+    span: ast.Span,
+};
+
+threadlocal var last_feature_gate: ?FeatureGateDiagnostic = null;
+
+fn clearFeatureGateDiagnostic() void {
+    last_feature_gate = null;
+}
+
+fn recordFeatureGate(feature: FeatureGate, span: ast.Span) void {
+    last_feature_gate = FeatureGateDiagnostic{
+        .feature = feature,
+        .span = span,
+    };
+}
+
+fn failFeature(feature: FeatureGate, span: ast.Span) Error {
+    recordFeatureGate(feature, span);
+    return Error.UnsupportedFeature;
+}
+
+pub fn takeFeatureGateDiagnostic() ?FeatureGateDiagnostic {
+    const result = last_feature_gate;
+    last_feature_gate = null;
+    return result;
+}
+
+pub fn featureGateName(feature: FeatureGate) []const u8 {
+    return switch (feature) {
+        .distinct => "DISTINCT",
+        .order_by => "ORDER BY",
+        .multiple_from => "multiple FROM tables",
+        .join => "JOIN",
+        .projection_star => "SELECT *",
+        .projection_expression => "non-aggregate projection",
+        .group_by_expression => "GROUP BY expression",
+        .missing_aggregate => "missing aggregate",
+        .aggregate_distinct => "DISTINCT aggregates",
+        .aggregate_argument_arity => "aggregate argument count",
+        .aggregate_argument_star => "aggregate argument STAR",
+        .derived_table => "derived table",
+    };
+}
+
 const CountState = struct {
     total: u64 = 0,
 };
@@ -1079,9 +1140,26 @@ pub const ValueEntry = struct {
 };
 
 pub fn compile(allocator: std.mem.Allocator, stmt: *const ast.SelectStatement, options: CompileOptions) Error!Program {
-    if (stmt.distinct) return Error.UnsupportedFeature;
-    if (stmt.order_by.len != 0) return Error.UnsupportedFeature;
-    if (stmt.from.len > 1) return Error.UnsupportedFeature;
+    clearFeatureGateDiagnostic();
+
+    if (stmt.distinct) {
+        const span = stmt.distinct_span orelse stmt.span;
+        return failFeature(.distinct, span);
+    }
+    if (stmt.order_by.len != 0) {
+        const span = stmt.order_by_span orelse stmt.order_by[0].span;
+        return failFeature(.order_by, span);
+    }
+    if (stmt.from.len > 1) {
+        const span = stmt.from[1].span;
+        return failFeature(.multiple_from, span);
+    }
+    for (stmt.from) |table_expr| {
+        if (table_expr.joins.len != 0) {
+            const span = table_expr.joins[0].span;
+            return failFeature(.join, span);
+        }
+    }
 
     var group_columns_builder = std.ArrayListUnmanaged(GroupColumn){};
     defer group_columns_builder.deinit(allocator);
@@ -1096,7 +1174,7 @@ pub fn compile(allocator: std.mem.Allocator, stmt: *const ast.SelectStatement, o
                 }
                 try group_columns_builder.append(allocator, .{ .column = col });
             },
-            else => return Error.UnsupportedFeature,
+            else => return failFeature(.group_by_expression, ast.expressionSpan(expr)),
         }
     }
 
@@ -1108,7 +1186,7 @@ pub fn compile(allocator: std.mem.Allocator, stmt: *const ast.SelectStatement, o
 
     for (stmt.projection) |item| {
         switch (item.kind) {
-            .star => return Error.UnsupportedFeature,
+            .star => return failFeature(.projection_star, item.span),
             .expression => |expr| {
                 if (classifyAggregate(expr)) |call_info| {
                     const index = try appendAggregateSpec(allocator, &aggregates_builder, call_info.call);
@@ -1125,7 +1203,7 @@ pub fn compile(allocator: std.mem.Allocator, stmt: *const ast.SelectStatement, o
                         if (column.table) |qualifier| {
                             if (!qualifierAllowed(table_binding, qualifier)) return Error.UnknownColumn;
                         }
-                        return Error.UnsupportedFeature;
+                        return failFeature(.projection_expression, ast.expressionSpan(expr));
                     };
                     const label = if (item.alias) |alias_ident| alias_ident.text() else column.name.text();
                     try projection_builder.append(allocator, .{
@@ -1135,14 +1213,14 @@ pub fn compile(allocator: std.mem.Allocator, stmt: *const ast.SelectStatement, o
                         },
                     });
                 } else {
-                    return Error.UnsupportedFeature;
+                    return failFeature(.projection_expression, ast.expressionSpan(expr));
                 }
             },
         }
     }
 
     if (aggregates_builder.items.len == 0) {
-        return Error.UnsupportedFeature; // stateful engine requires at least one aggregate
+        return failFeature(.missing_aggregate, stmt.span); // stateful engine requires at least one aggregate
     }
 
     if (stmt.having) |expr| {
@@ -1321,7 +1399,7 @@ fn appendAggregateSpec(
     builder: *std.ArrayListUnmanaged(AggregateSpec),
     call: *const ast.FunctionCall,
 ) Error!usize {
-    if (call.distinct) return Error.UnsupportedFeature;
+    if (call.distinct) return failFeature(.aggregate_distinct, call.span);
 
     const function = aggregateFunctionFromName(call.name.canonical) orelse return Error.UnsupportedFunction;
     const argument = switch (function) {
@@ -1370,13 +1448,13 @@ fn parseCountArgument(call: *const ast.FunctionCall) Error!AggregateArgument {
         if (arg.* == .star) return AggregateArgument.star;
         return AggregateArgument{ .expression = arg };
     }
-    return Error.UnsupportedFeature;
+    return failFeature(.aggregate_argument_arity, call.span);
 }
 
 fn parseSingleArgument(call: *const ast.FunctionCall) Error!AggregateArgument {
-    if (call.arguments.len != 1) return Error.UnsupportedFeature;
+    if (call.arguments.len != 1) return failFeature(.aggregate_argument_arity, call.span);
     const arg = call.arguments[0];
-    if (arg.* == .star) return Error.UnsupportedFeature;
+    if (arg.* == .star) return failFeature(.aggregate_argument_star, ast.expressionSpan(arg));
     return AggregateArgument{ .expression = arg };
 }
 
@@ -1838,7 +1916,7 @@ fn determineTableBinding(stmt: *const ast.SelectStatement) Error!?TableBinding {
             }
             break :blk binding;
         },
-        else => Error.UnsupportedFeature,
+        .derived => |derived| failFeature(.derived_table, derived.span),
     };
 }
 
@@ -2424,6 +2502,51 @@ test "compareOrder preserves precision for large integers" {
     try testing.expect(try compareOrder(.less_equal, .{ .integer = base }, .{ .integer = base }));
     try testing.expect(try compareOrder(.greater_equal, .{ .integer = larger }, .{ .integer = larger }));
     try testing.expect(!try compareOrder(.less, .{ .integer = larger }, .{ .integer = base }));
+}
+
+test "compile distinct reports diagnostic" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const query = "SELECT DISTINCT message FROM logs";
+    const stmt = try @import("parser.zig").parseSelect(arena, query);
+
+    try testing.expectError(Error.UnsupportedFeature, compile(testing.allocator, stmt, .{}));
+
+    const diag = takeFeatureGateDiagnostic() orelse return testing.expect(false);
+    try testing.expectEqual(FeatureGate.distinct, diag.feature);
+    try testing.expect(std.mem.eql(u8, query[diag.span.start..diag.span.end], "DISTINCT"));
+}
+
+test "compile order by reports diagnostic" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const query = "SELECT message FROM logs ORDER BY message DESC";
+    const stmt = try @import("parser.zig").parseSelect(arena, query);
+
+    try testing.expectError(Error.UnsupportedFeature, compile(testing.allocator, stmt, .{}));
+
+    const diag = takeFeatureGateDiagnostic() orelse return testing.expect(false);
+    try testing.expectEqual(FeatureGate.order_by, diag.feature);
+    try testing.expect(std.mem.eql(u8, query[diag.span.start..diag.span.end], "ORDER BY message DESC"));
+}
+
+test "compile join reports diagnostic" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const query = "SELECT logs.message, COUNT(*) FROM logs JOIN devices ON logs.device_id = devices.id";
+    const stmt = try @import("parser.zig").parseSelect(arena, query);
+
+    try testing.expectError(Error.UnsupportedFeature, compile(testing.allocator, stmt, .{}));
+
+    const diag = takeFeatureGateDiagnostic() orelse return testing.expect(false);
+    try testing.expectEqual(FeatureGate.join, diag.feature);
+    try testing.expect(std.mem.eql(u8, query[diag.span.start..diag.span.end], "JOIN devices ON logs.device_id = devices.id"));
 }
 
 test "reject non aggregate projections" {

@@ -153,8 +153,10 @@ pub const Parser = struct {
         last_end = max(last_end, select_span.end);
 
         var distinct = false;
+        var distinct_span: ?lexmod.Span = null;
         if (self.current.kind == .keyword and self.current.kind.keyword == .Distinct) {
             distinct = true;
+            distinct_span = self.current.span;
             last_end = max(last_end, self.current.span.end);
             try self.advance();
         }
@@ -213,10 +215,14 @@ pub const Parser = struct {
         }
 
         var order_items: []const ast.OrderByItem = &[_]ast.OrderByItem{};
+        var order_clause_span: ?lexmod.Span = null;
         if (self.isKeyword(.Order)) {
+            const order_start = self.current.span.start;
             order_items = try self.parseOrderByClause();
             if (order_items.len > 0) {
-                last_end = max(last_end, order_items[order_items.len - 1].span.end);
+                const order_end = order_items[order_items.len - 1].span.end;
+                last_end = max(last_end, order_end);
+                order_clause_span = spanFrom(order_start, order_end);
             }
         }
 
@@ -224,12 +230,14 @@ pub const Parser = struct {
         stmt.* = .{
             .with_clause = with_clause,
             .distinct = distinct,
+            .distinct_span = distinct_span,
             .projection = projection,
             .from = from_tables,
             .selection = selection,
             .group_by = group_by_exprs,
             .having = having_expr,
             .order_by = order_items,
+            .order_by_span = order_clause_span,
             .span = spanFrom(stmt_start, last_end),
         };
         return stmt;
