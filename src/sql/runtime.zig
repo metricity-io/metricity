@@ -7,6 +7,7 @@ const event_mod = source_mod.event;
 const ascii = std.ascii;
 const math = std.math;
 const hash = std.hash;
+const hash_map = std.hash_map;
 const meta = std.meta;
 
 const IdentifierBinding = struct {
@@ -110,8 +111,430 @@ const GroupState = struct {
     }
 };
 
+fn emptyMutableSlice() []u8 {
+    // Reuse a single zero-length buffer to avoid unnecessary allocations.
+    return @constCast(&[_]u8{});
+}
+
+const StringPoolEntry = struct {
+    bytes: []u8 = emptyMutableSlice(),
+    ref_count: usize = 0,
+};
+
+const SerializedGroupKey = struct {
+    bytes: []const u8,
+    hash: u64,
+};
+
+const SerializedGroupKeyContext = struct {
+    pub fn hash(self: @This(), key: SerializedGroupKey) u64 {
+        _ = self;
+        return key.hash;
+    }
+
+    pub fn eql(self: @This(), a: SerializedGroupKey, b: SerializedGroupKey) bool {
+        _ = self;
+        if (a.hash != b.hash) return false;
+        return std.mem.eql(u8, a.bytes, b.bytes);
+    }
+};
+
+const GroupMap = hash_map.HashMapUnmanaged(
+    SerializedGroupKey,
+    usize,
+    SerializedGroupKeyContext,
+    hash_map.default_max_load_percentage,
+);
+
+const GroupEntry = struct {
+    state: GroupState = .{ .key_values = &.{}, .aggregates = &.{}, .last_seen_ns = 0, .key_hash = 0 },
+    key_bytes: []u8 = emptyMutableSlice(),
+    hash: u64 = 0,
+    shard_index: usize = 0,
+    lru_prev: ?usize = null,
+    lru_next: ?usize = null,
+    free_next: ?usize = null,
+    occupied: bool = false,
+};
+
+const LruList = struct {
+    head: ?usize = null,
+    tail: ?usize = null,
+
+    fn insert(self: *LruList, entries: []GroupEntry, index: usize) void {
+        entries[index].lru_prev = self.tail;
+        entries[index].lru_next = null;
+        if (self.tail) |tail_index| {
+            entries[tail_index].lru_next = index;
+        } else {
+            self.head = index;
+        }
+        self.tail = index;
+    }
+
+    fn moveToTail(self: *LruList, entries: []GroupEntry, index: usize) void {
+        if (self.tail == index) return;
+        self.remove(entries, index);
+        self.insert(entries, index);
+    }
+
+    fn remove(self: *LruList, entries: []GroupEntry, index: usize) void {
+        if (entries[index].lru_prev) |prev_index| {
+            entries[prev_index].lru_next = entries[index].lru_next;
+        } else {
+            self.head = entries[index].lru_next;
+        }
+        if (entries[index].lru_next) |next_index| {
+            entries[next_index].lru_prev = entries[index].lru_prev;
+        } else {
+            self.tail = entries[index].lru_prev;
+        }
+        entries[index].lru_prev = null;
+        entries[index].lru_next = null;
+    }
+};
+
+const GroupShard = struct {
+    map: GroupMap = GroupMap.empty,
+
+    fn deinit(self: *GroupShard, allocator: std.mem.Allocator) void {
+        self.map.deinit(allocator);
+    }
+};
+
+const GroupStore = struct {
+    allocator: std.mem.Allocator,
+    shards: []GroupShard,
+    shard_mask: usize,
+    entries: std.ArrayListUnmanaged(GroupEntry) = .{},
+    free_head: ?usize = null,
+    lru: LruList = .{},
+    ttl_ns: ?u64,
+    max_groups: usize,
+    sweep_interval_ns: u64,
+    last_sweep: u64 = 0,
+    active_count: usize = 0,
+    key_ctx: SerializedGroupKeyContext = .{},
+    string_table: std.StringHashMap(u32),
+    next_string_id: u32 = 1,
+    string_pool: std.ArrayListUnmanaged(StringPoolEntry) = .{},
+
+    const Options = struct {
+        shard_count: usize = 16,
+        ttl_ns: ?u64 = null,
+        max_groups: usize = 0,
+        sweep_interval_ns: u64 = 0,
+    };
+
+    pub const Acquisition = struct {
+        index: usize,
+        entry: *GroupEntry,
+        created: bool,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Error!GroupStore {
+        const requested = if (options.shard_count == 0) 1 else options.shard_count;
+        const shard_count = normalizeShardCount(requested);
+        const shards = try allocator.alloc(GroupShard, shard_count);
+        var idx: usize = 0;
+        while (idx < shard_count) : (idx += 1) {
+            shards[idx] = .{};
+        }
+
+        return GroupStore{
+            .allocator = allocator,
+            .shards = shards,
+            .shard_mask = shard_count - 1,
+            .ttl_ns = options.ttl_ns,
+            .max_groups = options.max_groups,
+            .sweep_interval_ns = options.sweep_interval_ns,
+            .string_table = std.StringHashMap(u32).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *GroupStore) void {
+        for (self.entries.items) |*entry| {
+            if (!entry.occupied) continue;
+            if (entry.key_bytes.len != 0) {
+                self.releaseInternedStrings(entry.key_bytes);
+                self.allocator.free(entry.key_bytes);
+                entry.key_bytes = emptyMutableSlice();
+            }
+            entry.state.deinit(self.allocator);
+        }
+        self.entries.deinit(self.allocator);
+        for (self.shards) |*shard| {
+            shard.deinit(self.allocator);
+        }
+        self.string_table.deinit();
+        for (self.string_pool.items) |entry| {
+            if (entry.bytes.len != 0) self.allocator.free(entry.bytes);
+        }
+        self.string_pool.deinit(self.allocator);
+        self.allocator.free(self.shards);
+        self.* = undefined;
+    }
+
+    pub fn acquire(
+        self: *GroupStore,
+        key_bytes: []const u8,
+        hash_value: u64,
+        now_ns: u64,
+    ) std.mem.Allocator.Error!Acquisition {
+        self.maybeSweep(now_ns);
+
+        const shard_index = self.shardIndex(hash_value);
+        const lookup_key = SerializedGroupKey{ .bytes = key_bytes, .hash = hash_value };
+        if (self.shards[shard_index].map.getContext(lookup_key, self.key_ctx)) |existing_index| {
+            const idx = existing_index;
+            self.touchEntry(idx, now_ns);
+            return Acquisition{ .index = idx, .entry = &self.entries.items[idx], .created = false };
+        }
+
+        const key_copy = try self.copyKeyBytes(key_bytes);
+        const entry_index = try self.allocateEntryIndex();
+        const entry = &self.entries.items[entry_index];
+        entry.* = GroupEntry{
+            .state = .{ .key_values = &.{}, .aggregates = &.{}, .last_seen_ns = now_ns, .key_hash = hash_value },
+            .key_bytes = key_copy,
+            .hash = hash_value,
+            .shard_index = shard_index,
+            .lru_prev = null,
+            .lru_next = null,
+            .free_next = null,
+            .occupied = true,
+        };
+
+        const shard = &self.shards[entry.shard_index];
+        const stored_key = SerializedGroupKey{ .bytes = entry.key_bytes, .hash = entry.hash };
+        const gop = try shard.map.getOrPutContext(self.allocator, stored_key, self.key_ctx);
+        std.debug.assert(!gop.found_existing);
+        gop.value_ptr.* = entry_index;
+
+        self.lru.insert(self.entries.items, entry_index);
+        self.active_count += 1;
+        self.enforceLimit();
+
+        return Acquisition{ .index = entry_index, .entry = entry, .created = true };
+    }
+
+    pub fn getEntry(self: *GroupStore, index: usize) *GroupEntry {
+        return &self.entries.items[index];
+    }
+
+    pub fn remove(self: *GroupStore, index: usize) void {
+        self.removeEntry(index);
+    }
+
+    pub fn clear(self: *GroupStore) void {
+        var idx: usize = 0;
+        while (idx < self.entries.items.len) : (idx += 1) {
+            if (!self.entries.items[idx].occupied) continue;
+            self.removeEntry(idx);
+        }
+        self.entries.clearRetainingCapacity();
+        self.free_head = null;
+        self.lru = .{};
+        self.active_count = 0;
+        self.last_sweep = 0;
+        self.string_table.deinit();
+        self.string_table = std.StringHashMap(u32).init(self.allocator);
+        self.next_string_id = 1;
+        for (self.string_pool.items) |entry| {
+            if (entry.bytes.len != 0) self.allocator.free(entry.bytes);
+        }
+        self.string_pool.clearRetainingCapacity();
+        for (self.shards) |*shard| {
+            shard.map.clearRetainingCapacity();
+        }
+    }
+
+    pub fn count(self: GroupStore) usize {
+        return self.active_count;
+    }
+
+    fn allocateEntryIndex(self: *GroupStore) std.mem.Allocator.Error!usize {
+        if (self.free_head) |reused| {
+            self.free_head = self.entries.items[reused].free_next;
+            return reused;
+        }
+
+        const slot = try self.entries.addOne(self.allocator);
+        slot.* = GroupEntry{};
+        slot.key_bytes = emptyMutableSlice();
+        return self.entries.items.len - 1;
+    }
+
+    fn copyKeyBytes(self: *GroupStore, bytes: []const u8) std.mem.Allocator.Error![]u8 {
+        if (bytes.len == 0) return emptyMutableSlice();
+        const buffer = try self.allocator.alloc(u8, bytes.len);
+        std.mem.copyForwards(u8, buffer, bytes);
+        return buffer;
+    }
+
+    fn internString(self: *GroupStore, value: []const u8) std.mem.Allocator.Error!u32 {
+        if (self.string_table.get(value)) |existing_id| {
+            const index = @as(usize, existing_id) - 1;
+            std.debug.assert(index < self.string_pool.items.len);
+            const entry = &self.string_pool.items[index];
+            std.debug.assert(entry.ref_count > 0);
+            entry.ref_count += 1;
+            return existing_id;
+        }
+
+        const copy = try self.allocator.alloc(u8, value.len);
+        errdefer self.allocator.free(copy);
+        if (value.len != 0) {
+            std.mem.copyForwards(u8, copy, value);
+        }
+
+        const id = self.next_string_id;
+        const entry_value = StringPoolEntry{
+            .bytes = copy,
+            .ref_count = 1,
+        };
+        try self.string_pool.append(self.allocator, entry_value);
+        errdefer {
+            // Restore length if insertion into the table fails.
+            std.debug.assert(self.string_pool.items.len != 0);
+            self.string_pool.items.len -= 1;
+        }
+
+        try self.string_table.putNoClobber(copy, id);
+        self.next_string_id = id + 1;
+
+        return id;
+    }
+
+    fn releaseInternedStringId(self: *GroupStore, id: u32) void {
+        if (id == 0) return;
+        const index = @as(usize, id) - 1;
+        if (index >= self.string_pool.items.len) return;
+
+        const entry = &self.string_pool.items[index];
+        std.debug.assert(entry.ref_count > 0);
+        entry.ref_count -= 1;
+        if (entry.ref_count == 0) {
+            if (entry.bytes.len != 0) {
+                const removed = self.string_table.remove(entry.bytes);
+                std.debug.assert(removed);
+                self.allocator.free(entry.bytes);
+            }
+            entry.bytes = emptyMutableSlice();
+        }
+    }
+
+    fn releaseInternedStrings(self: *GroupStore, encoded: []const u8) void {
+        if (encoded.len == 0) return;
+
+        const Tag = std.meta.Tag(event_mod.Value);
+        var offset: usize = 0;
+        while (offset < encoded.len) {
+            const tag_byte = encoded[offset];
+            offset += 1;
+            const tag = std.meta.intToEnum(Tag, tag_byte) catch unreachable;
+            switch (tag) {
+                .string => {
+                    std.debug.assert(offset + 4 <= encoded.len);
+                    const id_bytes = encoded[offset .. offset + 4];
+                    const id_ptr: *const [4]u8 = @ptrCast(id_bytes.ptr);
+                    const id = std.mem.readInt(u32, id_ptr, .little);
+                    offset += 4;
+                    self.releaseInternedStringId(id);
+                },
+                .integer, .float => {
+                    std.debug.assert(offset + 8 <= encoded.len);
+                    offset += 8;
+                },
+                .boolean => {
+                    std.debug.assert(offset + 1 <= encoded.len);
+                    offset += 1;
+                },
+                .null => {},
+            }
+        }
+    }
+
+    fn touchEntry(self: *GroupStore, index: usize, now_ns: u64) void {
+        const entry = &self.entries.items[index];
+        entry.state.last_seen_ns = now_ns;
+        self.lru.moveToTail(self.entries.items, index);
+    }
+
+    fn enforceLimit(self: *GroupStore) void {
+        if (self.max_groups == 0) return;
+        while (self.active_count > self.max_groups) {
+            const oldest = self.lru.head orelse break;
+            self.removeEntry(oldest);
+        }
+    }
+
+    pub fn maybeSweep(self: *GroupStore, now_ns: u64) void {
+        const interval = self.sweep_interval_ns;
+        if (interval == 0) return;
+        if (self.last_sweep != 0 and now_ns - self.last_sweep < interval) return;
+        self.sweep(now_ns);
+    }
+
+    fn sweep(self: *GroupStore, now_ns: u64) void {
+        if (self.ttl_ns) |ttl| {
+            while (self.lru.head) |index| {
+                const entry = &self.entries.items[index];
+                if (!entry.occupied) {
+                    self.lru.remove(self.entries.items, index);
+                    continue;
+                }
+
+                const age = if (now_ns > entry.state.last_seen_ns)
+                    now_ns - entry.state.last_seen_ns
+                else
+                    0;
+                if (age <= ttl) break;
+                self.removeEntry(index);
+            }
+        }
+
+        self.last_sweep = now_ns;
+        self.enforceLimit();
+    }
+
+    fn removeEntry(self: *GroupStore, index: usize) void {
+        const entry = &self.entries.items[index];
+        if (!entry.occupied) return;
+
+        self.lru.remove(self.entries.items, index);
+
+        const shard = &self.shards[entry.shard_index];
+        const key = SerializedGroupKey{ .bytes = entry.key_bytes, .hash = entry.hash };
+        _ = shard.map.fetchRemoveContext(key, self.key_ctx) orelse unreachable;
+
+        entry.state.deinit(self.allocator);
+        if (entry.key_bytes.len != 0) {
+            self.releaseInternedStrings(entry.key_bytes);
+            self.allocator.free(entry.key_bytes);
+        }
+
+        entry.* = GroupEntry{};
+        entry.key_bytes = emptyMutableSlice();
+        entry.free_next = self.free_head;
+        self.free_head = index;
+        self.active_count -= 1;
+    }
+
+    fn shardIndex(self: *const GroupStore, hash_value: u64) usize {
+        return @intCast(hash_value & @as(u64, self.shard_mask));
+    }
+};
+
+fn normalizeShardCount(requested: usize) usize {
+    if (requested == 0) return 1;
+    if (std.math.isPowerOfTwo(requested)) return requested;
+    return std.math.ceilPowerOfTwo(usize, requested) catch std.math.maxInt(usize);
+}
+
 const GroupAcquisition = struct {
     index: usize,
+    entry: *GroupEntry,
     created: bool,
 };
 
@@ -120,6 +543,9 @@ const ProjectedKeys = struct {
     values: []event_mod.Value,
     hash: u64,
     allocated: bool,
+    encoded: []u8,
+    encoded_allocated: bool,
+    hash_ready: bool,
 
     fn empty(allocator: std.mem.Allocator) ProjectedKeys {
         return ProjectedKeys{
@@ -127,15 +553,21 @@ const ProjectedKeys = struct {
             .values = &.{},
             .hash = 0,
             .allocated = false,
+            .encoded = emptyMutableSlice(),
+            .encoded_allocated = false,
+            .hash_ready = true,
         };
     }
 
-    fn fromValues(allocator: std.mem.Allocator, values: []event_mod.Value, hashed: u64) ProjectedKeys {
+    fn fromValues(allocator: std.mem.Allocator, values: []event_mod.Value) ProjectedKeys {
         return ProjectedKeys{
             .allocator = allocator,
             .values = values,
-            .hash = hashed,
+            .hash = 0,
             .allocated = values.len != 0,
+            .encoded = emptyMutableSlice(),
+            .encoded_allocated = false,
+            .hash_ready = values.len == 0,
         };
     }
 
@@ -143,9 +575,27 @@ const ProjectedKeys = struct {
         if (self.allocated and self.values.len != 0) {
             self.allocator.free(self.values);
         }
+        if (self.encoded_allocated and self.encoded.len != 0) {
+            self.allocator.free(self.encoded);
+        }
         self.values = &.{};
         self.hash = 0;
         self.allocated = false;
+        self.encoded = emptyMutableSlice();
+        self.encoded_allocated = false;
+        self.hash_ready = false;
+    }
+
+    fn serialized(self: *ProjectedKeys, store: *GroupStore) std.mem.Allocator.Error![]const u8 {
+        if (!self.encoded_allocated and self.values.len != 0) {
+            self.encoded = try encodeGroupValues(store, self.allocator, self.values);
+            self.encoded_allocated = true;
+        }
+        if (!self.hash_ready) {
+            self.hash = hash.XxHash3.hash(0, self.encoded);
+            self.hash_ready = true;
+        }
+        return self.encoded;
     }
 };
 
@@ -168,11 +618,12 @@ const Transaction = struct {
 
     fn commit(self: *Transaction, now_ns: u64) void {
         if (!self.active) return;
+        const entry = self.program.group_store.getEntry(self.group_index);
         if (self.created) {
-            self.program.groups.items[self.group_index].last_seen_ns = now_ns;
+            entry.state.last_seen_ns = now_ns;
         } else {
             self.program.replaceGroupAggregates(self.group_index, self.snapshot);
-            self.program.groups.items[self.group_index].last_seen_ns = now_ns;
+            entry.state.last_seen_ns = now_ns;
             self.snapshot = &.{};
         }
         self.active = false;
@@ -181,7 +632,7 @@ const Transaction = struct {
     fn rollback(self: *Transaction) void {
         if (!self.active) return;
         if (self.created) {
-            self.program.removeGroupAt(self.group_index);
+            self.program.group_store.remove(self.group_index);
         } else {
             self.program.destroyAggregateStateSlice(self.snapshot);
             self.snapshot = &.{};
@@ -211,16 +662,12 @@ pub const Program = struct {
     allocator: std.mem.Allocator,
     plan: plan.PhysicalPlan,
     table_binding: ?TableBinding,
-    groups: std.ArrayListUnmanaged(GroupState) = .{},
+    group_store: GroupStore,
     eviction: EvictionConfig,
-    last_sweep: u64 = 0,
 
     /// Releases memory allocated for the program metadata and accumulated state.
     pub fn deinit(self: *Program) void {
-        for (self.groups.items) |*group| {
-            group.deinit(self.allocator);
-        }
-        self.groups.deinit(self.allocator);
+        self.group_store.deinit();
 
         self.allocator.free(self.plan.project.projections);
         self.allocator.free(self.plan.project.group_columns);
@@ -229,11 +676,7 @@ pub const Program = struct {
 
     /// Clears accumulated aggregation state, preserving compiled metadata.
     pub fn reset(self: *Program) void {
-        self.last_sweep = 0;
-        for (self.groups.items) |*group| {
-            group.deinit(self.allocator);
-        }
-        self.groups.clearRetainingCapacity();
+        self.group_store.clear();
     }
 
     /// Evaluates the program against a single event, returning an optional row.
@@ -246,7 +689,7 @@ pub const Program = struct {
     ) Error!?Row {
         const binding = self.table_binding;
 
-        self.maybeSweep(now_ns);
+        self.group_store.maybeSweep(now_ns);
 
         if (self.plan.filter) |filter_stage| {
             const predicate = try evaluateBoolean(filter_stage.predicate, event, binding);
@@ -257,7 +700,8 @@ pub const Program = struct {
         defer projected_keys.deinit();
 
         const acquisition = try self.runGroupAggregateStage(&projected_keys, now_ns);
-        var group_ptr = &self.groups.items[acquisition.index];
+        var entry = acquisition.entry;
+        var group_ptr = &entry.state;
 
         var cloned_states: []AggregateState = &.{};
         if (!acquisition.created and group_ptr.aggregates.len != 0) {
@@ -273,7 +717,7 @@ pub const Program = struct {
             .last_seen_ns = group_ptr.last_seen_ns,
             .key_hash = group_ptr.key_hash,
         };
-        const working_group = if (acquisition.created)
+        const working_group: *GroupState = if (acquisition.created)
             group_ptr
         else
             &working_group_storage;
@@ -285,13 +729,13 @@ pub const Program = struct {
             const keep = try self.evaluateHaving(having_stage.predicate, working_group);
             if (!keep) {
                 txn.commit(now_ns);
-                self.trimToLimit();
                 return null;
             }
         }
 
         txn.commit(now_ns);
-        group_ptr = &self.groups.items[acquisition.index];
+        entry = self.group_store.getEntry(acquisition.index);
+        group_ptr = &entry.state;
         group_ptr.key_hash = projected_keys.hash;
 
         const project_stage = self.plan.project;
@@ -323,7 +767,6 @@ pub const Program = struct {
         }
 
         std.debug.assert(idx == total_columns);
-        self.trimToLimit();
         var row = Row{ .allocator = allocator, .values = values, .owns_strings = true };
 
         if (self.plan.window) |window_stage| {
@@ -351,21 +794,26 @@ pub const Program = struct {
             values[idx] = try resolveColumn(event, group_col.column, binding);
         }
 
-        const hashed = hashGroupValues(values);
         ok = true;
-        return ProjectedKeys.fromValues(allocator, values, hashed);
+        return ProjectedKeys.fromValues(allocator, values);
     }
 
-    fn runGroupAggregateStage(self: *Program, projected: *const ProjectedKeys, now_ns: u64) Error!GroupAcquisition {
-        if (projected.values.len == 0) {
-            return self.stateForGlobalGroup(now_ns);
+    fn runGroupAggregateStage(self: *Program, projected: *ProjectedKeys, now_ns: u64) Error!GroupAcquisition {
+        const serialized = try projected.serialized(&self.group_store);
+        const acquisition = try self.group_store.acquire(serialized, projected.hash, now_ns);
+
+        if (acquisition.created) {
+            errdefer self.group_store.remove(acquisition.index);
+            try self.initializeGroupEntry(acquisition.entry, projected.values, projected.hash, now_ns);
+        } else {
+            self.group_store.releaseInternedStrings(serialized);
         }
 
-        if (self.findGroup(projected.values, projected.hash)) |existing| {
-            return GroupAcquisition{ .index = existing, .created = false };
-        }
-
-        return self.createGroup(projected.values, projected.hash, now_ns);
+        return GroupAcquisition{
+            .index = acquisition.index,
+            .entry = acquisition.entry,
+            .created = acquisition.created,
+        };
     }
 
     fn runWindowStage(self: *Program, stage: plan.WindowStage, row: *Row, now_ns: u64) Error!void {
@@ -380,56 +828,6 @@ pub const Program = struct {
         _ = stage;
         _ = row;
     }
-
-    fn stateForGlobalGroup(self: *Program, now_ns: u64) Error!GroupAcquisition {
-        if (self.groups.items.len != 0) {
-            return GroupAcquisition{ .index = 0, .created = false };
-        }
-
-        const aggregates = try self.createAggregateStateSlice();
-        const new_group = try self.groups.addOne(self.allocator);
-        new_group.* = GroupState{
-            .key_values = &.{},
-            .aggregates = aggregates,
-            .last_seen_ns = now_ns,
-            .key_hash = 0,
-        };
-        return GroupAcquisition{ .index = self.groups.items.len - 1, .created = true };
-    }
-
-    fn findGroup(self: *Program, values: []const event_mod.Value, hash_value: u64) ?usize {
-        for (self.groups.items, 0..) |*group, idx| {
-            if (group.key_hash != hash_value) continue;
-            if (valuesEqual(group.key_values, values)) {
-                return idx;
-            }
-        }
-        return null;
-    }
-
-    fn createGroup(self: *Program, values: []const event_mod.Value, key_hash: u64, now_ns: u64) Error!GroupAcquisition {
-        const copied = try self.copyKeyValues(values);
-        errdefer {
-            for (copied) |value| freeOwnedValue(self.allocator, value);
-            self.allocator.free(copied);
-        }
-
-        const aggregates = try self.createAggregateStateSlice();
-        errdefer {
-            for (aggregates) |*agg| agg.deinit(self.allocator);
-            self.allocator.free(aggregates);
-        }
-
-        const group_ptr = try self.groups.addOne(self.allocator);
-        group_ptr.* = GroupState{
-            .key_values = copied,
-            .aggregates = aggregates,
-            .last_seen_ns = now_ns,
-            .key_hash = key_hash,
-        };
-        return GroupAcquisition{ .index = self.groups.items.len - 1, .created = true };
-    }
-
     fn copyKeyValues(self: *Program, values: []const event_mod.Value) Error![]event_mod.Value {
         if (values.len == 0) return &.{};
         var output = try self.allocator.alloc(event_mod.Value, values.len);
@@ -465,6 +863,34 @@ pub const Program = struct {
             idx += 1;
         }
         return states;
+    }
+
+    fn initializeGroupEntry(
+        self: *Program,
+        entry: *GroupEntry,
+        values: []const event_mod.Value,
+        hash_value: u64,
+        now_ns: u64,
+    ) Error!void {
+        const copied = try self.copyKeyValues(values);
+        errdefer {
+            if (copied.len != 0) {
+                var i = copied.len;
+                while (i > 0) {
+                    i -= 1;
+                    freeOwnedValue(self.allocator, copied[i]);
+                }
+                self.allocator.free(copied);
+            }
+        }
+
+        const aggregates = try self.createAggregateStateSlice();
+        errdefer self.destroyAggregateStateSlice(aggregates);
+
+        entry.state.key_values = copied;
+        entry.state.aggregates = aggregates;
+        entry.state.last_seen_ns = now_ns;
+        entry.state.key_hash = hash_value;
     }
 
     fn updateAggregates(self: *Program, group: *GroupState, event: *const event_mod.Event, binding: ?TableBinding) Error!void {
@@ -528,35 +954,6 @@ pub const Program = struct {
         return null;
     }
 
-    fn maybeSweep(self: *Program, now_ns: u64) void {
-        const interval = self.eviction.sweep_interval_ns;
-        if (interval == 0) return;
-        if (self.last_sweep != 0 and now_ns - self.last_sweep < interval) return;
-        self.sweep(now_ns);
-    }
-
-    fn sweep(self: *Program, now_ns: u64) void {
-        if (self.eviction.ttl_ns) |ttl| {
-            var idx: usize = 0;
-            while (idx < self.groups.items.len) {
-                const group = self.groups.items[idx];
-                if (now_ns - group.last_seen_ns > ttl) {
-                    var removed = self.groups.swapRemove(idx);
-                    removed.deinit(self.allocator);
-                    continue;
-                }
-                idx += 1;
-            }
-        }
-        self.last_sweep = now_ns;
-        self.trimToLimit();
-    }
-
-    fn removeGroupAt(self: *Program, index: usize) void {
-        var removed = self.groups.swapRemove(index);
-        removed.deinit(self.allocator);
-    }
-
     fn destroyAggregateStateSlice(self: *Program, states: []AggregateState) void {
         if (states.len == 0) return;
         for (states) |*agg| {
@@ -566,9 +963,9 @@ pub const Program = struct {
     }
 
     fn replaceGroupAggregates(self: *Program, index: usize, new_states: []AggregateState) void {
-        var group = &self.groups.items[index];
-        self.destroyAggregateStateSlice(group.aggregates);
-        group.aggregates = new_states;
+        const entry = self.group_store.getEntry(index);
+        self.destroyAggregateStateSlice(entry.state.aggregates);
+        entry.state.aggregates = new_states;
     }
 
     fn cloneAggregateStates(self: *Program, states: []AggregateState) Error![]AggregateState {
@@ -607,30 +1004,6 @@ pub const Program = struct {
             .value = try copyValueOwned(self.allocator, state.value),
             .has_value = true,
         };
-    }
-
-    fn trimToLimit(self: *Program) void {
-        const limit = self.eviction.max_groups;
-        if (limit == 0) return;
-        while (self.groups.items.len > limit) {
-            const idx = self.oldestGroupIndex();
-            var removed = self.groups.swapRemove(idx);
-            removed.deinit(self.allocator);
-        }
-    }
-
-    fn oldestGroupIndex(self: *Program) usize {
-        var oldest_index: usize = 0;
-        var oldest_seen = self.groups.items[0].last_seen_ns;
-        var idx: usize = 1;
-        while (idx < self.groups.items.len) : (idx += 1) {
-            const group = self.groups.items[idx];
-            if (group.last_seen_ns < oldest_seen) {
-                oldest_seen = group.last_seen_ns;
-                oldest_index = idx;
-            }
-        }
-        return oldest_index;
     }
 };
 
@@ -767,14 +1140,20 @@ pub fn compile(allocator: std.mem.Allocator, stmt: *const ast.SelectStatement, o
         .route = null,
     };
 
-    const program = Program{
+    var store = try GroupStore.init(allocator, .{
+        .ttl_ns = options.eviction.ttl_ns,
+        .max_groups = options.eviction.max_groups,
+        .sweep_interval_ns = options.eviction.sweep_interval_ns,
+    });
+    errdefer store.deinit();
+
+    return Program{
         .allocator = allocator,
         .plan = physical_plan,
         .table_binding = table_binding,
-        .groups = .{},
+        .group_store = store,
         .eviction = options.eviction,
     };
-    return program;
 }
 
 const AggregateCallInfo = struct {
@@ -900,26 +1279,42 @@ fn qualifiersEqual(a: ?ast.Identifier, b: ?ast.Identifier, binding: ?TableBindin
     return true;
 }
 
-fn hashGroupValues(values: []const event_mod.Value) u64 {
-    var hasher = hash.Fnv1a_64.init();
+fn encodeGroupValues(store: *GroupStore, allocator: std.mem.Allocator, values: []const event_mod.Value) std.mem.Allocator.Error![]u8 {
+    if (values.len == 0) return emptyMutableSlice();
+
+    var buffer = std.ArrayListUnmanaged(u8){};
+    errdefer buffer.deinit(allocator);
+
     for (values) |value| {
-        hashGroupValue(&hasher, value);
+        try encodeGroupValue(store, &buffer, allocator, value);
     }
-    return hasher.final();
+
+    const owned = try buffer.toOwnedSlice(allocator);
+    buffer = std.ArrayListUnmanaged(u8){};
+    return owned;
 }
 
-fn hashGroupValue(hasher: *hash.Fnv1a_64, value: event_mod.Value) void {
+fn encodeGroupValue(
+    store: *GroupStore,
+    buffer: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    value: event_mod.Value,
+) std.mem.Allocator.Error!void {
     const tag = meta.activeTag(value);
     const tag_byte: u8 = @intCast(@intFromEnum(tag));
-    hasher.update(&[_]u8{tag_byte});
+    try buffer.append(allocator, tag_byte);
+
     switch (value) {
         .string => |bytes| {
-            hasher.update(bytes);
+            const id = try store.internString(bytes);
+            var id_buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &id_buf, id, .little);
+            try buffer.appendSlice(allocator, &id_buf);
         },
         .integer => |int_value| {
-            var buffer: [8]u8 = undefined;
-            std.mem.writeInt(i64, &buffer, int_value, .little);
-            hasher.update(&buffer);
+            var int_buf: [8]u8 = undefined;
+            std.mem.writeInt(i64, &int_buf, int_value, .little);
+            try buffer.appendSlice(allocator, &int_buf);
         },
         .float => |float_value| {
             const canonical = if (math.isNan(float_value))
@@ -929,17 +1324,14 @@ fn hashGroupValue(hasher: *hash.Fnv1a_64, value: event_mod.Value) void {
             else
                 float_value;
             const bits: u64 = @bitCast(canonical);
-            var buffer: [8]u8 = undefined;
-            std.mem.writeInt(u64, &buffer, bits, .little);
-            hasher.update(&buffer);
+            var float_buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &float_buf, bits, .little);
+            try buffer.appendSlice(allocator, &float_buf);
         },
         .boolean => |flag| {
-            const byte: u8 = if (flag) 1 else 0;
-            hasher.update(&[_]u8{byte});
+            try buffer.append(allocator, if (flag) 1 else 0);
         },
-        .null => {
-            hasher.update(&[_]u8{0xff});
-        },
+        .null => {},
     }
 }
 
@@ -1561,7 +1953,7 @@ test "having treats null aggregate as false" {
 
     const maybe_row_null = try program.execute(testing.allocator, &null_event, nextTimestamp(&clock));
     try testing.expect(maybe_row_null == null);
-    try testing.expectEqual(@as(usize, 1), program.groups.items.len);
+    try testing.expectEqual(@as(usize, 1), program.group_store.count());
 
     const row = try program.execute(testing.allocator, &value_event, nextTimestamp(&clock)) orelse return testing.expect(false);
     defer row.deinit();
@@ -1594,7 +1986,7 @@ test "group by float treats negative zero as zero" {
 
     const first_row = try program.execute(testing.allocator, &zero_event, nextTimestamp(&clock)) orelse return testing.expect(false);
     defer first_row.deinit();
-    try testing.expectEqual(@as(usize, 1), program.groups.items.len);
+    try testing.expectEqual(@as(usize, 1), program.group_store.count());
     try testing.expectEqual(@as(usize, 2), first_row.values.len);
     try testing.expect(first_row.values[0].value == .float);
     try testing.expectEqual(@as(f64, 0.0), first_row.values[0].value.float);
@@ -1602,7 +1994,7 @@ test "group by float treats negative zero as zero" {
 
     const second_row = try program.execute(testing.allocator, &negative_zero_event, nextTimestamp(&clock)) orelse return testing.expect(false);
     defer second_row.deinit();
-    try testing.expectEqual(@as(usize, 1), program.groups.items.len);
+    try testing.expectEqual(@as(usize, 1), program.group_store.count());
     try testing.expectEqual(@as(usize, 2), second_row.values.len);
     try testing.expect(second_row.values[0].value == .float);
     try testing.expectEqual(@as(f64, 0.0), second_row.values[0].value.float);
@@ -1632,7 +2024,7 @@ test "group by float groups NaNs together" {
 
     const first_row = try program.execute(testing.allocator, &first_nan_event, nextTimestamp(&clock)) orelse return testing.expect(false);
     defer first_row.deinit();
-    try testing.expectEqual(@as(usize, 1), program.groups.items.len);
+    try testing.expectEqual(@as(usize, 1), program.group_store.count());
     try testing.expectEqual(@as(usize, 2), first_row.values.len);
     try testing.expect(first_row.values[0].value == .float);
     try testing.expect(math.isNan(first_row.values[0].value.float));
@@ -1640,7 +2032,7 @@ test "group by float groups NaNs together" {
 
     const second_row = try program.execute(testing.allocator, &second_nan_event, nextTimestamp(&clock)) orelse return testing.expect(false);
     defer second_row.deinit();
-    try testing.expectEqual(@as(usize, 1), program.groups.items.len);
+    try testing.expectEqual(@as(usize, 1), program.group_store.count());
     try testing.expectEqual(@as(usize, 2), second_row.values.len);
     try testing.expect(second_row.values[0].value == .float);
     try testing.expect(math.isNan(second_row.values[0].value.float));
@@ -1679,15 +2071,15 @@ test "enforces max groups when having filters rows" {
 
     const maybe_row_a = try program.execute(testing.allocator, &event_a, nextTimestamp(&clock));
     try testing.expect(maybe_row_a == null);
-    try testing.expectEqual(@as(usize, 1), program.groups.items.len);
+    try testing.expectEqual(@as(usize, 1), program.group_store.count());
 
     const maybe_row_b = try program.execute(testing.allocator, &event_b, nextTimestamp(&clock));
     try testing.expect(maybe_row_b == null);
-    try testing.expectEqual(@as(usize, 2), program.groups.items.len);
+    try testing.expectEqual(@as(usize, 2), program.group_store.count());
 
     const maybe_row_c = try program.execute(testing.allocator, &event_c, nextTimestamp(&clock));
     try testing.expect(maybe_row_c == null);
-    try testing.expectEqual(@as(usize, 2), program.groups.items.len);
+    try testing.expectEqual(@as(usize, 2), program.group_store.count());
 }
 
 test "sum integer field" {
@@ -1740,7 +2132,7 @@ test "rollback removes new group on error" {
 
     var clock: u64 = 1;
     try testing.expectError(Error.TypeMismatch, program.execute(testing.allocator, &bad_event, nextTimestamp(&clock)));
-    try testing.expectEqual(@as(usize, 0), program.groups.items.len);
+    try testing.expectEqual(@as(usize, 0), program.group_store.count());
 }
 
 test "rollback preserves existing aggregates on error" {
@@ -1772,7 +2164,7 @@ test "rollback preserves existing aggregates on error" {
     try testing.expectEqual(@as(i64, 2), first_row.values[0].value.integer);
 
     try testing.expectError(Error.TypeMismatch, program.execute(testing.allocator, &bad_event, nextTimestamp(&clock)));
-    try testing.expectEqual(@as(usize, 1), program.groups.items.len);
+    try testing.expectEqual(@as(usize, 1), program.group_store.count());
 
     const maybe_row = try program.execute(testing.allocator, &next_event, nextTimestamp(&clock)) orelse return testing.expect(false);
     defer maybe_row.deinit();
@@ -1999,6 +2391,91 @@ test "evicts least recently used group when limit exceeded" {
     const row_b2 = try program.execute(testing.allocator, &event_b, 14) orelse return testing.expect(false);
     defer row_b2.deinit();
     try testing.expectEqual(@as(i64, 1), row_b2.values[1].value.integer);
+}
+
+test "group store releases interned strings on eviction" {
+    var store = try GroupStore.init(testing.allocator, .{
+        .ttl_ns = null,
+        .max_groups = 1,
+        .sweep_interval_ns = 0,
+    });
+    defer store.deinit();
+
+    const key_a_bytes = "alpha";
+    const values_a = [_]event_mod.Value{ event_mod.Value{ .string = key_a_bytes } };
+    const encoded_a = try encodeGroupValues(&store, testing.allocator, &values_a);
+    defer if (encoded_a.len != 0) testing.allocator.free(encoded_a);
+    const hash_a = hash.XxHash3.hash(0, encoded_a);
+    const acquisition_a = try store.acquire(encoded_a, hash_a, 10);
+    try testing.expect(acquisition_a.created);
+
+    const key_b_bytes = "beta";
+    const values_b = [_]event_mod.Value{ event_mod.Value{ .string = key_b_bytes } };
+    const encoded_b = try encodeGroupValues(&store, testing.allocator, &values_b);
+    defer if (encoded_b.len != 0) testing.allocator.free(encoded_b);
+    const hash_b = hash.XxHash3.hash(0, encoded_b);
+    const acquisition_b = try store.acquire(encoded_b, hash_b, 20);
+    try testing.expect(acquisition_b.created);
+
+    try testing.expectEqual(@as(usize, 1), store.count());
+    try testing.expect(store.string_table.get(key_a_bytes) == null);
+    try testing.expect(store.string_table.get(key_b_bytes) != null);
+    try testing.expect(store.string_pool.items.len >= 1);
+    try testing.expectEqual(@as(usize, 0), store.string_pool.items[0].ref_count);
+    try testing.expectEqual(@as(usize, 0), store.string_pool.items[0].bytes.len);
+
+    store.remove(acquisition_b.index);
+
+    try testing.expectEqual(@as(usize, 0), store.count());
+    try testing.expect(store.string_table.get(key_b_bytes) == null);
+    try testing.expect(store.string_pool.items.len >= 2);
+    try testing.expectEqual(@as(usize, 0), store.string_pool.items[1].ref_count);
+    try testing.expectEqual(@as(usize, 0), store.string_pool.items[1].bytes.len);
+}
+
+test "group store releases interned strings on cache hit" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try @import("parser.zig").parseSelect(arena,
+        \\SELECT message, COUNT(*) AS total
+        \\FROM logs
+        \\GROUP BY message
+    );
+
+    var program = try compile(testing.allocator, stmt, .{});
+    defer program.deinit();
+
+    const message = "alpha";
+    var event = try testEvent(testing.allocator, message, 1);
+    defer freeEvent(testing.allocator, event);
+
+    var clock: u64 = 1;
+
+    const row_first = try program.execute(testing.allocator, &event, nextTimestamp(&clock)) orelse return testing.expect(false);
+    defer row_first.deinit();
+
+    var ref_count: usize = 0;
+    for (program.group_store.string_pool.items) |entry| {
+        if (entry.bytes.len != 0 and std.mem.eql(u8, entry.bytes, message)) {
+            ref_count = entry.ref_count;
+            break;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), ref_count);
+
+    const row_second = try program.execute(testing.allocator, &event, nextTimestamp(&clock)) orelse return testing.expect(false);
+    defer row_second.deinit();
+
+    ref_count = 0;
+    for (program.group_store.string_pool.items) |entry| {
+        if (entry.bytes.len != 0 and std.mem.eql(u8, entry.bytes, message)) {
+            ref_count = entry.ref_count;
+            break;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), ref_count);
 }
 
 test "execute projection" {
