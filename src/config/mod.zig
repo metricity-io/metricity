@@ -11,6 +11,7 @@ pub const ValidationError = error{
     MissingSinks,
     InvalidParallelism,
     InvalidQueueCapacity,
+    InvalidLimit,
 };
 
 pub const OwnedPipelineConfig = struct {
@@ -65,6 +66,9 @@ pub const PipelineConfig = struct {
             try validateInputs(transform.inputs(), components);
             try validateEdges(.transform, transform.outputs(), components);
             try validateExecutionSettings(transform.executionSettings());
+            switch (transform) {
+                .sql => |sql_cfg| try validateSqlTransform(sql_cfg),
+            }
         }
 
         for (self.sinks) |sink| {
@@ -92,6 +96,21 @@ pub const SqlEvictionConfig = struct {
     sweep_interval_seconds: ?u64 = null,
 };
 
+pub const SqlLimitConfig = struct {
+    max_state_bytes: usize = 64 * 1024 * 1024,
+    max_row_bytes: usize = 64 * 1024,
+    max_group_bytes: usize = 1024 * 1024,
+    cpu_budget_ns_per_second: u64 = 100_000_000,
+    late_event_threshold_seconds: ?u64 = null,
+};
+
+pub const SqlErrorPolicy = enum {
+    skip_event,
+    null,
+    clamp,
+    propagate,
+};
+
 pub const SqlTransform = struct {
     id: []const u8,
     inputs: []const []const u8,
@@ -100,6 +119,8 @@ pub const SqlTransform = struct {
     parallelism: usize = 1,
     queue: QueueConfig = .{},
     eviction: SqlEvictionConfig = .{},
+    limits: SqlLimitConfig = .{},
+    error_policy: SqlErrorPolicy = .skip_event,
 };
 
 pub const TransformNode = union(TransformType) {
@@ -218,6 +239,17 @@ fn validateInputs(inputs: []const []const u8, components: std.StringHashMap(Comp
 fn validateExecutionSettings(settings: ExecutionSettings) ValidationError!void {
     if (settings.parallelism == 0) return ValidationError.InvalidParallelism;
     if (settings.queue.capacity == 0) return ValidationError.InvalidQueueCapacity;
+}
+
+fn validateSqlTransform(transform: SqlTransform) ValidationError!void {
+    if (transform.limits.max_state_bytes == 0) return ValidationError.InvalidLimit;
+    if (transform.limits.max_row_bytes == 0) return ValidationError.InvalidLimit;
+    if (transform.limits.max_group_bytes == 0) return ValidationError.InvalidLimit;
+    if (transform.limits.cpu_budget_ns_per_second == 0) return ValidationError.InvalidLimit;
+    if (transform.limits.max_group_bytes > transform.limits.max_state_bytes) return ValidationError.InvalidLimit;
+    if (transform.limits.late_event_threshold_seconds) |threshold| {
+        if (threshold == 0) return ValidationError.InvalidLimit;
+    }
 }
 
 const testing = std.testing;

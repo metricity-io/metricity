@@ -31,6 +31,11 @@ pub const Error = std.mem.Allocator.Error || error{
     UnsupportedFunction,
     DivideByZero,
     ArithmeticOverflow,
+    RowTooLarge,
+    GroupStateTooLarge,
+    StateBudgetExceeded,
+    CpuBudgetExceeded,
+    LateEvent,
 };
 
 const AggregateFunction = plan.AggregateFunction;
@@ -167,6 +172,7 @@ const GroupState = struct {
     aggregates: []AggregateState,
     last_seen_ns: u64,
     key_hash: u64,
+    size_bytes: usize = 0,
 
     fn deinit(self: *GroupState, allocator: std.mem.Allocator) void {
         for (self.key_values) |value| {
@@ -288,12 +294,30 @@ const GroupStore = struct {
     string_table: std.StringHashMap(u32),
     next_string_id: u32 = 1,
     string_pool: std.ArrayListUnmanaged(StringPoolEntry) = .{},
+    max_state_bytes: usize,
+    state_bytes: usize = 0,
+    pending_ttl_evictions: usize = 0,
+    pending_max_groups_evictions: usize = 0,
+    pending_state_evictions: usize = 0,
 
     const Options = struct {
         shard_count: usize = 16,
         ttl_ns: ?u64 = null,
         max_groups: usize = 0,
         sweep_interval_ns: u64 = 0,
+        max_state_bytes: usize = 0,
+    };
+
+    pub const EvictionReason = enum { ttl, max_groups, state_bytes };
+
+    pub const EvictionStats = struct {
+        ttl: usize,
+        max_groups: usize,
+        state_bytes: usize,
+
+        pub fn isEmpty(self: EvictionStats) bool {
+            return self.ttl == 0 and self.max_groups == 0 and self.state_bytes == 0;
+        }
     };
 
     pub const Acquisition = struct {
@@ -319,7 +343,29 @@ const GroupStore = struct {
             .max_groups = options.max_groups,
             .sweep_interval_ns = options.sweep_interval_ns,
             .string_table = std.StringHashMap(u32).init(allocator),
+            .max_state_bytes = options.max_state_bytes,
         };
+    }
+
+    fn recordEviction(self: *GroupStore, reason: EvictionReason) void {
+        switch (reason) {
+            .ttl => self.pending_ttl_evictions += 1,
+            .max_groups => self.pending_max_groups_evictions += 1,
+            .state_bytes => self.pending_state_evictions += 1,
+        }
+    }
+
+    pub fn takeEvictionStats(self: *GroupStore) ?EvictionStats {
+        const stats = EvictionStats{
+            .ttl = self.pending_ttl_evictions,
+            .max_groups = self.pending_max_groups_evictions,
+            .state_bytes = self.pending_state_evictions,
+        };
+        if (stats.isEmpty()) return null;
+        self.pending_ttl_evictions = 0;
+        self.pending_max_groups_evictions = 0;
+        self.pending_state_evictions = 0;
+        return stats;
     }
 
     pub fn deinit(self: *GroupStore) void {
@@ -350,7 +396,7 @@ const GroupStore = struct {
         key_bytes: []const u8,
         hash_value: u64,
         now_ns: u64,
-    ) std.mem.Allocator.Error!Acquisition {
+    ) (std.mem.Allocator.Error || error{StateBudgetExceeded})!Acquisition {
         self.maybeSweep(now_ns);
 
         const shard_index = self.shardIndex(hash_value);
@@ -383,7 +429,11 @@ const GroupStore = struct {
 
         self.lru.insert(self.entries.items, entry_index);
         self.active_count += 1;
+        _ = self.updateEntryFootprint(entry_index);
         self.enforceLimit();
+        if (!self.entries.items[entry_index].occupied) {
+            return error.StateBudgetExceeded;
+        }
 
         return Acquisition{ .index = entry_index, .entry = entry, .created = true };
     }
@@ -393,14 +443,14 @@ const GroupStore = struct {
     }
 
     pub fn remove(self: *GroupStore, index: usize) void {
-        self.removeEntry(index);
+        self.removeEntry(index, null);
     }
 
     pub fn clear(self: *GroupStore) void {
         var idx: usize = 0;
         while (idx < self.entries.items.len) : (idx += 1) {
             if (!self.entries.items[idx].occupied) continue;
-            self.removeEntry(idx);
+            self.removeEntry(idx, null);
         }
         self.entries.clearRetainingCapacity();
         self.free_head = null;
@@ -414,6 +464,10 @@ const GroupStore = struct {
             if (entry.bytes.len != 0) self.allocator.free(entry.bytes);
         }
         self.string_pool.clearRetainingCapacity();
+        self.state_bytes = 0;
+        self.pending_ttl_evictions = 0;
+        self.pending_max_groups_evictions = 0;
+        self.pending_state_evictions = 0;
         for (self.shards) |*shard| {
             shard.map.clearRetainingCapacity();
         }
@@ -421,6 +475,10 @@ const GroupStore = struct {
 
     pub fn count(self: GroupStore) usize {
         return self.active_count;
+    }
+
+    pub fn stateBytes(self: *const GroupStore) usize {
+        return self.state_bytes;
     }
 
     fn allocateEntryIndex(self: *GroupStore) std.mem.Allocator.Error!usize {
@@ -472,6 +530,7 @@ const GroupStore = struct {
 
         try self.string_table.putNoClobber(copy, id);
         self.next_string_id = id + 1;
+        self.state_bytes += copy.len;
 
         return id;
     }
@@ -488,6 +547,11 @@ const GroupStore = struct {
             if (entry.bytes.len != 0) {
                 const removed = self.string_table.remove(entry.bytes);
                 std.debug.assert(removed);
+                if (self.state_bytes >= entry.bytes.len) {
+                    self.state_bytes -= entry.bytes.len;
+                } else {
+                    self.state_bytes = 0;
+                }
                 self.allocator.free(entry.bytes);
             }
             entry.bytes = emptyMutableSlice();
@@ -525,6 +589,25 @@ const GroupStore = struct {
         }
     }
 
+    fn updateEntryFootprint(self: *GroupStore, index: usize) usize {
+        const entry = &self.entries.items[index];
+        if (!entry.occupied) return 0;
+        const old_size = entry.state.size_bytes;
+        const new_size = entryFootprint(entry);
+        entry.state.size_bytes = new_size;
+        if (new_size > old_size) {
+            self.state_bytes += new_size - old_size;
+        } else {
+            const delta = old_size - new_size;
+            if (self.state_bytes >= delta) {
+                self.state_bytes -= delta;
+            } else {
+                self.state_bytes = 0;
+            }
+        }
+        return new_size;
+    }
+
     fn touchEntry(self: *GroupStore, index: usize, now_ns: u64) void {
         const entry = &self.entries.items[index];
         entry.state.last_seen_ns = now_ns;
@@ -532,10 +615,15 @@ const GroupStore = struct {
     }
 
     fn enforceLimit(self: *GroupStore) void {
-        if (self.max_groups == 0) return;
-        while (self.active_count > self.max_groups) {
+        while (self.max_groups != 0 and self.active_count > self.max_groups) {
             const oldest = self.lru.head orelse break;
-            self.removeEntry(oldest);
+            self.removeEntry(oldest, .max_groups);
+        }
+
+        while (self.max_state_bytes != 0 and self.state_bytes > self.max_state_bytes) {
+            const oldest = self.lru.head orelse break;
+            self.removeEntry(oldest, .state_bytes);
+            if (self.lru.head == null) break;
         }
     }
 
@@ -560,7 +648,7 @@ const GroupStore = struct {
                 else
                     0;
                 if (age <= ttl) break;
-                self.removeEntry(index);
+                self.removeEntry(index, .ttl);
             }
         }
 
@@ -568,7 +656,7 @@ const GroupStore = struct {
         self.enforceLimit();
     }
 
-    fn removeEntry(self: *GroupStore, index: usize) void {
+    fn removeEntry(self: *GroupStore, index: usize, reason: ?EvictionReason) void {
         const entry = &self.entries.items[index];
         if (!entry.occupied) return;
 
@@ -577,6 +665,16 @@ const GroupStore = struct {
         const shard = &self.shards[entry.shard_index];
         const key = SerializedGroupKey{ .bytes = entry.key_bytes, .hash = entry.hash };
         _ = shard.map.fetchRemoveContext(key, self.key_ctx) orelse unreachable;
+
+        if (reason) |r| self.recordEviction(r);
+
+        if (entry.state.size_bytes != 0) {
+            if (self.state_bytes >= entry.state.size_bytes) {
+                self.state_bytes -= entry.state.size_bytes;
+            } else {
+                self.state_bytes = 0;
+            }
+        }
 
         entry.state.deinit(self.allocator);
         if (entry.key_bytes.len != 0) {
@@ -607,6 +705,58 @@ const GroupAcquisition = struct {
     entry: *GroupEntry,
     created: bool,
 };
+
+fn valueFootprint(value: event_mod.Value) usize {
+    return switch (value) {
+        .string => |bytes| bytes.len,
+        .integer => @sizeOf(i64),
+        .float => @sizeOf(f64),
+        .boolean => @sizeOf(bool),
+        .null => 0,
+    };
+}
+
+fn aggregateFootprint(state: *const AggregateState) usize {
+    return switch (state.*) {
+        .count => @sizeOf(CountState),
+        .sum => @sizeOf(SumState),
+        .avg => @sizeOf(AvgState),
+        .min => |min_state| blk: {
+            var size: usize = @sizeOf(MinMaxState);
+            if (min_state.has_value) {
+                size += valueFootprint(min_state.value);
+            }
+            break :blk size;
+        },
+        .max => |max_state| blk: {
+            var size: usize = @sizeOf(MinMaxState);
+            if (max_state.has_value) {
+                size += valueFootprint(max_state.value);
+            }
+            break :blk size;
+        },
+    };
+}
+
+fn groupStateFootprint(state: *const GroupState) usize {
+    var total: usize = 0;
+    total += state.key_values.len * @sizeOf(event_mod.Value);
+    for (state.key_values) |value| {
+        total += valueFootprint(value);
+    }
+    total += state.aggregates.len * @sizeOf(AggregateState);
+    for (state.aggregates) |aggregate| {
+        total += aggregateFootprint(&aggregate);
+    }
+    return total;
+}
+
+fn entryFootprint(entry: *const GroupEntry) usize {
+    var total: usize = entry.key_bytes.len;
+    total += groupStateFootprint(&entry.state);
+    return total;
+}
+
 
 const ProjectedKeys = struct {
     allocator: std.mem.Allocator,
@@ -686,11 +836,14 @@ const Transaction = struct {
         };
     }
 
-    fn commit(self: *Transaction, now_ns: u64) void {
+    fn commit(self: *Transaction, now_ns: u64) Error!void {
         if (!self.active) return;
+        errdefer self.rollback();
 
         const entry = self.program.group_store.getEntry(self.group_index);
         entry.state.last_seen_ns = now_ns;
+
+        try self.program.finalizeGroup(self.group_index, now_ns);
 
         const journal_slice = self.program.aggregate_journal.items[self.journal_start..self.program.aggregate_journal.items.len];
         for (journal_slice) |journal_record| {
@@ -746,6 +899,7 @@ const Transaction = struct {
                     },
                 }
             }
+            _ = self.program.group_store.updateEntryFootprint(self.group_index);
         }
 
         self.program.aggregate_journal.items.len = self.journal_start;
@@ -773,8 +927,56 @@ pub const EvictionConfig = struct {
     sweep_interval_ns: u64 = 60 * std.time.ns_per_s,
 };
 
+pub const LimitConfig = struct {
+    max_state_bytes: usize = 0,
+    max_row_bytes: usize = 0,
+    max_group_bytes: usize = 0,
+    cpu_budget_ns_per_second: u64 = 0,
+    late_event_threshold_ns: ?u64 = null,
+};
+
+pub const ErrorPolicy = enum {
+    skip_event,
+    null,
+    clamp,
+    propagate,
+};
+
+const CpuBudgetTracker = struct {
+    budget_ns: u64,
+    window_start_ns: i128 = 0,
+    used_ns: u64 = 0,
+
+    fn init(budget_ns: u64) CpuBudgetTracker {
+        return .{ .budget_ns = budget_ns };
+    }
+
+    fn consume(self: *CpuBudgetTracker, now_ns: i128, cost_ns: u64) bool {
+        if (self.budget_ns == 0) return true;
+        if (self.window_start_ns == 0 or now_ns - self.window_start_ns >= @as(i128, @intCast(std.time.ns_per_s))) {
+            self.window_start_ns = now_ns;
+            self.used_ns = 0;
+        }
+
+        if (self.used_ns >= self.budget_ns) {
+            return false;
+        }
+
+        const remaining = self.budget_ns - self.used_ns;
+        if (cost_ns > remaining) {
+            self.used_ns = self.budget_ns;
+            return false;
+        }
+
+        self.used_ns += cost_ns;
+        return true;
+    }
+};
+
 pub const CompileOptions = struct {
     eviction: EvictionConfig = .{},
+    limits: LimitConfig = .{},
+    error_policy: ErrorPolicy = .skip_event,
 };
 
 /// Compiled representation of a SQL `SELECT` statement that can be executed
@@ -785,6 +987,10 @@ pub const Program = struct {
     table_binding: ?TableBinding,
     group_store: GroupStore,
     eviction: EvictionConfig,
+    limits: LimitConfig,
+    error_policy: ErrorPolicy,
+    cpu_tracker: CpuBudgetTracker,
+    row_adjustment: RowAdjustment = .none,
     filter_program: ?expr_ir.Program = null,
     having_program: ?expr_ir.Program = null,
     aggregate_argument_programs: []?expr_ir.Program = &.{},
@@ -826,6 +1032,51 @@ pub const Program = struct {
     pub fn reset(self: *Program) void {
         self.group_store.clear();
         self.aggregate_journal.items.len = 0;
+        self.cpu_tracker.window_start_ns = 0;
+        self.cpu_tracker.used_ns = 0;
+        self.row_adjustment = .none;
+    }
+
+    pub fn consumeCpuBudget(self: *Program, now_ns: i128, cost_ns: u64) bool {
+        return self.cpu_tracker.consume(now_ns, cost_ns);
+    }
+
+    pub fn lateEventThreshold(self: *const Program) ?u64 {
+        return self.limits.late_event_threshold_ns;
+    }
+
+    pub fn takeEvictions(self: *Program) ?GroupStore.EvictionStats {
+        return self.group_store.takeEvictionStats();
+    }
+
+    pub fn stateBytes(self: *const Program) usize {
+        return self.group_store.stateBytes();
+    }
+
+    pub fn groupCount(self: *const Program) usize {
+        return self.group_store.count();
+    }
+
+    pub fn takeRowAdjustment(self: *Program) RowAdjustment {
+        const result = self.row_adjustment;
+        self.row_adjustment = .none;
+        return result;
+    }
+
+    fn finalizeGroup(self: *Program, index: usize, now_ns: u64) Error!void {
+        self.group_store.touchEntry(index, now_ns);
+        const new_size = self.group_store.updateEntryFootprint(index);
+        if (self.limits.max_group_bytes != 0 and new_size > self.limits.max_group_bytes) {
+            return Error.GroupStateTooLarge;
+        }
+        if (self.limits.max_state_bytes != 0 and new_size > self.limits.max_state_bytes) {
+            return Error.StateBudgetExceeded;
+        }
+
+        self.group_store.enforceLimit();
+        if (self.limits.max_state_bytes != 0 and self.group_store.stateBytes() > self.limits.max_state_bytes) {
+            return Error.StateBudgetExceeded;
+        }
     }
 
     /// Evaluates the program against a single event, returning an optional row.
@@ -836,6 +1087,32 @@ pub const Program = struct {
         event: *const event_mod.Event,
         now_ns: u64,
     ) Error!?Row {
+        const exec_start = std.time.nanoTimestamp();
+        return self.executeTracked(allocator, event, now_ns, exec_start, null);
+    }
+
+    /// Executes the program while reporting the observed CPU duration. When `duration_out`
+    /// is provided the caller receives the elapsed nanoseconds spent inside this method.
+    pub fn executeTracked(
+        self: *Program,
+        allocator: std.mem.Allocator,
+        event: *const event_mod.Event,
+        now_ns: u64,
+        exec_start_ns: i128,
+        duration_out: ?*u64,
+    ) Error!?Row {
+        return self.executeInternal(allocator, event, now_ns, exec_start_ns, duration_out);
+    }
+
+    fn executeInternal(
+        self: *Program,
+        allocator: std.mem.Allocator,
+        event: *const event_mod.Event,
+        now_ns: u64,
+        exec_start_ns: i128,
+        duration_out: ?*u64,
+    ) Error!?Row {
+        if (duration_out) |ptr| ptr.* = 0;
         self.group_store.maybeSweep(now_ns);
 
         var event_accessor_ctx = EventAccessorContext{ .event = event };
@@ -877,15 +1154,20 @@ pub const Program = struct {
             };
             const keep = try self.executePredicateProgram(program, exec_ctx, true);
             if (!keep) {
-                txn.commit(now_ns);
+                const exec_end = std.time.nanoTimestamp();
+                var duration_ns: u64 = 0;
+                const duration_i128 = exec_end - exec_start_ns;
+                if (duration_i128 > 0) {
+                    duration_ns = @as(u64, @intCast(duration_i128));
+                }
+                if (duration_out) |ptr| ptr.* = duration_ns;
+                if (duration_ns != 0 and !self.consumeCpuBudget(exec_end, duration_ns)) {
+                    return Error.CpuBudgetExceeded;
+                }
+                try txn.commit(now_ns);
                 return null;
             }
         }
-
-        txn.commit(now_ns);
-        entry = self.group_store.getEntry(acquisition.index);
-        group_ptr = &entry.state;
-        group_ptr.key_hash = projected_keys.hash;
 
         const project_stage = self.plan.project;
         const aggregate_stage = self.plan.group_aggregate;
@@ -917,6 +1199,53 @@ pub const Program = struct {
 
         std.debug.assert(idx == total_columns);
         var row = Row{ .allocator = allocator, .values = values, .owns_strings = true };
+        var drop_row = false;
+
+        self.row_adjustment = .none;
+        if (self.limits.max_row_bytes != 0) {
+            var row_bytes = row.footprint();
+            if (row_bytes > self.limits.max_row_bytes) {
+                switch (self.error_policy) {
+                    .clamp => {
+                        if (!try row.clampToBytes(self.limits.max_row_bytes)) {
+                            row.deinit();
+                            return Error.RowTooLarge;
+                        }
+                        row_bytes = row.footprint();
+                        if (row_bytes > self.limits.max_row_bytes) {
+                            row.deinit();
+                            return Error.RowTooLarge;
+                        }
+                        self.row_adjustment = .clamped;
+                    },
+                    .null => {
+                        row.deinit();
+                        self.row_adjustment = .nullified;
+                        drop_row = true;
+                    },
+                    .skip_event, .propagate => {
+                        row.deinit();
+                        return Error.RowTooLarge;
+                    },
+                }
+            }
+        }
+
+        if (drop_row) {
+            const exec_end = std.time.nanoTimestamp();
+            var duration_ns: u64 = 0;
+            const duration_i128 = exec_end - exec_start_ns;
+            if (duration_i128 > 0) {
+                duration_ns = @as(u64, @intCast(duration_i128));
+            }
+            if (duration_out) |ptr| ptr.* = duration_ns;
+            if (duration_ns != 0 and !self.consumeCpuBudget(exec_end, duration_ns)) {
+                return Error.CpuBudgetExceeded;
+            }
+
+            try txn.commit(now_ns);
+            return null;
+        }
 
         if (self.plan.window) |window_stage| {
             try self.runWindowStage(window_stage, &row, now_ns);
@@ -925,6 +1254,22 @@ pub const Program = struct {
         if (self.plan.route) |route_stage| {
             try self.runRouteStage(route_stage, &row);
         }
+
+        const exec_end = std.time.nanoTimestamp();
+        var duration_ns: u64 = 0;
+        const duration_i128 = exec_end - exec_start_ns;
+        if (duration_i128 > 0) {
+            duration_ns = @as(u64, @intCast(duration_i128));
+        }
+        if (duration_out) |ptr| ptr.* = duration_ns;
+        if (duration_ns != 0 and !self.consumeCpuBudget(exec_end, duration_ns)) {
+            return Error.CpuBudgetExceeded;
+        }
+
+        try txn.commit(now_ns);
+        entry = self.group_store.getEntry(acquisition.index);
+        group_ptr = &entry.state;
+        group_ptr.key_hash = projected_keys.hash;
 
         return row;
     }
@@ -1114,11 +1459,59 @@ pub const Program = struct {
     }
 };
 
+const RowAdjustment = enum { none, clamped, nullified };
+
 /// Result row consumed by sink implementations.
 pub const Row = struct {
     allocator: std.mem.Allocator,
     values: []ValueEntry,
     owns_strings: bool = false,
+
+    pub fn footprint(self: *const Row) usize {
+        var total: usize = 0;
+        for (self.values) |entry| {
+            total += entry.name.len;
+            total += valueFootprint(entry.value);
+        }
+        return total;
+    }
+
+    pub fn clampToBytes(self: *Row, limit: usize) !bool {
+        var current = self.footprint();
+        if (current <= limit) return true;
+
+        if (self.values.len == 0) return false;
+
+        var idx: usize = 0;
+        while (idx < self.values.len and current > limit) : (idx += 1) {
+            var entry = &self.values[idx];
+            if (entry.value != .string) continue;
+            const slice = entry.value.string;
+            if (slice.len == 0) continue;
+            const excess = current - limit;
+            const reduce = if (excess < slice.len) excess else slice.len;
+            const new_len = slice.len - reduce;
+            if (self.owns_strings) {
+                const trimmed = try self.allocator.dupe(u8, slice[0..new_len]);
+                self.allocator.free(slice);
+                entry.value = .{ .string = trimmed };
+            } else {
+                entry.value = .{ .string = slice[0..new_len] };
+            }
+            current = self.footprint();
+        }
+
+        return current <= limit;
+    }
+
+    pub fn setAllNull(self: *Row) void {
+        for (self.values) |*entry| {
+            if (self.owns_strings and entry.value == .string) {
+                self.allocator.free(entry.value.string);
+            }
+            entry.value = .{ .null = {} };
+        }
+    }
 
     /// Releases ownership of value entries.
     pub fn deinit(self: Row) void {
@@ -1132,6 +1525,39 @@ pub const Row = struct {
         self.allocator.free(self.values);
     }
 };
+
+test "row clamp shrinks string payload" {
+    const allocator = std.testing.allocator;
+
+    var entries = try allocator.alloc(ValueEntry, 1);
+
+    const original = try allocator.dupe(u8, "abcdefghij");
+    entries[0] = .{ .name = "col", .value = .{ .string = original } };
+
+    var row = Row{ .allocator = allocator, .values = entries, .owns_strings = true };
+    defer row.deinit();
+
+    try std.testing.expectEqual(@as(usize, 13), row.footprint());
+    try std.testing.expect(try row.clampToBytes(8));
+    try std.testing.expectEqual(@as(usize, 8), row.footprint());
+    try std.testing.expectEqual(@as(usize, 5), row.values[0].value.string.len);
+}
+
+test "row setAllNull releases owned strings" {
+    const allocator = std.testing.allocator;
+
+    var entries = try allocator.alloc(ValueEntry, 1);
+
+    const original = try allocator.dupe(u8, "payload");
+    entries[0] = .{ .name = "col", .value = .{ .string = original } };
+
+    var row = Row{ .allocator = allocator, .values = entries, .owns_strings = true };
+
+    row.setAllNull();
+    try std.testing.expect(row.values[0].value == .null);
+
+    row.deinit();
+}
 
 /// Named value produced by SQL execution.
 pub const ValueEntry = struct {
@@ -1357,6 +1783,7 @@ pub fn compile(allocator: std.mem.Allocator, stmt: *const ast.SelectStatement, o
         .ttl_ns = options.eviction.ttl_ns,
         .max_groups = options.eviction.max_groups,
         .sweep_interval_ns = options.eviction.sweep_interval_ns,
+        .max_state_bytes = options.limits.max_state_bytes,
     });
     errdefer store.deinit();
 
@@ -1366,6 +1793,9 @@ pub fn compile(allocator: std.mem.Allocator, stmt: *const ast.SelectStatement, o
         .table_binding = table_binding,
         .group_store = store,
         .eviction = options.eviction,
+        .limits = options.limits,
+        .error_policy = options.error_policy,
+        .cpu_tracker = CpuBudgetTracker.init(options.limits.cpu_budget_ns_per_second),
         .filter_program = filter_program_opt,
         .having_program = having_program_opt,
         .aggregate_argument_programs = aggregate_argument_programs,
@@ -2016,7 +2446,14 @@ fn loadAggregateValue(context_ptr: *anyopaque, aggregate_index: usize) expr_ir.E
     const context: *AggregateAccessorContext = @ptrCast(@alignCast(context_ptr));
     if (aggregate_index >= context.group.aggregates.len) return expr_ir.Error.UnknownColumn;
     const spec = &context.program.plan.group_aggregate.aggregates[aggregate_index];
-    return aggregateResultValue(&context.group.aggregates[aggregate_index], spec);
+    return aggregateResultValue(&context.group.aggregates[aggregate_index], spec) catch |err| switch (err) {
+        Error.RowTooLarge,
+        Error.GroupStateTooLarge,
+        Error.StateBudgetExceeded,
+        Error.CpuBudgetExceeded,
+        Error.LateEvent => unreachable,
+        else => |other| return other,
+    };
 }
 
 const testing = std.testing;
@@ -2131,6 +2568,30 @@ test "count per message with having filter" {
     try testing.expectEqualStrings("message", row2.values[0].name);
     try testing.expectEqualStrings("hello", row2.values[0].value.string);
     try testing.expectEqual(@as(i64, 2), row2.values[1].value.integer);
+}
+
+test "null policy drops oversized row" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try @import("parser.zig").parseSelect(arena, "SELECT COUNT(*) AS total FROM logs");
+
+    var program = try compile(testing.allocator, stmt, .{
+        .limits = .{ .max_row_bytes = 1 },
+        .error_policy = .null,
+    });
+    defer program.deinit();
+
+    var event = try testEvent(testing.allocator, "hello", 4);
+    defer freeEvent(testing.allocator, event);
+
+    var clock: u64 = 1;
+
+    const produced = try program.execute(testing.allocator, &event, nextTimestamp(&clock));
+    try testing.expect(produced == null);
+    try testing.expect(program.takeRowAdjustment() == .nullified);
+    try testing.expect(program.takeRowAdjustment() == .none);
 }
 
 test "having treats null aggregate as false" {
@@ -2682,6 +3143,30 @@ test "group store releases interned strings on eviction" {
     try testing.expectEqual(@as(usize, 0), store.string_pool.items[1].bytes.len);
 }
 
+test "group store acquire returns state budget exceeded when entry evicted immediately" {
+    var store = try GroupStore.init(testing.allocator, .{
+        .ttl_ns = null,
+        .max_groups = 0,
+        .sweep_interval_ns = 0,
+        .max_state_bytes = 4,
+    });
+    defer store.deinit();
+
+    const values = [_]event_mod.Value{event_mod.Value{ .string = "alpha" }};
+    const encoded = try encodeGroupValues(&store, testing.allocator, &values);
+    defer if (encoded.len != 0) testing.allocator.free(encoded);
+    const hash_value = hash.XxHash3.hash(0, encoded);
+
+    const acquisition = store.acquire(encoded, hash_value, 10) catch |err| {
+        try testing.expectEqual(error.StateBudgetExceeded, err);
+        try testing.expectEqual(@as(usize, 0), store.count());
+        try testing.expectEqual(@as(usize, 0), store.stateBytes());
+        return;
+    };
+    defer store.remove(acquisition.index);
+    try testing.expect(false);
+}
+
 test "group store releases interned strings on cache hit" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();
@@ -2725,6 +3210,84 @@ test "group store releases interned strings on cache hit" {
         }
     }
     try testing.expectEqual(@as(usize, 1), ref_count);
+}
+
+test "program execute fails when state budget smaller than single group footprint" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try @import("parser.zig").parseSelect(arena,
+        \\SELECT message, COUNT(*) AS total
+        \\FROM logs
+        \\GROUP BY message
+    );
+
+    var program = try compile(testing.allocator, stmt, .{
+        .limits = .{ .max_state_bytes = 4 },
+    });
+    defer program.deinit();
+
+    var event = try testEvent(testing.allocator, "alpha", 1);
+    defer freeEvent(testing.allocator, event);
+
+    try std.testing.expectError(error.StateBudgetExceeded, program.execute(testing.allocator, &event, 10));
+    try testing.expectEqual(@as(usize, 0), program.group_store.count());
+    try testing.expectEqual(@as(usize, 0), program.group_store.stateBytes());
+}
+
+test "cpu budget exceed rolls back aggregate state" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try @import("parser.zig").parseSelect(arena,
+        \\SELECT COUNT(*) AS total
+        \\FROM logs
+        \\GROUP BY message
+    );
+
+    var program = try compile(testing.allocator, stmt, .{
+        .limits = .{ .cpu_budget_ns_per_second = 1_000_000 },
+    });
+    defer program.deinit();
+
+    var event = try testEvent(testing.allocator, "alpha", 1);
+    defer freeEvent(testing.allocator, event);
+
+    var clock: u64 = 1;
+    var duration_ns: u64 = 0;
+    const start_ok = std.time.nanoTimestamp();
+    const first_row = try program.executeTracked(
+        testing.allocator,
+        &event,
+        nextTimestamp(&clock),
+        start_ok,
+        &duration_ns,
+    ) orelse return testing.expect(false);
+    defer first_row.deinit();
+
+    duration_ns = 0;
+    const start_exceed = std.time.nanoTimestamp() - 10_000_000;
+    try testing.expectError(
+        Error.CpuBudgetExceeded,
+        program.executeTracked(
+            testing.allocator,
+            &event,
+            nextTimestamp(&clock),
+            start_exceed,
+            &duration_ns,
+        ),
+    );
+    try testing.expect(duration_ns >= 1_000_000);
+
+    var observed_total: ?u64 = null;
+    for (program.group_store.entries.items) |entry| {
+        if (!entry.occupied) continue;
+        observed_total = entry.state.aggregates[0].count.total;
+        break;
+    }
+    try testing.expectEqual(@as(?u64, 1), observed_total);
 }
 
 test "execute projection" {

@@ -254,8 +254,13 @@ pub const Pipeline = struct {
         const events = batch.batch.events;
         const ack_token = batch.batch.ack;
 
-        const batch_ctx = try BatchContext.create(self.worker_allocator, &self.metrics, ack_token, events.len);
+        const batch_ctx = try BatchContext.create(self.worker_allocator, &self.metrics, ack_token, events.len, batch.descriptor.name);
         errdefer batch_ctx.forceRelease();
+
+        if (events.len != 0) {
+            const count: u64 = @intCast(events.len);
+            self.metrics.recordSourceIngest(batch.descriptor.name, count);
+        }
 
         if (events.len == 0) {
             if (ack_token.isAvailable()) {
@@ -416,6 +421,9 @@ const TransformRuntime = struct {
     program_mutex: std.Thread.Mutex = .{},
     config: *const config_mod.TransformNode,
     channel_metrics: metrics_mod.ChannelMetrics,
+    id: []const u8,
+    limits: sql_mod.runtime.LimitConfig,
+    error_policy: sql_mod.runtime.ErrorPolicy,
 
     fn init(pipeline: *Pipeline, config: *const config_mod.TransformNode) Error!TransformRuntime {
         const exec = config.executionSettings();
@@ -454,8 +462,28 @@ const TransformRuntime = struct {
             eviction.sweep_interval_ns = secondsToNanoseconds(sweep_u64);
         }
 
+        const limit_config = sql_mod.runtime.LimitConfig{
+            .max_state_bytes = sql_cfg.limits.max_state_bytes,
+            .max_row_bytes = sql_cfg.limits.max_row_bytes,
+            .max_group_bytes = sql_cfg.limits.max_group_bytes,
+            .cpu_budget_ns_per_second = sql_cfg.limits.cpu_budget_ns_per_second,
+            .late_event_threshold_ns = if (sql_cfg.limits.late_event_threshold_seconds) |secs|
+                secondsToNanoseconds(secs)
+            else
+                null,
+        };
+
+        const runtime_policy: sql_mod.runtime.ErrorPolicy = switch (sql_cfg.error_policy) {
+            .skip_event => .skip_event,
+            .null => .null,
+            .clamp => .clamp,
+            .propagate => .propagate,
+        };
+
         var program = try sql_mod.runtime.compile(pipeline.worker_allocator, stmt, .{
             .eviction = eviction,
+            .limits = limit_config,
+            .error_policy = runtime_policy,
         });
         errdefer program.deinit();
 
@@ -473,6 +501,9 @@ const TransformRuntime = struct {
             .program_mutex = .{},
             .config = config,
             .channel_metrics = channel_metrics,
+            .id = config.id(),
+            .limits = limit_config,
+            .error_policy = runtime_policy,
         };
         channel_owned = false;
         channel_metrics_owned = false;
@@ -574,26 +605,108 @@ fn handleTransformMessage(context: *TransformWorkerContext, message: EventMessag
     const node_index = context.node_index;
 
     var produced: ?sql_mod.runtime.Row = null;
-    var exec_failed = false;
+    var exec_error: ?sql_mod.runtime.Error = null;
+    var executed = false;
+    const OptionalEvictionStats = @TypeOf(runtime.program.takeEvictions());
+    const RowAdjustment = @TypeOf(runtime.program.takeRowAdjustment());
+    var eviction_stats: OptionalEvictionStats = null;
+    var state_bytes: usize = 0;
+    var group_count: usize = 0;
+    var row_adjustment: RowAdjustment = .none;
+    var metrics_ready = false;
+    var locked_for_execution = false;
 
-    exec_scope: {
+    if (runtime.limits.late_event_threshold_ns) |threshold_ns| {
+        if (message.event.metadata.received_at) |received_at| {
+            const now_wall = std.time.nanoTimestamp();
+            var age = now_wall - received_at;
+            if (age < 0) age = 0;
+            const threshold_i128: i128 = @intCast(threshold_ns);
+            if (age > threshold_i128) {
+                exec_error = sql_mod.runtime.Error.LateEvent;
+            }
+        }
+    }
+
+    var duration_ns: u64 = 0;
+
+    if (exec_error == null) execution: {
+        locked_for_execution = true;
         runtime.program_mutex.lock();
         defer runtime.program_mutex.unlock();
+        defer {
+            if (executed) {
+                eviction_stats = runtime.program.takeEvictions();
+                state_bytes = runtime.program.stateBytes();
+                group_count = runtime.program.groupCount();
+                metrics_ready = true;
+            }
+            row_adjustment = runtime.program.takeRowAdjustment();
+        }
 
         const now_ns = MonotonicClock.now();
-        produced = runtime.program.execute(
+        const exec_start = std.time.nanoTimestamp();
+        executed = true;
+        produced = runtime.program.executeTracked(
             message.context.batchAllocator(),
             message.event,
             now_ns,
-        ) catch {
-            exec_failed = true;
+            exec_start,
+            &duration_ns,
+        ) catch |err| {
+            exec_error = err;
             produced = null;
-            break :exec_scope;
+            break :execution;
         };
     }
 
-    if (exec_failed) {
-        message.context.releaseFailure();
+    if (metrics_ready) {
+        if (eviction_stats) |stats| {
+            if (stats.ttl != 0) {
+                const delta: u64 = @intCast(stats.ttl);
+                pipeline.metrics.recordTransformEviction(runtime.id, "ttl", delta);
+            }
+            if (stats.max_groups != 0) {
+                const delta: u64 = @intCast(stats.max_groups);
+                pipeline.metrics.recordTransformEviction(runtime.id, "max_groups", delta);
+            }
+            if (stats.state_bytes != 0) {
+                const delta: u64 = @intCast(stats.state_bytes);
+                pipeline.metrics.recordTransformEviction(runtime.id, "state_bytes", delta);
+            }
+        }
+        pipeline.metrics.recordTransformState(runtime.id, state_bytes);
+        pipeline.metrics.recordTransformGroupCount(runtime.id, group_count);
+    }
+
+    if (!locked_for_execution) {
+        runtime.program_mutex.lock();
+        defer runtime.program_mutex.unlock();
+        row_adjustment = runtime.program.takeRowAdjustment();
+    }
+
+    switch (row_adjustment) {
+        .none => {},
+        .clamped => {
+            pipeline.metrics.recordTransformTruncate(runtime.id, "row", 1);
+            pipeline.metrics.recordTransformError(runtime.id, "clamp", 1);
+        },
+        .nullified => {
+            pipeline.metrics.recordTransformError(runtime.id, "null", 1);
+        },
+    }
+
+    pipeline.metrics.recordTransformProcessed(runtime.id, 1);
+    if (duration_ns != 0) {
+        pipeline.metrics.recordTransformExecTime(runtime.id, duration_ns);
+    }
+
+    if (exec_error) |err| {
+        if (isLimitViolation(err)) {
+            handleLimitViolation(runtime, pipeline, &message, err);
+        } else {
+            message.context.releaseFailure();
+        }
         return;
     }
 
@@ -624,6 +737,40 @@ fn handleTransformMessage(context: *TransformWorkerContext, message: EventMessag
     message.context.releaseSuccess();
 }
 
+fn isLimitViolation(err: sql_mod.runtime.Error) bool {
+    return switch (err) {
+        sql_mod.runtime.Error.RowTooLarge,
+        sql_mod.runtime.Error.GroupStateTooLarge,
+        sql_mod.runtime.Error.StateBudgetExceeded,
+        sql_mod.runtime.Error.CpuBudgetExceeded,
+        sql_mod.runtime.Error.LateEvent => true,
+        else => false,
+    };
+}
+
+fn handleLimitViolation(runtime: *TransformRuntime, pipeline: *Pipeline, message: *const EventMessage, violation: sql_mod.runtime.Error) void {
+    if (violation == sql_mod.runtime.Error.LateEvent) {
+        pipeline.metrics.recordTransformLateEvent(runtime.id, 1);
+    }
+
+    const policy_label = switch (runtime.error_policy) {
+        .skip_event => "skip_event",
+        .null => "null",
+        .clamp => "clamp",
+        .propagate => "error",
+    };
+    pipeline.metrics.recordTransformError(runtime.id, policy_label, 1);
+
+    switch (runtime.error_policy) {
+        .skip_event, .null, .clamp => {
+            message.context.releaseSuccess();
+        },
+        .propagate => {
+            message.context.releaseFailure();
+        },
+    }
+}
+
 const SinkRuntime = struct {
     channel: SinkChannel,
     queue: config_mod.QueueConfig,
@@ -631,6 +778,7 @@ const SinkRuntime = struct {
     batch_capacity: usize,
     config: *const config_mod.SinkNode,
     channel_metrics: metrics_mod.ChannelMetrics,
+    id: []const u8,
 
     fn init(pipeline: *Pipeline, config: *const config_mod.SinkNode) Error!SinkRuntime {
         const exec = config.executionSettings();
@@ -656,6 +804,7 @@ const SinkRuntime = struct {
             .batch_capacity = computeBatchCapacity(exec.queue),
             .config = config,
             .channel_metrics = channel_metrics,
+            .id = config.id(),
         };
         channel_owned = false;
         channel_metrics_owned = false;
@@ -722,6 +871,7 @@ const SinkWorker = struct {
 const SinkWorkerContext = struct {
     pipeline: *Pipeline,
     node_index: usize,
+    node_name: []const u8,
     sink: sink_mod.Sink,
     batch_buffer: []SinkMessage,
     row_view: []sql_mod.runtime.Row,
@@ -738,6 +888,7 @@ const SinkWorkerContext = struct {
         return SinkWorkerContext{
             .pipeline = pipeline,
             .node_index = 0,
+            .node_name = config.id(),
             .sink = sink_instance,
             .batch_buffer = buffer,
             .row_view = row_view,
@@ -777,6 +928,7 @@ fn sinkWorkerMain(context: *SinkWorkerContext) void {
             var success_row = message.row;
             success_row.deinit();
             message.context.releaseSuccess();
+            context.pipeline.metrics.recordSinkEmitted(runtime.id, 1);
         }
     }
 }
@@ -846,12 +998,14 @@ const BatchContext = struct {
     failed: std.atomic.Value(bool),
     metrics: *const metrics_mod.PipelineMetrics,
     start_time: i128,
+    source_name: []const u8,
 
     fn create(
         allocator: std.mem.Allocator,
         metrics: *const metrics_mod.PipelineMetrics,
         ack: event_mod.AckToken,
         total_events: usize,
+        source_name: []const u8,
     ) !*BatchContext {
         const arena = try allocator.create(std.heap.ArenaAllocator);
         errdefer allocator.destroy(arena);
@@ -873,6 +1027,7 @@ const BatchContext = struct {
             .failed = std.atomic.Value(bool).init(false),
             .metrics = metrics,
             .start_time = std.time.nanoTimestamp(),
+            .source_name = source_name,
         };
         return ctx;
     }
@@ -906,6 +1061,7 @@ const BatchContext = struct {
                 @intCast(-raw_latency);
             self.metrics.recordAck(final_status);
             self.metrics.recordAckLatency(latency_u64);
+            self.metrics.recordPipelineLatency(self.source_name, latency_u64);
             self.destroy();
         }
     }
@@ -1572,7 +1728,7 @@ test "forwardEventToNode surfaces allocation failure without double release" {
     var handle = event_mod.AckHandle.init(&recorder, Recorder.complete);
     const token = event_mod.AckToken.init(&handle);
 
-    var batch_ctx = try BatchContext.create(pipeline.worker_allocator, &pipeline.metrics, token, 1);
+    var batch_ctx = try BatchContext.create(pipeline.worker_allocator, &pipeline.metrics, token, 1, "test");
     errdefer batch_ctx.forceRelease();
 
     var fail_storage: [1]u8 = undefined;
@@ -1631,7 +1787,7 @@ test "retryPushEvent treats drop_oldest as stored" {
     var handle = event_mod.AckHandle.init(&recorder, Recorder.complete);
     const token = event_mod.AckToken.init(&handle);
 
-    var batch_ctx = try BatchContext.create(allocator, &pipeline.metrics, token, 2);
+    var batch_ctx = try BatchContext.create(allocator, &pipeline.metrics, token, 2, "test");
     errdefer batch_ctx.forceRelease();
 
     const ctx_old = try EventContext.create(allocator, batch_ctx);
@@ -1702,7 +1858,7 @@ test "retryPushEvent releases evicted context" {
     var handle = event_mod.AckHandle.init(&recorder, Recorder.complete);
     const token = event_mod.AckToken.init(&handle);
 
-    var batch_ctx = try BatchContext.create(allocator, &pipeline.metrics, token, 1);
+    var batch_ctx = try BatchContext.create(allocator, &pipeline.metrics, token, 1, "test");
     defer if (recorder_alive) batch_ctx.forceRelease();
 
     const ctx_old = try EventContext.create(allocator, batch_ctx);
@@ -1716,7 +1872,7 @@ test "retryPushEvent releases evicted context" {
     retryPushEvent(&channel, &pipeline, &message_old);
 
     var batch_ctx_new_alive = true;
-    var batch_ctx_new = try BatchContext.create(allocator, &pipeline.metrics, event_mod.AckToken.none(), 1);
+    var batch_ctx_new = try BatchContext.create(allocator, &pipeline.metrics, event_mod.AckToken.none(), 1, "test");
     defer if (batch_ctx_new_alive) batch_ctx_new.forceRelease();
 
     const ctx_new = try EventContext.create(allocator, batch_ctx_new);
@@ -1776,11 +1932,11 @@ test "batch context records ack metrics" {
 
     var pipeline_metrics = metrics_mod.PipelineMetrics.init(&metrics_sink);
 
-    var success_ctx = try BatchContext.create(allocator, &pipeline_metrics, event_mod.AckToken.none(), 1);
+    var success_ctx = try BatchContext.create(allocator, &pipeline_metrics, event_mod.AckToken.none(), 1, "test");
     std.Thread.sleep(1 * std.time.ns_per_ms);
     success_ctx.complete(true);
 
-    var failure_ctx = try BatchContext.create(allocator, &pipeline_metrics, event_mod.AckToken.none(), 1);
+    var failure_ctx = try BatchContext.create(allocator, &pipeline_metrics, event_mod.AckToken.none(), 1, "test");
     std.Thread.sleep(1 * std.time.ns_per_ms);
     failure_ctx.complete(false);
 

@@ -119,6 +119,7 @@ fn describeRuntimeError(err: runtime.Error) RuntimeErrorDescription {
         config_mod.ValidationError.MissingSinks => .{ .message = "pipeline must define at least one sink" },
         config_mod.ValidationError.InvalidParallelism => .{ .message = "pipeline component declares zero parallelism" },
         config_mod.ValidationError.InvalidQueueCapacity => .{ .message = "pipeline queue capacity must be greater than zero" },
+        config_mod.ValidationError.InvalidLimit => .{ .message = "pipeline limit configuration is invalid" },
         pipeline_mod.Error.CycleDetected => .{ .message = "pipeline topology contains cycles" },
         pipeline_mod.Error.UnknownSource => .{ .message = "collector produced batch for unknown source" },
         pipeline_mod.Error.ChannelClosed => .{ .message = "worker communication channel closed unexpectedly" },
@@ -200,6 +201,12 @@ test "describe runtime error includes feature gate detail" {
 test "describe runtime error maps collector" {
     const desc = describeRuntimeError(collector_mod.CollectorError.UnsupportedSource);
     try std.testing.expectEqualStrings("collector: unsupported source type", desc.message);
+    try std.testing.expect(desc.detail == null);
+}
+
+test "describe runtime error maps invalid limit" {
+    const desc = describeRuntimeError(config_mod.ValidationError.InvalidLimit);
+    try std.testing.expectEqualStrings("pipeline limit configuration is invalid", desc.message);
     try std.testing.expect(desc.detail == null);
 }
 
