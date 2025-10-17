@@ -28,6 +28,7 @@ const SectionRef = union(enum) {
     source: usize,
     transform: usize,
     transform_limits: usize,
+    transform_sharding: usize,
     sink: usize,
 };
 
@@ -55,6 +56,10 @@ const TransformDraft = struct {
     limits_cpu_budget_ns_per_sec: ?u64 = null,
     limits_late_event_threshold_seconds: ?usize = null,
     error_policy: ?cfg.SqlErrorPolicy = null,
+    sharding_shard_count: ?usize = null,
+    sharding_key_field: ?[]const u8 = null,
+    sharding_key_metadata: ?cfg.SqlShardMetadataKey = null,
+    sharding_fallback: ?cfg.SqlShardFallback = null,
 };
 
 const SinkDraft = struct {
@@ -123,8 +128,13 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !cfg.OwnedPipelin
                             }
                         }
                         if (existing_idx == null) return ParseError.MissingSection;
-                        if (!std.mem.eql(u8, subsection, "limits")) return ParseError.UnknownSection;
-                        current = SectionRef{ .transform_limits = existing_idx.? };
+                        if (std.mem.eql(u8, subsection, "limits")) {
+                            current = SectionRef{ .transform_limits = existing_idx.? };
+                        } else if (std.mem.eql(u8, subsection, "sharding")) {
+                            current = SectionRef{ .transform_sharding = existing_idx.? };
+                        } else {
+                            return ParseError.UnknownSection;
+                        }
                     },
                     else => return ParseError.InvalidSyntax,
                 }
@@ -161,6 +171,7 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !cfg.OwnedPipelin
             .source => |idx| try applySourceKV(arena, &source_drafts.items[idx], kv.key, kv.value),
             .transform => |idx| try applyTransformKV(arena, &transform_drafts.items[idx], kv.key, kv.value),
             .transform_limits => |idx| try applyTransformLimitsKV(arena, &transform_drafts.items[idx], kv.key, kv.value),
+            .transform_sharding => |idx| try applyTransformShardingKV(arena, &transform_drafts.items[idx], kv.key, kv.value),
             .sink => |idx| try applySinkKV(arena, &sink_drafts.items[idx], kv.key, kv.value),
         }
     }
@@ -186,6 +197,21 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !cfg.OwnedPipelin
                 const query = draft.query orelse return ParseError.MissingQuery;
     const default_queue = cfg.QueueConfig{};
     const default_limits = cfg.SqlLimitConfig{};
+                if (draft.sharding_key_field != null and draft.sharding_key_metadata != null) {
+                    return ParseError.InvalidValue;
+                }
+                const shard_count = draft.sharding_shard_count orelse 1;
+                var sharding_key: ?cfg.SqlShardKey = null;
+                if (draft.sharding_key_field) |field_name| {
+                    sharding_key = cfg.SqlShardKey{ .field = field_name };
+                } else if (draft.sharding_key_metadata) |metadata_key| {
+                    sharding_key = cfg.SqlShardKey{ .metadata = metadata_key };
+                }
+                const sharding_config = cfg.SqlShardingConfig{
+                    .shard_count = shard_count,
+                    .key = sharding_key,
+                    .fallback = draft.sharding_fallback orelse .route_first,
+                };
                 try transforms_out.append(arena, .{
                     .sql = .{
                         .id = draft.id,
@@ -210,6 +236,7 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !cfg.OwnedPipelin
                             .late_event_threshold_seconds = if (draft.limits_late_event_threshold_seconds) |secs| @intCast(secs) else default_limits.late_event_threshold_seconds,
                         },
                         .error_policy = draft.error_policy orelse .skip_event,
+                        .sharding = sharding_config,
                     },
                 });
             },
@@ -377,6 +404,34 @@ fn applyTransformLimitsKV(arena: std.mem.Allocator, draft: *TransformDraft, key:
     if (std.mem.eql(u8, key, "late_event_threshold_seconds")) {
         if (draft.limits_late_event_threshold_seconds != null) return ParseError.DuplicateKey;
         draft.limits_late_event_threshold_seconds = try parseNonNegativeInt(value);
+        return;
+    }
+
+    return ParseError.InvalidValue;
+}
+
+fn applyTransformShardingKV(arena: std.mem.Allocator, draft: *TransformDraft, key: []const u8, value: []const u8) !void {
+    if (std.mem.eql(u8, key, "shard_count")) {
+        if (draft.sharding_shard_count != null) return ParseError.DuplicateKey;
+        draft.sharding_shard_count = try parsePositiveInt(value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "key_field")) {
+        if (draft.sharding_key_field != null) return ParseError.DuplicateKey;
+        draft.sharding_key_field = try parseStringValue(arena, value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "key_metadata")) {
+        if (draft.sharding_key_metadata != null) return ParseError.DuplicateKey;
+        draft.sharding_key_metadata = try parseShardMetadataKey(arena, value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "fallback")) {
+        if (draft.sharding_fallback != null) return ParseError.DuplicateKey;
+        draft.sharding_fallback = try parseShardFallback(arena, value);
         return;
     }
 
@@ -576,6 +631,20 @@ fn parseErrorPolicy(arena: std.mem.Allocator, raw: []const u8) !cfg.SqlErrorPoli
     return ParseError.InvalidValue;
 }
 
+fn parseShardFallback(arena: std.mem.Allocator, raw: []const u8) !cfg.SqlShardFallback {
+    const literal = try parseLiteralSlice(arena, raw);
+    if (ascii.eqlIgnoreCase(literal, "first_shard")) return .route_first;
+    if (ascii.eqlIgnoreCase(literal, "route_first")) return .route_first;
+    if (ascii.eqlIgnoreCase(literal, "drop")) return .drop;
+    return ParseError.InvalidValue;
+}
+
+fn parseShardMetadataKey(arena: std.mem.Allocator, raw: []const u8) !cfg.SqlShardMetadataKey {
+    const literal = try parseLiteralSlice(arena, raw);
+    if (ascii.eqlIgnoreCase(literal, "source_id")) return .source_id;
+    return ParseError.InvalidValue;
+}
+
 fn parsePositiveInt(raw: []const u8) !usize {
     if (raw.len == 0) return ParseError.InvalidValue;
     const value = std.fmt.parseInt(usize, raw, 10) catch return ParseError.InvalidValue;
@@ -735,6 +804,8 @@ test "parse sample config" {
     try testing.expect(pipeline.sinks.len == 1);
     const sql_transform = pipeline.transforms[0].sql;
     try testing.expect(sql_transform.limits.late_event_threshold_seconds == null);
+    try testing.expectEqual(@as(usize, 1), sql_transform.sharding.shard_count);
+    try testing.expect(sql_transform.sharding.key == null);
     try pipeline.validate(testing.allocator);
 }
 
@@ -776,6 +847,67 @@ test "parse execution settings" {
     try testing.expectEqual(@as(usize, 2), sink_settings.parallelism);
     try testing.expectEqual(@as(usize, 512), sink_settings.queue.capacity);
     try testing.expect(sink_settings.queue.strategy == .drop_newest);
+}
+
+test "parse sharding config" {
+    const config = ("[sources.syslog_in]\n" ++
+        "type = \"syslog\"\n" ++
+        "address = \"udp://127.0.0.1:5514\"\n" ++
+        "\n" ++
+        "[transforms.sql_sharded]\n" ++
+        "type = \"sql\"\n" ++
+        "inputs = [\"syslog_in\"]\n" ++
+        "query = \"SELECT message FROM logs\"\n" ++
+        "\n" ++
+        "[transforms.sql_sharded.sharding]\n" ++
+        "shard_count = 4\n" ++
+        "key_field = \"hostname\"\n" ++
+        "fallback = \"drop\"\n" ++
+        "\n" ++
+        "[sinks.console]\n" ++
+        "type = \"console\"\n" ++
+        "inputs = [\"sql_sharded\"]\n");
+
+    var owned = try parse(testing.allocator, config);
+    defer owned.deinit(testing.allocator);
+
+    const pipeline = owned.pipeline;
+    try testing.expectEqual(@as(usize, 1), pipeline.transforms.len);
+    const sql_transform = pipeline.transforms[0].sql;
+    try testing.expectEqual(@as(usize, 4), sql_transform.sharding.shard_count);
+    const shard_key = sql_transform.sharding.key orelse return testing.expect(false);
+    try testing.expect(shard_key == .field);
+    try testing.expect(std.mem.eql(u8, shard_key.field, "hostname"));
+    try testing.expect(sql_transform.sharding.fallback == .drop);
+    try pipeline.validate(testing.allocator);
+}
+
+test "parse sharding metadata key" {
+    const config = ("[sources.syslog_in]\n" ++
+        "type = \"syslog\"\n" ++
+        "address = \"udp://127.0.0.1:5514\"\n" ++
+        "\n" ++
+        "[transforms.sql_meta]\n" ++
+        "type = \"sql\"\n" ++
+        "inputs = [\"syslog_in\"]\n" ++
+        "query = \"SELECT * FROM logs\"\n" ++
+        "\n" ++
+        "[transforms.sql_meta.sharding]\n" ++
+        "shard_count = 2\n" ++
+        "key_metadata = \"source_id\"\n" ++
+        "\n" ++
+        "[sinks.console]\n" ++
+        "type = \"console\"\n" ++
+        "inputs = [\"sql_meta\"]\n");
+
+    var owned = try parse(testing.allocator, config);
+    defer owned.deinit(testing.allocator);
+
+    const sql_transform = owned.pipeline.transforms[0].sql;
+    try testing.expectEqual(@as(usize, 2), sql_transform.sharding.shard_count);
+    const shard_key = sql_transform.sharding.key orelse return testing.expect(false);
+    try testing.expect(shard_key == .metadata);
+    try testing.expect(shard_key.metadata == .source_id);
 }
 
 test "parse nested transform limits table" {

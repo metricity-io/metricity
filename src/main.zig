@@ -120,6 +120,8 @@ fn describeRuntimeError(err: runtime.Error) RuntimeErrorDescription {
         config_mod.ValidationError.InvalidParallelism => .{ .message = "pipeline component declares zero parallelism" },
         config_mod.ValidationError.InvalidQueueCapacity => .{ .message = "pipeline queue capacity must be greater than zero" },
         config_mod.ValidationError.InvalidLimit => .{ .message = "pipeline limit configuration is invalid" },
+        config_mod.ValidationError.InvalidShardCount => .{ .message = "transform shard count must be greater than zero" },
+        config_mod.ValidationError.MissingShardKey => .{ .message = "sharded transform requires a shard key" },
         pipeline_mod.Error.CycleDetected => .{ .message = "pipeline topology contains cycles" },
         pipeline_mod.Error.UnknownSource => .{ .message = "collector produced batch for unknown source" },
         pipeline_mod.Error.ChannelClosed => .{ .message = "worker communication channel closed unexpectedly" },

@@ -96,6 +96,37 @@ eviction_sweep_seconds = 30         # Set to 0 to disable periodic sweeps
 The max-groups limit is also enforced after every event; TTL relies on the periodic sweep (or the next
 execution triggered by an event) to reclaim stale groups.
 
+## Sharding
+
+SQL transforms can spread their workload across multiple shards. Each shard owns an independent SQL
+program, allocator arena and work queue, so slow or blocked keys do not stall other traffic.
+
+Sharding is configured with a nested table:
+
+```toml
+[transforms.sql_enrich]
+type = "sql"
+inputs = ["syslog_in"]
+query = "SELECT host, COUNT(*) AS total FROM logs GROUP BY host"
+
+[transforms.sql_enrich.sharding]
+shard_count = 8
+key_field = "host"          # or: key_metadata = "source_id"
+fallback = "first_shard"    # or: "drop"
+```
+
+- `shard_count` (default `1`) sets the number of shards. Each shard inherits the transform queue
+  settings and spawns its own worker threads.
+- `key_field` hashes a log field to choose a shard. Alternatively `key_metadata` can target
+  built-in metadata such as `source_id`. Exactly one key selector must be provided when sharding is
+  enabled.
+- `fallback` controls behaviour when the selector cannot produce a key. `"first_shard"` routes the
+  event to shard `0`, while `"drop"` acknowledges the event without executing the query.
+
+Per-shard channel metrics are exposed automatically. Missing shard keys also increment
+`pipeline_errors_total_transform_<id>_missing_shard_key_route` or
+`pipeline_errors_total_transform_<id>_missing_shard_key_drop` depending on the fallback.
+
 ## Supported Aggregate Functions
 
 | Function                | Notes |
