@@ -50,6 +50,22 @@ const ack_metrics = struct {
     const latency_count = "pipeline_ack_latency_events_total";
 };
 
+const pipeline_metrics = struct {
+    const source_ingested = "pipeline_events_ingested_total";
+    const transform_processed = "pipeline_events_processed_total";
+    const sink_emitted = "pipeline_rows_emitted_total";
+    const transform_exec_time_total = "pipeline_transform_exec_ns_total";
+    const transform_exec_time_count = "pipeline_transform_exec_events_total";
+    const transform_state_bytes = "pipeline_group_state_bytes";
+    const transform_group_count = "pipeline_group_count";
+    const transform_evictions = "pipeline_group_evictions_total";
+    const transform_late_events = "pipeline_late_events_total";
+    const transform_truncate = "pipeline_row_truncate_total";
+    const transform_errors = "pipeline_errors_total";
+    const pipeline_latency_total = "pipeline_event_latency_ns_total";
+    const pipeline_latency_count = "pipeline_event_latency_count";
+};
+
 pub const PipelineMetrics = struct {
     sink: ?*const source_mod.Metrics = null,
 
@@ -81,6 +97,75 @@ pub const PipelineMetrics = struct {
         const sink = self.sink orelse return;
         sink.incrCounter(ack_metrics.latency_total, latency_ns);
         sink.incrCounter(ack_metrics.latency_count, 1);
+    }
+
+    pub fn recordSourceIngest(self: *const PipelineMetrics, name: []const u8, delta: u64) void {
+        self.emitCounter(pipeline_metrics.source_ingested, "source", name, delta);
+    }
+
+    pub fn recordTransformProcessed(self: *const PipelineMetrics, name: []const u8, delta: u64) void {
+        self.emitCounter(pipeline_metrics.transform_processed, "transform", name, delta);
+    }
+
+    pub fn recordSinkEmitted(self: *const PipelineMetrics, name: []const u8, delta: u64) void {
+        self.emitCounter(pipeline_metrics.sink_emitted, "sink", name, delta);
+    }
+
+    pub fn recordTransformExecTime(self: *const PipelineMetrics, name: []const u8, ns: u64) void {
+        self.emitCounter(pipeline_metrics.transform_exec_time_total, "transform", name, ns);
+        self.emitCounter(pipeline_metrics.transform_exec_time_count, "transform", name, 1);
+    }
+
+    pub fn recordPipelineLatency(self: *const PipelineMetrics, name: []const u8, ns: u64) void {
+        self.emitCounter(pipeline_metrics.pipeline_latency_total, "node", name, ns);
+        self.emitCounter(pipeline_metrics.pipeline_latency_count, "node", name, 1);
+    }
+
+    pub fn recordTransformState(self: *const PipelineMetrics, name: []const u8, bytes: usize) void {
+        self.emitGauge(pipeline_metrics.transform_state_bytes, "transform", name, bytes);
+    }
+
+    pub fn recordTransformGroupCount(self: *const PipelineMetrics, name: []const u8, count: usize) void {
+        self.emitGauge(pipeline_metrics.transform_group_count, "transform", name, count);
+    }
+
+    pub fn recordTransformEviction(self: *const PipelineMetrics, name: []const u8, reason: []const u8, delta: u64) void {
+        self.emitCounterWithReason(pipeline_metrics.transform_evictions, "transform", name, reason, delta);
+    }
+
+    pub fn recordTransformLateEvent(self: *const PipelineMetrics, name: []const u8, delta: u64) void {
+        self.emitCounter(pipeline_metrics.transform_late_events, "transform", name, delta);
+    }
+
+    pub fn recordTransformTruncate(self: *const PipelineMetrics, name: []const u8, target: []const u8, delta: u64) void {
+        self.emitCounterWithReason(pipeline_metrics.transform_truncate, "transform", name, target, delta);
+    }
+
+    pub fn recordTransformError(self: *const PipelineMetrics, name: []const u8, policy: []const u8, delta: u64) void {
+        self.emitCounterWithReason(pipeline_metrics.transform_errors, "transform", name, policy, delta);
+    }
+
+    fn emitCounter(self: *const PipelineMetrics, base: []const u8, kind: []const u8, name: []const u8, delta: u64) void {
+        const sink = self.sink orelse return;
+        var buffer: [128]u8 = undefined;
+        const metric_name = std.fmt.bufPrint(&buffer, "{s}_{s}_{s}", .{ base, kind, name }) catch return;
+        sink.incrCounter(metric_name, delta);
+    }
+
+    fn emitCounterWithReason(self: *const PipelineMetrics, base: []const u8, kind: []const u8, name: []const u8, reason: []const u8, delta: u64) void {
+        const sink = self.sink orelse return;
+        var buffer: [160]u8 = undefined;
+        const metric_name = std.fmt.bufPrint(&buffer, "{s}_{s}_{s}_{s}", .{ base, kind, name, reason }) catch return;
+        sink.incrCounter(metric_name, delta);
+    }
+
+    fn emitGauge(self: *const PipelineMetrics, base: []const u8, kind: []const u8, name: []const u8, value: usize) void {
+        const sink = self.sink orelse return;
+        if (std.math.cast(i64, value)) |gauge_value| {
+            var buffer: [128]u8 = undefined;
+            const metric_name = std.fmt.bufPrint(&buffer, "{s}_{s}_{s}", .{ base, kind, name }) catch return;
+            sink.recordGauge(metric_name, gauge_value);
+        }
     }
 };
 

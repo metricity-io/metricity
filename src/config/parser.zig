@@ -27,6 +27,8 @@ const SectionKind = enum { sources, transforms, sinks };
 const SectionRef = union(enum) {
     source: usize,
     transform: usize,
+    transform_limits: usize,
+    transform_sharding: usize,
     sink: usize,
 };
 
@@ -45,6 +47,23 @@ const TransformDraft = struct {
     parallelism: ?usize = null,
     queue_capacity: ?usize = null,
     queue_strategy: ?cfg.QueueStrategy = null,
+    eviction_ttl_seconds: ?usize = null,
+    eviction_max_groups: ?usize = null,
+    eviction_sweep_seconds: ?usize = null,
+    limits_max_state_bytes: ?usize = null,
+    limits_max_row_bytes: ?usize = null,
+    limits_max_group_bytes: ?usize = null,
+    limits_cpu_budget_ns_per_sec: ?u64 = null,
+    limits_late_event_threshold_seconds: ?usize = null,
+    error_policy: ?cfg.SqlErrorPolicy = null,
+    sharding_shard_count: ?usize = null,
+    sharding_key_field: ?[]const u8 = null,
+    sharding_key_metadata: ?cfg.SqlShardMetadataKey = null,
+    sharding_fallback: ?cfg.SqlShardFallback = null,
+    event_time_field: ?[]const u8 = null,
+    event_time_metadata: ?cfg.SqlEventTimeMetadata = null,
+    watermark_lag_seconds: ?usize = null,
+    allowed_lateness_seconds: ?usize = null,
 };
 
 const SinkDraft = struct {
@@ -101,6 +120,31 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !cfg.OwnedPipelin
 
         if (trimmed[0] == '[') {
             const section = try parseSection(arena, trimmed);
+            if (section.subsection) |subsection| {
+                switch (section.kind) {
+                    .transforms => {
+                        var existing_idx: ?usize = null;
+                        var i: usize = 0;
+                        while (i < transform_drafts.items.len) : (i += 1) {
+                            if (std.mem.eql(u8, transform_drafts.items[i].id, section.id)) {
+                                existing_idx = i;
+                                break;
+                            }
+                        }
+                        if (existing_idx == null) return ParseError.MissingSection;
+                        if (std.mem.eql(u8, subsection, "limits")) {
+                            current = SectionRef{ .transform_limits = existing_idx.? };
+                        } else if (std.mem.eql(u8, subsection, "sharding")) {
+                            current = SectionRef{ .transform_sharding = existing_idx.? };
+                        } else {
+                            return ParseError.UnknownSection;
+                        }
+                    },
+                    else => return ParseError.InvalidSyntax,
+                }
+                continue;
+            }
+
             try registerId(allocator, &id_registry, section.id);
             switch (section.kind) {
                 .sources => {
@@ -130,6 +174,8 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !cfg.OwnedPipelin
         switch (current.?) {
             .source => |idx| try applySourceKV(arena, &source_drafts.items[idx], kv.key, kv.value),
             .transform => |idx| try applyTransformKV(arena, &transform_drafts.items[idx], kv.key, kv.value),
+            .transform_limits => |idx| try applyTransformLimitsKV(arena, &transform_drafts.items[idx], kv.key, kv.value),
+            .transform_sharding => |idx| try applyTransformShardingKV(arena, &transform_drafts.items[idx], kv.key, kv.value),
             .sink => |idx| try applySinkKV(arena, &sink_drafts.items[idx], kv.key, kv.value),
         }
     }
@@ -154,6 +200,22 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !cfg.OwnedPipelin
             .sql => {
                 const query = draft.query orelse return ParseError.MissingQuery;
                 const default_queue = cfg.QueueConfig{};
+                const default_limits = cfg.SqlLimitConfig{};
+                if (draft.sharding_key_field != null and draft.sharding_key_metadata != null) {
+                    return ParseError.InvalidValue;
+                }
+                const shard_count = draft.sharding_shard_count orelse 1;
+                var sharding_key: ?cfg.SqlShardKey = null;
+                if (draft.sharding_key_field) |field_name| {
+                    sharding_key = cfg.SqlShardKey{ .field = field_name };
+                } else if (draft.sharding_key_metadata) |metadata_key| {
+                    sharding_key = cfg.SqlShardKey{ .metadata = metadata_key };
+                }
+                const sharding_config = cfg.SqlShardingConfig{
+                    .shard_count = shard_count,
+                    .key = sharding_key,
+                    .fallback = draft.sharding_fallback orelse .route_first,
+                };
                 try transforms_out.append(arena, .{
                     .sql = .{
                         .id = draft.id,
@@ -165,6 +227,24 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !cfg.OwnedPipelin
                             .capacity = draft.queue_capacity orelse default_queue.capacity,
                             .strategy = draft.queue_strategy orelse default_queue.strategy,
                         },
+                        .eviction = .{
+                            .ttl_seconds = if (draft.eviction_ttl_seconds) |ttl| @intCast(ttl) else null,
+                            .max_groups = draft.eviction_max_groups,
+                            .sweep_interval_seconds = if (draft.eviction_sweep_seconds) |seconds| @intCast(seconds) else null,
+                        },
+                        .limits = .{
+                            .max_state_bytes = draft.limits_max_state_bytes orelse default_limits.max_state_bytes,
+                            .max_row_bytes = draft.limits_max_row_bytes orelse default_limits.max_row_bytes,
+                            .max_group_bytes = draft.limits_max_group_bytes orelse default_limits.max_group_bytes,
+                            .cpu_budget_ns_per_second = draft.limits_cpu_budget_ns_per_sec orelse default_limits.cpu_budget_ns_per_second,
+                            .late_event_threshold_seconds = if (draft.limits_late_event_threshold_seconds) |secs| @intCast(secs) else default_limits.late_event_threshold_seconds,
+                        },
+                        .error_policy = draft.error_policy orelse .skip_event,
+                        .sharding = sharding_config,
+                        .event_time_field = draft.event_time_field,
+                        .event_time_metadata = draft.event_time_metadata,
+                        .watermark_lag_seconds = if (draft.watermark_lag_seconds) |secs| @intCast(secs) else null,
+                        .allowed_lateness_seconds = if (draft.allowed_lateness_seconds) |secs| @intCast(secs) else null,
                     },
                 });
             },
@@ -269,6 +349,121 @@ fn applyTransformKV(arena: std.mem.Allocator, draft: *TransformDraft, key: []con
         if (draft.queue_strategy != null) return ParseError.DuplicateKey;
         const strategy_name = try parseStringValue(arena, value);
         draft.queue_strategy = try parseQueueStrategy(strategy_name);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "eviction_ttl_seconds")) {
+        if (draft.eviction_ttl_seconds != null) return ParseError.DuplicateKey;
+        draft.eviction_ttl_seconds = try parseNonNegativeInt(value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "eviction_max_groups")) {
+        if (draft.eviction_max_groups != null) return ParseError.DuplicateKey;
+        draft.eviction_max_groups = try parseNonNegativeInt(value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "eviction_sweep_seconds")) {
+        if (draft.eviction_sweep_seconds != null) return ParseError.DuplicateKey;
+        draft.eviction_sweep_seconds = try parseNonNegativeInt(value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "event_time_field")) {
+        if (draft.event_time_field != null) return ParseError.DuplicateKey;
+        draft.event_time_field = try parseStringValue(arena, value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "event_time_metadata")) {
+        if (draft.event_time_metadata != null) return ParseError.DuplicateKey;
+        draft.event_time_metadata = try parseEventTimeMetadata(arena, value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "watermark_lag_seconds")) {
+        if (draft.watermark_lag_seconds != null) return ParseError.DuplicateKey;
+        draft.watermark_lag_seconds = try parseNonNegativeInt(value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "allowed_lateness_seconds")) {
+        if (draft.allowed_lateness_seconds != null) return ParseError.DuplicateKey;
+        draft.allowed_lateness_seconds = try parseNonNegativeInt(value);
+        return;
+    }
+
+    if (std.mem.startsWith(u8, key, "limits_") and key.len > "limits_".len) {
+        const bare_key = key["limits_".len..];
+        return applyTransformLimitsKV(arena, draft, bare_key, value);
+    }
+
+    if (std.mem.eql(u8, key, "error_policy")) {
+        if (draft.error_policy != null) return ParseError.DuplicateKey;
+        draft.error_policy = try parseErrorPolicy(arena, value);
+        return;
+    }
+
+    return ParseError.InvalidValue;
+}
+
+fn applyTransformLimitsKV(arena: std.mem.Allocator, draft: *TransformDraft, key: []const u8, value: []const u8) !void {
+    if (std.mem.eql(u8, key, "max_state_bytes")) {
+        if (draft.limits_max_state_bytes != null) return ParseError.DuplicateKey;
+        draft.limits_max_state_bytes = try parseByteQuantity(arena, value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "max_row_bytes")) {
+        if (draft.limits_max_row_bytes != null) return ParseError.DuplicateKey;
+        draft.limits_max_row_bytes = try parseByteQuantity(arena, value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "max_group_bytes")) {
+        if (draft.limits_max_group_bytes != null) return ParseError.DuplicateKey;
+        draft.limits_max_group_bytes = try parseByteQuantity(arena, value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "cpu_budget_ns_per_sec")) {
+        if (draft.limits_cpu_budget_ns_per_sec != null) return ParseError.DuplicateKey;
+        draft.limits_cpu_budget_ns_per_sec = try parseDurationNs(arena, value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "late_event_threshold_seconds")) {
+        if (draft.limits_late_event_threshold_seconds != null) return ParseError.DuplicateKey;
+        draft.limits_late_event_threshold_seconds = try parseNonNegativeInt(value);
+        return;
+    }
+
+    return ParseError.InvalidValue;
+}
+
+fn applyTransformShardingKV(arena: std.mem.Allocator, draft: *TransformDraft, key: []const u8, value: []const u8) !void {
+    if (std.mem.eql(u8, key, "shard_count")) {
+        if (draft.sharding_shard_count != null) return ParseError.DuplicateKey;
+        draft.sharding_shard_count = try parsePositiveInt(value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "key_field")) {
+        if (draft.sharding_key_field != null) return ParseError.DuplicateKey;
+        draft.sharding_key_field = try parseStringValue(arena, value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "key_metadata")) {
+        if (draft.sharding_key_metadata != null) return ParseError.DuplicateKey;
+        draft.sharding_key_metadata = try parseShardMetadataKey(arena, value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "fallback")) {
+        if (draft.sharding_fallback != null) return ParseError.DuplicateKey;
+        draft.sharding_fallback = try parseShardFallback(arena, value);
         return;
     }
 
@@ -382,11 +577,122 @@ fn parseStringArray(arena: std.mem.Allocator, raw: []const u8) ![]const []const 
     return try list.toOwnedSlice(arena);
 }
 
+fn parseLiteralSlice(arena: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    if (raw.len != 0 and raw[0] == '"') {
+        return parseStringValue(arena, raw);
+    }
+    return std.mem.trim(u8, raw, " \t\r");
+}
+
+fn parseByteQuantity(arena: std.mem.Allocator, raw: []const u8) !usize {
+    const literal = try parseLiteralSlice(arena, raw);
+    if (literal.len == 0) return ParseError.InvalidValue;
+
+    var idx: usize = 0;
+    while (idx < literal.len and ascii.isDigit(literal[idx])) : (idx += 1) {}
+    if (idx == 0) return ParseError.InvalidValue;
+
+    const number_slice = literal[0..idx];
+    const base_value = std.fmt.parseInt(u64, number_slice, 10) catch return ParseError.InvalidValue;
+    const suffix = std.mem.trim(u8, literal[idx..], " \t\r");
+
+    var multiplier: u64 = 1;
+    if (suffix.len != 0) {
+        if (ascii.eqlIgnoreCase(suffix, "b")) {
+            multiplier = 1;
+        } else if (ascii.eqlIgnoreCase(suffix, "kib")) {
+            multiplier = 1024;
+        } else if (ascii.eqlIgnoreCase(suffix, "mib")) {
+            multiplier = 1024 * 1024;
+        } else if (ascii.eqlIgnoreCase(suffix, "gib")) {
+            multiplier = 1024 * 1024 * 1024;
+        } else if (ascii.eqlIgnoreCase(suffix, "kb")) {
+            multiplier = 1000;
+        } else if (ascii.eqlIgnoreCase(suffix, "mb")) {
+            multiplier = 1000 * 1000;
+        } else if (ascii.eqlIgnoreCase(suffix, "gb")) {
+            multiplier = 1000 * 1000 * 1000;
+        } else {
+            return ParseError.InvalidValue;
+        }
+    }
+
+    const total = @as(u128, base_value) * multiplier;
+    if (total == 0) return ParseError.InvalidValue;
+    if (total > std.math.maxInt(usize)) return ParseError.InvalidValue;
+    return @intCast(total);
+}
+
+fn parseDurationNs(arena: std.mem.Allocator, raw: []const u8) !u64 {
+    const literal = try parseLiteralSlice(arena, raw);
+    if (literal.len == 0) return ParseError.InvalidValue;
+
+    var idx: usize = 0;
+    while (idx < literal.len and ascii.isDigit(literal[idx])) : (idx += 1) {}
+    if (idx == 0) return ParseError.InvalidValue;
+
+    const number_slice = literal[0..idx];
+    const magnitude = std.fmt.parseInt(u64, number_slice, 10) catch return ParseError.InvalidValue;
+    const suffix = std.mem.trim(u8, literal[idx..], " \t\r");
+
+    var multiplier: u64 = 1;
+    if (suffix.len == 0 or ascii.eqlIgnoreCase(suffix, "ns")) {
+        multiplier = 1;
+    } else if (ascii.eqlIgnoreCase(suffix, "us") or std.mem.eql(u8, suffix, "\xC2\xB5s")) {
+        multiplier = std.time.ns_per_us;
+    } else if (ascii.eqlIgnoreCase(suffix, "ms")) {
+        multiplier = std.time.ns_per_ms;
+    } else if (ascii.eqlIgnoreCase(suffix, "s")) {
+        multiplier = std.time.ns_per_s;
+    } else {
+        return ParseError.InvalidValue;
+    }
+
+    const total = @as(u128, magnitude) * multiplier;
+    if (total == 0) return ParseError.InvalidValue;
+    if (total > std.math.maxInt(u64)) return ParseError.InvalidValue;
+    return @intCast(total);
+}
+
+fn parseErrorPolicy(arena: std.mem.Allocator, raw: []const u8) !cfg.SqlErrorPolicy {
+    const literal = try parseLiteralSlice(arena, raw);
+    if (ascii.eqlIgnoreCase(literal, "skip_event")) return .skip_event;
+    if (ascii.eqlIgnoreCase(literal, "null")) return .null;
+    if (ascii.eqlIgnoreCase(literal, "clamp")) return .clamp;
+    if (ascii.eqlIgnoreCase(literal, "error")) return .propagate;
+    return ParseError.InvalidValue;
+}
+
+fn parseShardFallback(arena: std.mem.Allocator, raw: []const u8) !cfg.SqlShardFallback {
+    const literal = try parseLiteralSlice(arena, raw);
+    if (ascii.eqlIgnoreCase(literal, "first_shard")) return .route_first;
+    if (ascii.eqlIgnoreCase(literal, "route_first")) return .route_first;
+    if (ascii.eqlIgnoreCase(literal, "drop")) return .drop;
+    return ParseError.InvalidValue;
+}
+
+fn parseShardMetadataKey(arena: std.mem.Allocator, raw: []const u8) !cfg.SqlShardMetadataKey {
+    const literal = try parseLiteralSlice(arena, raw);
+    if (ascii.eqlIgnoreCase(literal, "source_id")) return .source_id;
+    return ParseError.InvalidValue;
+}
+
+fn parseEventTimeMetadata(arena: std.mem.Allocator, raw: []const u8) !cfg.SqlEventTimeMetadata {
+    const literal = try parseLiteralSlice(arena, raw);
+    if (ascii.eqlIgnoreCase(literal, "received_at")) return .received_at;
+    return ParseError.InvalidValue;
+}
+
 fn parsePositiveInt(raw: []const u8) !usize {
     if (raw.len == 0) return ParseError.InvalidValue;
     const value = std.fmt.parseInt(usize, raw, 10) catch return ParseError.InvalidValue;
     if (value == 0) return ParseError.InvalidValue;
     return value;
+}
+
+fn parseNonNegativeInt(raw: []const u8) !usize {
+    if (raw.len == 0) return ParseError.InvalidValue;
+    return std.fmt.parseInt(usize, raw, 10) catch ParseError.InvalidValue;
 }
 
 fn parseQueueStrategy(name: []const u8) !cfg.QueueStrategy {
@@ -463,17 +769,34 @@ fn splitKeyValue(line: []const u8) !KeyValue {
     return ParseError.InvalidSyntax;
 }
 
-fn parseSection(arena: std.mem.Allocator, line: []const u8) !struct { kind: SectionKind, id: []const u8 } {
+fn parseSection(arena: std.mem.Allocator, line: []const u8) !struct { kind: SectionKind, id: []const u8, subsection: ?[]const u8 } {
     if (line.len < 3 or line[line.len - 1] != ']') return ParseError.InvalidSyntax;
     const inner = std.mem.trim(u8, line[1 .. line.len - 1], " \t\r");
     const dot = std.mem.indexOfScalar(u8, inner, '.');
     if (dot == null) return ParseError.InvalidSyntax;
     const prefix = std.mem.trim(u8, inner[0..dot.?], " \t\r");
-    const id_part = std.mem.trim(u8, inner[dot.? + 1 ..], " \t\r");
-    if (id_part.len == 0) return ParseError.InvalidSyntax;
+    const rest = std.mem.trim(u8, inner[dot.? + 1 ..], " \t\r");
+    if (rest.len == 0) return ParseError.InvalidSyntax;
     const kind = if (std.mem.eql(u8, prefix, "sources")) SectionKind.sources else if (std.mem.eql(u8, prefix, "transforms")) SectionKind.transforms else if (std.mem.eql(u8, prefix, "sinks")) SectionKind.sinks else return ParseError.UnknownSection;
+    const sub_dot = std.mem.indexOfScalar(u8, rest, '.');
+
+    var id_part = rest;
+    var subsection_part: ?[]const u8 = null;
+
+    if (sub_dot) |idx| {
+        if (kind != SectionKind.transforms) return ParseError.InvalidSyntax;
+        id_part = std.mem.trim(u8, rest[0..idx], " \t\r");
+        const raw_subsection = std.mem.trim(u8, rest[idx + 1 ..], " \t\r");
+        if (raw_subsection.len == 0) return ParseError.InvalidSyntax;
+        if (std.mem.indexOfScalar(u8, raw_subsection, '.')) |_| {
+            return ParseError.InvalidSyntax;
+        }
+        subsection_part = try arena.dupe(u8, raw_subsection);
+    }
+
+    if (id_part.len == 0) return ParseError.InvalidSyntax;
     const id = try arena.dupe(u8, id_part);
-    return .{ .kind = kind, .id = id };
+    return .{ .kind = kind, .id = id, .subsection = subsection_part };
 }
 
 fn stripComment(line: []const u8) []const u8 {
@@ -517,6 +840,10 @@ test "parse sample config" {
     try testing.expect(pipeline.sources.len == 1);
     try testing.expect(pipeline.transforms.len == 1);
     try testing.expect(pipeline.sinks.len == 1);
+    const sql_transform = pipeline.transforms[0].sql;
+    try testing.expect(sql_transform.limits.late_event_threshold_seconds == null);
+    try testing.expectEqual(@as(usize, 1), sql_transform.sharding.shard_count);
+    try testing.expect(sql_transform.sharding.key == null);
     try pipeline.validate(testing.allocator);
 }
 
@@ -558,6 +885,107 @@ test "parse execution settings" {
     try testing.expectEqual(@as(usize, 2), sink_settings.parallelism);
     try testing.expectEqual(@as(usize, 512), sink_settings.queue.capacity);
     try testing.expect(sink_settings.queue.strategy == .drop_newest);
+}
+
+test "parse sharding config" {
+    const config = ("[sources.syslog_in]\n" ++
+        "type = \"syslog\"\n" ++
+        "address = \"udp://127.0.0.1:5514\"\n" ++
+        "\n" ++
+        "[transforms.sql_sharded]\n" ++
+        "type = \"sql\"\n" ++
+        "inputs = [\"syslog_in\"]\n" ++
+        "query = \"SELECT message FROM logs\"\n" ++
+        "\n" ++
+        "[transforms.sql_sharded.sharding]\n" ++
+        "shard_count = 4\n" ++
+        "key_field = \"hostname\"\n" ++
+        "fallback = \"drop\"\n" ++
+        "\n" ++
+        "[sinks.console]\n" ++
+        "type = \"console\"\n" ++
+        "inputs = [\"sql_sharded\"]\n");
+
+    var owned = try parse(testing.allocator, config);
+    defer owned.deinit(testing.allocator);
+
+    const pipeline = owned.pipeline;
+    try testing.expectEqual(@as(usize, 1), pipeline.transforms.len);
+    const sql_transform = pipeline.transforms[0].sql;
+    try testing.expectEqual(@as(usize, 4), sql_transform.sharding.shard_count);
+    const shard_key = sql_transform.sharding.key orelse return testing.expect(false);
+    try testing.expect(shard_key == .field);
+    try testing.expect(std.mem.eql(u8, shard_key.field, "hostname"));
+    try testing.expect(sql_transform.sharding.fallback == .drop);
+    try pipeline.validate(testing.allocator);
+}
+
+test "parse sharding metadata key" {
+    const config = ("[sources.syslog_in]\n" ++
+        "type = \"syslog\"\n" ++
+        "address = \"udp://127.0.0.1:5514\"\n" ++
+        "\n" ++
+        "[transforms.sql_meta]\n" ++
+        "type = \"sql\"\n" ++
+        "inputs = [\"syslog_in\"]\n" ++
+        "query = \"SELECT * FROM logs\"\n" ++
+        "\n" ++
+        "[transforms.sql_meta.sharding]\n" ++
+        "shard_count = 2\n" ++
+        "key_metadata = \"source_id\"\n" ++
+        "\n" ++
+        "[sinks.console]\n" ++
+        "type = \"console\"\n" ++
+        "inputs = [\"sql_meta\"]\n");
+
+    var owned = try parse(testing.allocator, config);
+    defer owned.deinit(testing.allocator);
+
+    const sql_transform = owned.pipeline.transforms[0].sql;
+    try testing.expectEqual(@as(usize, 2), sql_transform.sharding.shard_count);
+    const shard_key = sql_transform.sharding.key orelse return testing.expect(false);
+    try testing.expect(shard_key == .metadata);
+    try testing.expect(shard_key.metadata == .source_id);
+}
+
+test "parse nested transform limits table" {
+    const config = ("[sources.syslog_in]\n" ++
+        "type = \"syslog\"\n" ++
+        "address = \"udp://127.0.0.1:5514\"\n" ++
+        "\n" ++
+        "[transforms.sql_enrich]\n" ++
+        "type = \"sql\"\n" ++
+        "inputs = [\"syslog_in\"]\n" ++
+        "query = \"SELECT message, COUNT(*) AS total FROM logs GROUP BY message\"\n" ++
+        "error_policy = \"clamp\"\n" ++
+        "\n" ++
+        "[transforms.sql_enrich.limits]\n" ++
+        "max_state_bytes = \"32MiB\"\n" ++
+        "max_row_bytes = \"16KiB\"\n" ++
+        "max_group_bytes = \"512KiB\"\n" ++
+        "cpu_budget_ns_per_sec = \"50ms\"\n" ++
+        "late_event_threshold_seconds = 5\n" ++
+        "\n" ++
+        "[sinks.console]\n" ++
+        "type = \"console\"\n" ++
+        "inputs = [\"sql_enrich\"]\n" ++
+        "target = \"stdout\"\n");
+
+    var owned = try parse(testing.allocator, config);
+    defer owned.deinit(testing.allocator);
+    const pipeline = owned.pipeline;
+    try testing.expectEqual(@as(usize, 1), pipeline.sources.len);
+    try testing.expectEqual(@as(usize, 1), pipeline.transforms.len);
+    try testing.expectEqual(@as(usize, 1), pipeline.sinks.len);
+
+    const sql_transform = pipeline.transforms[0].sql;
+    try testing.expectEqual(@as(usize, 32 * 1024 * 1024), sql_transform.limits.max_state_bytes);
+    try testing.expectEqual(@as(usize, 16 * 1024), sql_transform.limits.max_row_bytes);
+    try testing.expectEqual(@as(usize, 512 * 1024), sql_transform.limits.max_group_bytes);
+    try testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), sql_transform.limits.cpu_budget_ns_per_second);
+    try testing.expect(sql_transform.limits.late_event_threshold_seconds != null);
+    try testing.expectEqual(@as(u64, 5), sql_transform.limits.late_event_threshold_seconds.?);
+    try testing.expect(sql_transform.error_policy == .clamp);
 }
 
 test "parseFile enforces size limit" {

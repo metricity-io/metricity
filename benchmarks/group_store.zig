@@ -1,0 +1,198 @@
+const std = @import("std");
+const metricity = @import("metricity");
+
+const runtime = metricity.sql.runtime;
+const parser = metricity.sql.parser;
+const source_mod = metricity.source;
+const event_mod = source_mod.event;
+
+const BenchmarkScenario = struct {
+    name: []const u8,
+    query: []const u8,
+    group_mod: ?usize = null,
+};
+
+const ScenarioResult = struct {
+    count: usize,
+    groups: usize,
+    insert_ns: u64,
+    lookup_ns: u64,
+    state_bytes: usize,
+
+    fn insertNsPerEvent(self: ScenarioResult) f128 {
+        if (self.count == 0) return 0;
+        return @as(f128, @floatFromInt(self.insert_ns)) / @as(f128, @floatFromInt(self.count));
+    }
+
+    fn lookupNsPerEvent(self: ScenarioResult) f128 {
+        if (self.count == 0) return 0;
+        return @as(f128, @floatFromInt(self.lookup_ns)) / @as(f128, @floatFromInt(self.count));
+    }
+
+    fn insertThroughput(self: ScenarioResult) f128 {
+        if (self.insert_ns == 0) return 0;
+        return @as(f128, @floatFromInt(self.count)) * @as(f128, @floatFromInt(std.time.ns_per_s)) /
+            @as(f128, @floatFromInt(self.insert_ns));
+    }
+
+    fn lookupThroughput(self: ScenarioResult) f128 {
+        if (self.lookup_ns == 0) return 0;
+        return @as(f128, @floatFromInt(self.count)) * @as(f128, @floatFromInt(std.time.ns_per_s)) /
+            @as(f128, @floatFromInt(self.lookup_ns));
+    }
+
+    fn bytesPerGroup(self: ScenarioResult) f128 {
+        if (self.groups == 0) return 0;
+        return @as(f128, @floatFromInt(self.state_bytes)) /
+            @as(f128, @floatFromInt(self.groups));
+    }
+};
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    var counts = try parseCounts(allocator, args);
+    defer allocator.free(counts);
+
+    if (counts.len == 0) {
+        const defaults = [_]usize{ 1_000, 10_000, 100_000, 250_000 };
+        counts = try allocator.alloc(usize, defaults.len);
+        @memcpy(counts, &defaults);
+    }
+
+    std.debug.print("benchmark,scenario,count,phase,elapsed_ns,ns_per_event,events_per_sec,state_bytes,state_bytes_per_group\n", .{});
+
+    const scenarios = [_]BenchmarkScenario{
+        .{ .name = "count_only", .query = "SELECT message, COUNT(*) AS total FROM logs GROUP BY message" },
+        .{ .name = "mixed_aggregates", .query =
+            "SELECT message, COUNT(*) AS total, SUM(syslog_severity) AS severity_sum, AVG(syslog_severity) AS severity_avg, MIN(message) AS first_msg, MAX(message) AS last_msg FROM logs GROUP BY message",
+            .group_mod = 128,
+        },
+    };
+
+    for (scenarios) |scenario| {
+        for (counts) |count| {
+            const result = try runScenario(allocator, scenario, count);
+            const insert_ns_per_event = result.insertNsPerEvent();
+            const lookup_ns_per_event = result.lookupNsPerEvent();
+            const insert_throughput = result.insertThroughput();
+            const lookup_throughput = result.lookupThroughput();
+            const bytes_per_group = result.bytesPerGroup();
+
+            std.debug.print(
+                "group_store,{s},{d},insert,{d},{d:.2},{d:.2},{d},{d:.2}\n",
+                .{ scenario.name, count, result.insert_ns, insert_ns_per_event, insert_throughput, result.state_bytes, bytes_per_group },
+            );
+            std.debug.print(
+                "group_store,{s},{d},lookup,{d},{d:.2},{d:.2},{d},{d:.2}\n",
+                .{ scenario.name, count, result.lookup_ns, lookup_ns_per_event, lookup_throughput, result.state_bytes, bytes_per_group },
+            );
+        }
+    }
+}
+
+fn parseCounts(allocator: std.mem.Allocator, args: [][:0]u8) ![]usize {
+    if (args.len <= 1) return allocator.alloc(usize, 0);
+    const raw = args[1..];
+    var list = std.ArrayListUnmanaged(usize){};
+    errdefer list.deinit(allocator);
+
+    for (raw) |arg| {
+        const trimmed = std.mem.trim(u8, std.mem.sliceTo(arg, 0), " ");
+        if (trimmed.len == 0) continue;
+        const value = std.fmt.parseInt(usize, trimmed, 10) catch |err| switch (err) {
+            error.InvalidCharacter => continue,
+            else => return err,
+        };
+        try list.append(allocator, value);
+    }
+
+    const owned = try list.toOwnedSlice(allocator);
+    list.deinit(allocator);
+    return owned;
+}
+
+fn runScenario(allocator: std.mem.Allocator, scenario: BenchmarkScenario, count: usize) !ScenarioResult {
+    var arena_inst = std.heap.ArenaAllocator.init(allocator);
+    defer arena_inst.deinit();
+
+    const stmt = try parser.parseSelect(arena_inst.allocator(), scenario.query);
+
+    var program = try runtime.compile(allocator, stmt, .{ .eviction = .{
+        .ttl_ns = null,
+        .max_groups = if (count == 0) 0 else count,
+        .sweep_interval_ns = 0,
+    } });
+    defer program.deinit();
+
+    var clock: u64 = 1;
+
+    const warmup_base = count / 10;
+    const warmup_count = if (warmup_base < 100_000) warmup_base else 100_000;
+    if (warmup_count > 0) {
+        try processEvents(&program, allocator, warmup_count, &clock, scenario.group_mod);
+        program.reset();
+        clock = 1;
+    }
+
+    var insert_timer = try std.time.Timer.start();
+    try processEvents(&program, allocator, count, &clock, scenario.group_mod);
+    const insert_ns = insert_timer.read();
+    const groups = program.groupCount();
+    const state_bytes = program.stateBytes();
+
+    var lookup_timer = try std.time.Timer.start();
+    try processEvents(&program, allocator, count, &clock, scenario.group_mod);
+    const lookup_ns = lookup_timer.read();
+
+    return ScenarioResult{
+        .count = count,
+        .groups = groups,
+        .insert_ns = insert_ns,
+        .lookup_ns = lookup_ns,
+        .state_bytes = state_bytes,
+    };
+}
+
+fn processEvents(program: *runtime.Program, allocator: std.mem.Allocator, count: usize, clock: *u64, group_mod: ?usize) !void {
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const group_index = if (group_mod) |mod| i % mod else i;
+        const message = try std.fmt.allocPrint(allocator, "group_{d}", .{group_index});
+        defer allocator.free(message);
+
+        var event = try createEvent(allocator, message);
+        defer freeEvent(allocator, event);
+
+        if (try program.execute(allocator, &event, nextTimestamp(clock))) |row| {
+            row.deinit();
+        }
+    }
+}
+
+fn createEvent(allocator: std.mem.Allocator, message: []const u8) !event_mod.Event {
+    const fields = try allocator.alloc(event_mod.Field, 1);
+    fields[0] = .{ .name = "syslog_severity", .value = .{ .integer = 5 } };
+
+    return event_mod.Event{
+        .metadata = .{ .source_id = "benchmark" },
+        .payload = .{ .log = .{ .message = message, .fields = fields } },
+    };
+}
+
+fn freeEvent(allocator: std.mem.Allocator, event: event_mod.Event) void {
+    switch (event.payload) {
+        .log => |log_event| allocator.free(log_event.fields),
+    }
+}
+
+fn nextTimestamp(counter: *u64) u64 {
+    const value = counter.*;
+    counter.* += 1;
+    return value;
+}

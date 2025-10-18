@@ -153,6 +153,21 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
+    const group_bench = b.addExecutable(.{
+        .name = "group_store_bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/group_store.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "metricity", .module = mod },
+            },
+        }),
+    });
+    group_bench.root_module.link_libc = true;
+    group_bench.root_module.sanitize_thread = sanitize_thread;
+    b.installArtifact(group_bench);
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.
@@ -178,6 +193,14 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
+
+    const group_bench_step = b.step("bench-group-store", "Run the group store benchmark");
+    const group_bench_run = b.addRunArtifact(group_bench);
+    group_bench_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        group_bench_run.addArgs(args);
+    }
+    group_bench_step.dependOn(&group_bench_run.step);
 
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to

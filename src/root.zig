@@ -12,6 +12,10 @@ pub const pipeline = @import("pipeline/mod.zig");
 pub const config_parser = @import("config/parser.zig");
 pub const di = @import("common/di.zig");
 
+pub const std_options: std.Options = .{
+    .log_level = if (builtin.is_test) .err else std.log.default_level,
+};
+
 comptime {
     if (builtin.is_test) {
         std.testing.refAllDecls(sql);

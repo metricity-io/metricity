@@ -82,6 +82,19 @@ const RuntimeErrorDescription = struct {
     detail: ?[]const u8 = null,
 };
 
+threadlocal var feature_gate_detail_buffer: [128]u8 = undefined;
+
+fn formatFeatureGateDetail(diag: sql_runtime.FeatureGateDiagnostic) []const u8 {
+    var stream = std.io.fixedBufferStream(&feature_gate_detail_buffer);
+    stream.reset();
+    const writer = stream.writer();
+    const name = sql_runtime.featureGateName(diag.feature);
+    writer.print("{s} unsupported (span {d}..{d})", .{ name, diag.span.start, diag.span.end }) catch {
+        return "unsupported feature";
+    };
+    return stream.getWritten();
+}
+
 fn describeRuntimeError(err: runtime.Error) RuntimeErrorDescription {
     return switch (err) {
         std.mem.Allocator.Error.OutOfMemory => .{ .message = "allocator exhausted memory" },
@@ -106,6 +119,9 @@ fn describeRuntimeError(err: runtime.Error) RuntimeErrorDescription {
         config_mod.ValidationError.MissingSinks => .{ .message = "pipeline must define at least one sink" },
         config_mod.ValidationError.InvalidParallelism => .{ .message = "pipeline component declares zero parallelism" },
         config_mod.ValidationError.InvalidQueueCapacity => .{ .message = "pipeline queue capacity must be greater than zero" },
+        config_mod.ValidationError.InvalidLimit => .{ .message = "pipeline limit configuration is invalid" },
+        config_mod.ValidationError.InvalidShardCount => .{ .message = "transform shard count must be greater than zero" },
+        config_mod.ValidationError.MissingShardKey => .{ .message = "sharded transform requires a shard key" },
         pipeline_mod.Error.CycleDetected => .{ .message = "pipeline topology contains cycles" },
         pipeline_mod.Error.UnknownSource => .{ .message = "collector produced batch for unknown source" },
         pipeline_mod.Error.ChannelClosed => .{ .message = "worker communication channel closed unexpectedly" },
@@ -122,7 +138,16 @@ fn describeRuntimeError(err: runtime.Error) RuntimeErrorDescription {
         sql_parser.ParseError.ExpectedToken => .{ .message = "sql parser: expected token missing" },
         sql_parser.ParseError.InvalidNumber => .{ .message = "sql parser: invalid numeric literal" },
         sql_parser.ParseError.LexError => .{ .message = "sql parser: lexical analysis failed" },
-        sql_runtime.Error.UnsupportedFeature => .{ .message = "sql runtime: unsupported feature" },
+        sql_runtime.Error.UnsupportedFeature => blk: {
+            const diag = sql_runtime.takeFeatureGateDiagnostic();
+            if (diag) |d| {
+                break :blk .{
+                    .message = "sql runtime: unsupported feature",
+                    .detail = formatFeatureGateDetail(d),
+                };
+            }
+            break :blk .{ .message = "sql runtime: unsupported feature" };
+        },
         sql_runtime.Error.UnknownColumn => .{ .message = "sql runtime: unknown column" },
         sql_runtime.Error.TypeMismatch => .{ .message = "sql runtime: type mismatch" },
         sql_runtime.Error.UnsupportedFunction => .{ .message = "sql runtime: unsupported function" },
@@ -160,9 +185,30 @@ test "describe parse error" {
     try std.testing.expectEqualStrings("unknown command", describeParseError(cli.ParseError.UnknownCommand));
 }
 
+test "describe runtime error includes feature gate detail" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try sql_parser.parseSelect(arena, "SELECT DISTINCT message FROM logs");
+    try std.testing.expectError(sql_runtime.Error.UnsupportedFeature, sql_runtime.compile(std.testing.allocator, stmt, .{}));
+
+    const desc = describeRuntimeError(sql_runtime.Error.UnsupportedFeature);
+    try std.testing.expectEqualStrings("sql runtime: unsupported feature", desc.message);
+    const detail = desc.detail orelse return std.testing.expect(false);
+    try std.testing.expect(std.mem.containsAtLeast(u8, detail, 1, "DISTINCT"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, detail, 1, "span"));
+}
+
 test "describe runtime error maps collector" {
     const desc = describeRuntimeError(collector_mod.CollectorError.UnsupportedSource);
     try std.testing.expectEqualStrings("collector: unsupported source type", desc.message);
+    try std.testing.expect(desc.detail == null);
+}
+
+test "describe runtime error maps invalid limit" {
+    const desc = describeRuntimeError(config_mod.ValidationError.InvalidLimit);
+    try std.testing.expectEqualStrings("pipeline limit configuration is invalid", desc.message);
     try std.testing.expect(desc.detail == null);
 }
 

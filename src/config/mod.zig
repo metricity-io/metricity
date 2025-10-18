@@ -11,6 +11,9 @@ pub const ValidationError = error{
     MissingSinks,
     InvalidParallelism,
     InvalidQueueCapacity,
+    InvalidLimit,
+    InvalidShardCount,
+    MissingShardKey,
 };
 
 pub const OwnedPipelineConfig = struct {
@@ -65,6 +68,9 @@ pub const PipelineConfig = struct {
             try validateInputs(transform.inputs(), components);
             try validateEdges(.transform, transform.outputs(), components);
             try validateExecutionSettings(transform.executionSettings());
+            switch (transform) {
+                .sql => |sql_cfg| try validateSqlTransform(sql_cfg),
+            }
         }
 
         for (self.sinks) |sink| {
@@ -86,6 +92,51 @@ pub const TransformType = enum {
     sql,
 };
 
+pub const SqlEvictionConfig = struct {
+    ttl_seconds: ?u64 = null,
+    max_groups: ?usize = null,
+    sweep_interval_seconds: ?u64 = null,
+};
+
+pub const SqlLimitConfig = struct {
+    max_state_bytes: usize = 64 * 1024 * 1024,
+    max_row_bytes: usize = 64 * 1024,
+    max_group_bytes: usize = 1024 * 1024,
+    cpu_budget_ns_per_second: u64 = 100_000_000,
+    late_event_threshold_seconds: ?u64 = null,
+};
+
+pub const SqlErrorPolicy = enum {
+    skip_event,
+    null,
+    clamp,
+    propagate,
+};
+
+pub const SqlShardFallback = enum {
+    route_first,
+    drop,
+};
+
+pub const SqlShardMetadataKey = enum {
+    source_id,
+};
+
+pub const SqlEventTimeMetadata = enum {
+    received_at,
+};
+
+pub const SqlShardKey = union(enum) {
+    field: []const u8,
+    metadata: SqlShardMetadataKey,
+};
+
+pub const SqlShardingConfig = struct {
+    shard_count: usize = 1,
+    key: ?SqlShardKey = null,
+    fallback: SqlShardFallback = .route_first,
+};
+
 pub const SqlTransform = struct {
     id: []const u8,
     inputs: []const []const u8,
@@ -93,6 +144,14 @@ pub const SqlTransform = struct {
     query: []const u8,
     parallelism: usize = 1,
     queue: QueueConfig = .{},
+    eviction: SqlEvictionConfig = .{},
+    limits: SqlLimitConfig = .{},
+    error_policy: SqlErrorPolicy = .skip_event,
+    sharding: SqlShardingConfig = .{},
+    event_time_field: ?[]const u8 = null,
+    event_time_metadata: ?SqlEventTimeMetadata = null,
+    watermark_lag_seconds: ?u64 = null,
+    allowed_lateness_seconds: ?u64 = null,
 };
 
 pub const TransformNode = union(TransformType) {
@@ -213,6 +272,21 @@ fn validateExecutionSettings(settings: ExecutionSettings) ValidationError!void {
     if (settings.queue.capacity == 0) return ValidationError.InvalidQueueCapacity;
 }
 
+fn validateSqlTransform(transform: SqlTransform) ValidationError!void {
+    if (transform.limits.max_state_bytes == 0) return ValidationError.InvalidLimit;
+    if (transform.limits.max_row_bytes == 0) return ValidationError.InvalidLimit;
+    if (transform.limits.max_group_bytes == 0) return ValidationError.InvalidLimit;
+    if (transform.limits.cpu_budget_ns_per_second == 0) return ValidationError.InvalidLimit;
+    if (transform.limits.max_group_bytes > transform.limits.max_state_bytes) return ValidationError.InvalidLimit;
+    if (transform.limits.late_event_threshold_seconds) |threshold| {
+        if (threshold == 0) return ValidationError.InvalidLimit;
+    }
+    if (transform.sharding.shard_count == 0) return ValidationError.InvalidShardCount;
+    if (transform.sharding.shard_count > 1 and transform.sharding.key == null) {
+        return ValidationError.MissingShardKey;
+    }
+}
+
 const testing = std.testing;
 
 test "validate simple pipeline" {
@@ -291,6 +365,62 @@ test "validate rejects zero queue capacity" {
     };
 
     try testing.expectError(ValidationError.InvalidQueueCapacity, pipeline.validate(allocator));
+}
+
+test "validate rejects zero shard count" {
+    const allocator = testing.allocator;
+    const source_config = source_cfg.SourceConfig{
+        .id = "in",
+        .payload = .{ .syslog = .{ .address = "udp://127.0.0.1:514" } },
+    };
+
+    const pipeline = PipelineConfig{
+        .sources = &[_]SourceNode{
+            .{ .id = "in", .config = source_config, .outputs = &[_][]const u8{"sql"} },
+        },
+        .transforms = &[_]TransformNode{
+            .{ .sql = .{
+                .id = "sql",
+                .inputs = &[_][]const u8{"in"},
+                .outputs = &[_][]const u8{"out"},
+                .query = "SELECT * FROM logs",
+                .sharding = .{ .shard_count = 0 },
+            } },
+        },
+        .sinks = &[_]SinkNode{
+            .{ .console = .{ .id = "out", .inputs = &[_][]const u8{"sql"} } },
+        },
+    };
+
+    try testing.expectError(ValidationError.InvalidShardCount, pipeline.validate(allocator));
+}
+
+test "validate sharding requires key" {
+    const allocator = testing.allocator;
+    const source_config = source_cfg.SourceConfig{
+        .id = "in",
+        .payload = .{ .syslog = .{ .address = "udp://127.0.0.1:514" } },
+    };
+
+    const pipeline = PipelineConfig{
+        .sources = &[_]SourceNode{
+            .{ .id = "in", .config = source_config, .outputs = &[_][]const u8{"sql"} },
+        },
+        .transforms = &[_]TransformNode{
+            .{ .sql = .{
+                .id = "sql",
+                .inputs = &[_][]const u8{"in"},
+                .outputs = &[_][]const u8{"out"},
+                .query = "SELECT * FROM logs",
+                .sharding = .{ .shard_count = 2 },
+            } },
+        },
+        .sinks = &[_]SinkNode{
+            .{ .console = .{ .id = "out", .inputs = &[_][]const u8{"sql"} } },
+        },
+    };
+
+    try testing.expectError(ValidationError.MissingShardKey, pipeline.validate(allocator));
 }
 
 test "detect missing sink" {

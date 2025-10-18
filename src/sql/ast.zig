@@ -178,6 +178,23 @@ pub const OrderByItem = struct {
     span: Span,
 };
 
+pub const WindowKind = enum {
+    tumbling,
+    hopping,
+    session,
+};
+
+pub const WindowClause = struct {
+    kind: WindowKind,
+    timestamp: *const Expression,
+    size: ?*const Expression = null,
+    slide: ?*const Expression = null,
+    gap: ?*const Expression = null,
+    watermark: ?*const Expression = null,
+    allowed_lateness: ?*const Expression = null,
+    span: Span,
+};
+
 pub const CommonTableExpression = struct {
     name: Identifier,
     columns: []const Identifier = &[_]Identifier{},
@@ -194,12 +211,15 @@ pub const WithClause = struct {
 pub const SelectStatement = struct {
     with_clause: ?WithClause = null,
     distinct: bool = false,
+    distinct_span: ?Span = null,
     projection: []const SelectItem,
     from: []const TableExpression = &[_]TableExpression{},
     selection: ?*const Expression = null,
     group_by: []const *const Expression = &[_]*const Expression{},
     having: ?*const Expression = null,
+    window: ?WindowClause = null,
     order_by: []const OrderByItem = &[_]OrderByItem{},
+    order_by_span: ?Span = null,
     span: Span,
 };
 

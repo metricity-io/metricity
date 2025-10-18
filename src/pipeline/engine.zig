@@ -10,6 +10,7 @@ const event_mod = source_mod.event;
 const graph_mod = @import("graph.zig");
 const channel_mod = @import("channel.zig");
 const metrics_mod = @import("metrics.zig");
+const wyhash = std.hash.Wyhash;
 
 const EventChannel = channel_mod.Channel(EventMessage);
 const SinkChannel = channel_mod.Channel(SinkMessage);
@@ -18,9 +19,62 @@ const backoff_ns: u64 = 5 * std.time.ns_per_ms;
 const atomic_order = std.builtin.AtomicOrder;
 const max_batch_size: usize = 64;
 
+/// Provides monotonically non-decreasing nanosecond timestamps for SQL eviction.
+/// Prefers `std.time.Instant` (monotonic clock) and falls back to clamped wall time.
+const MonotonicClock = struct {
+    var once = std.once(init);
+    var base: std.time.Instant = undefined;
+    var supported: bool = false;
+    var last_ns = std.atomic.Value(u64).init(0);
+
+    fn init() void {
+        const Self = @This();
+        const instant = std.time.Instant.now() catch {
+            Self.supported = false;
+            return;
+        };
+        Self.base = instant;
+        Self.supported = true;
+    }
+
+    fn now() u64 {
+        const Self = @This();
+        Self.once.call();
+        if (Self.supported) {
+            const current = std.time.Instant.now() catch return Self.fallback();
+            const elapsed = current.since(Self.base);
+            return Self.enforce(elapsed);
+        }
+        return Self.fallback();
+    }
+
+    fn enforce(candidate: u64) u64 {
+        const Self = @This();
+        const previous = Self.last_ns.fetchMax(candidate, .acq_rel);
+        return if (candidate > previous) candidate else previous;
+    }
+
+    fn fallback() u64 {
+        const Self = @This();
+        const raw = std.time.nanoTimestamp();
+        const positive = if (raw < 0) 0 else @as(u128, @intCast(raw));
+        const clamped = std.math.cast(u64, positive) orelse std.math.maxInt(u64);
+        return Self.enforce(clamped);
+    }
+};
+
 fn computeBatchCapacity(queue: config_mod.QueueConfig) usize {
     if (queue.capacity == 0) return 1;
     return @min(queue.capacity, max_batch_size);
+}
+
+fn secondsToNanoseconds(seconds: u64) u64 {
+    if (seconds == 0) return 0;
+    const product = @as(u128, seconds) * std.time.ns_per_s;
+    if (product > std.math.maxInt(u64)) {
+        return std.math.maxInt(u64);
+    }
+    return @intCast(product);
 }
 
 /// Aggregated failure surface for bring-up and steady-state runtime issues within the
@@ -78,15 +132,15 @@ pub const Pipeline = struct {
         const nodes = try allocator.alloc(NodeRuntime, graph.nodes.len);
         errdefer allocator.free(nodes);
 
-    var pipeline = Pipeline{
-        .allocator = allocator,
-        .collector = collector,
-        .collector_configs = collector_configs,
-        .graph = graph,
-        .nodes = nodes,
-        .sink_builder = options.sink_builder orelse defaultSinkBuilder,
-        .metrics = metrics_mod.PipelineMetrics.init(options.metrics),
-    };
+        var pipeline = Pipeline{
+            .allocator = allocator,
+            .collector = collector,
+            .collector_configs = collector_configs,
+            .graph = graph,
+            .nodes = nodes,
+            .sink_builder = options.sink_builder orelse defaultSinkBuilder,
+            .metrics = metrics_mod.PipelineMetrics.init(options.metrics),
+        };
 
         try pipeline.buildSourceLookup();
         try pipeline.initNodes(cfg);
@@ -201,8 +255,13 @@ pub const Pipeline = struct {
         const events = batch.batch.events;
         const ack_token = batch.batch.ack;
 
-        const batch_ctx = try BatchContext.create(self.worker_allocator, &self.metrics, ack_token, events.len);
+        const batch_ctx = try BatchContext.create(self.worker_allocator, &self.metrics, ack_token, events.len, batch.descriptor.name);
         errdefer batch_ctx.forceRelease();
+
+        if (events.len != 0) {
+            const count: u64 = @intCast(events.len);
+            self.metrics.recordSourceIngest(batch.descriptor.name, count);
+        }
 
         if (events.len == 0) {
             if (ack_token.isAvailable()) {
@@ -353,110 +412,363 @@ const SinkMessage = struct {
     context: *EventContext,
 };
 
-const TransformRuntime = struct {
+const TransformShardRuntime = struct {
+    name: []const u8,
+    name_owned: bool,
     channel: EventChannel,
-    queue: config_mod.QueueConfig,
-    workers: []TransformWorker,
+    channel_metrics: metrics_mod.ChannelMetrics,
     batch_capacity: usize,
     arena: *std.heap.ArenaAllocator,
     program: sql_mod.runtime.Program,
-    config: *const config_mod.TransformNode,
-    channel_metrics: metrics_mod.ChannelMetrics,
+    program_mutex: std.Thread.Mutex = .{},
+    workers: []TransformWorker,
 
-    fn init(pipeline: *Pipeline, config: *const config_mod.TransformNode) Error!TransformRuntime {
-        const exec = config.executionSettings();
-        var channel_metrics = try pipeline.metrics.createChannelMetrics(
-            pipeline.allocator,
-            .{ .name = config.id(), .kind = .transform },
-        );
-        var channel_metrics_owned = true;
-        errdefer if (channel_metrics_owned) channel_metrics.deinit();
-
-        var channel = try EventChannel.init(pipeline.worker_allocator, exec.queue, null);
-        var channel_owned = true;
-        errdefer if (channel_owned) channel.deinit();
-
-        var arena = try pipeline.allocator.create(std.heap.ArenaAllocator);
-        errdefer pipeline.allocator.destroy(arena);
-        arena.* = std.heap.ArenaAllocator.init(pipeline.allocator);
-        errdefer arena.deinit();
-
-        const sql_cfg = switch (config.*) {
-            .sql => |value| value,
-        };
-
-        const stmt = try sql_mod.parser.parseSelect(arena.allocator(), sql_cfg.query);
-        var program = try sql_mod.runtime.compile(pipeline.worker_allocator, stmt);
-        errdefer program.deinit();
-
-        const workers = try pipeline.allocator.alloc(TransformWorker, exec.parallelism);
-        errdefer pipeline.allocator.free(workers);
-        for (workers) |*worker| worker.* = .{};
-
-        const runtime = TransformRuntime{
-            .channel = channel,
-            .queue = exec.queue,
-            .workers = workers,
-            .batch_capacity = computeBatchCapacity(exec.queue),
-            .arena = arena,
-            .program = program,
-            .config = config,
-            .channel_metrics = channel_metrics,
-        };
-        channel_owned = false;
-        channel_metrics_owned = false;
-        return runtime;
-    }
-
-    fn spawn(self: *TransformRuntime, pipeline: *Pipeline, node_index: usize) Error!void {
-        for (self.workers) |*worker| {
-            const context = try pipeline.allocator.create(TransformWorkerContext);
-            errdefer pipeline.allocator.destroy(context);
-            context.* = try TransformWorkerContext.init(pipeline, node_index, self);
-            errdefer context.deinit();
-            worker.context = context;
-            worker.thread = try std.Thread.spawn(.{}, transformWorkerMain, .{context});
-        }
-    }
-
-    fn enqueue(self: *TransformRuntime, pipeline: *Pipeline, message: *EventMessage) void {
-        var local = message.*;
-        retryPushEvent(&self.channel, pipeline, &local);
-    }
-
-    fn stop(self: *TransformRuntime) void {
-        self.channel.clearObserver();
-        self.channel.close();
-    }
-
-    fn join(self: *TransformRuntime, pipeline: *Pipeline) void {
-        for (self.workers) |*worker| {
-            if (worker.thread) |thread| thread.join();
-            worker.thread = null;
-            if (worker.context) |context| {
-                context.deinit();
-                pipeline.allocator.destroy(context);
-                worker.context = null;
-            }
-        }
-    }
-
-    fn deinit(self: *TransformRuntime, pipeline: *Pipeline) void {
+    fn deinit(self: *TransformShardRuntime, pipeline: *Pipeline) void {
         self.channel.drainWith(struct {
             fn release(message: EventMessage) void {
                 message.context.releaseFailure();
             }
         }.release);
-        self.program.deinit();
-        self.arena.deinit();
-        pipeline.allocator.destroy(self.arena);
         self.channel.deinit();
         pipeline.allocator.free(self.workers);
         self.channel_metrics.deinit();
+        self.program.deinit();
+        self.arena.deinit();
+        pipeline.allocator.destroy(self.arena);
+        if (self.name_owned) {
+            pipeline.allocator.free(self.name);
+        }
+    }
+};
+
+const TransformRuntime = struct {
+    queue: config_mod.QueueConfig,
+    shards: []TransformShardRuntime,
+    sharding: config_mod.SqlShardingConfig,
+    workers_per_shard: usize,
+    config: *const config_mod.TransformNode,
+    id: []const u8,
+    limits: sql_mod.runtime.LimitConfig,
+    error_policy: sql_mod.runtime.ErrorPolicy,
+    hash_seed: u64,
+    shard_field: ?[]const u8,
+    shard_metadata: ?config_mod.SqlShardMetadataKey,
+
+    fn init(pipeline: *Pipeline, config: *const config_mod.TransformNode) Error!TransformRuntime {
+        const exec = config.executionSettings();
+        const sql_cfg = switch (config.*) {
+            .sql => |value| value,
+        };
+
+        const shard_count = sql_cfg.sharding.shard_count;
+        const workers_per_shard = exec.parallelism;
+
+        var shards = try pipeline.allocator.alloc(TransformShardRuntime, shard_count);
+        var shards_initialized: usize = 0;
+        errdefer {
+            var idx: usize = 0;
+            while (idx < shards_initialized) : (idx += 1) {
+                shards[idx].deinit(pipeline);
+            }
+            pipeline.allocator.free(shards);
+        }
+
+        var eviction = sql_mod.runtime.EvictionConfig{};
+        if (sql_cfg.eviction.ttl_seconds) |ttl_secs| {
+            const ttl_u64: u64 = @intCast(ttl_secs);
+            eviction.ttl_ns = if (ttl_u64 == 0) null else secondsToNanoseconds(ttl_u64);
+        }
+        if (sql_cfg.eviction.max_groups) |max| {
+            eviction.max_groups = max;
+        }
+        if (sql_cfg.eviction.sweep_interval_seconds) |sweep_secs| {
+            const sweep_u64: u64 = @intCast(sweep_secs);
+            eviction.sweep_interval_ns = secondsToNanoseconds(sweep_u64);
+        }
+
+        const limit_config = sql_mod.runtime.LimitConfig{
+            .max_state_bytes = sql_cfg.limits.max_state_bytes,
+            .max_row_bytes = sql_cfg.limits.max_row_bytes,
+            .max_group_bytes = sql_cfg.limits.max_group_bytes,
+            .cpu_budget_ns_per_second = sql_cfg.limits.cpu_budget_ns_per_second,
+            .late_event_threshold_ns = if (sql_cfg.limits.late_event_threshold_seconds) |secs|
+                secondsToNanoseconds(secs)
+            else
+                null,
+        };
+
+        const config_event_time_field = sql_cfg.event_time_field;
+        const config_event_time_metadata: ?sql_mod.runtime.EventMetadataSource =
+            if (sql_cfg.event_time_metadata) |metadata_source|
+                switch (metadata_source) {
+                    .received_at => sql_mod.runtime.EventMetadataSource.received_at,
+                }
+            else
+                null;
+        const config_watermark_lag_ns = if (sql_cfg.watermark_lag_seconds) |secs|
+            secondsToNanoseconds(secs)
+        else
+            null;
+        const config_allowed_lateness_ns = if (sql_cfg.allowed_lateness_seconds) |secs|
+            secondsToNanoseconds(secs)
+        else
+            null;
+
+        const runtime_policy: sql_mod.runtime.ErrorPolicy = switch (sql_cfg.error_policy) {
+            .skip_event => .skip_event,
+            .null => .null,
+            .clamp => .clamp,
+            .propagate => .propagate,
+        };
+
+        var shard_index: usize = 0;
+        while (shard_index < shard_count) : (shard_index += 1) {
+            const name_info = try TransformRuntime.makeShardName(pipeline.allocator, config.id(), shard_index, shard_count);
+            const shard_name = name_info.value;
+            var shard_name_owned = name_info.owned;
+            errdefer if (shard_name_owned) pipeline.allocator.free(shard_name);
+
+            var channel_metrics = try pipeline.metrics.createChannelMetrics(
+                pipeline.allocator,
+                .{ .name = shard_name, .kind = .transform },
+            );
+            var channel_metrics_owned = true;
+            errdefer if (channel_metrics_owned) channel_metrics.deinit();
+
+            var channel = try EventChannel.init(pipeline.worker_allocator, exec.queue, null);
+            var channel_owned = true;
+            errdefer if (channel_owned) channel.deinit();
+
+            var arena = try pipeline.allocator.create(std.heap.ArenaAllocator);
+            errdefer pipeline.allocator.destroy(arena);
+            arena.* = std.heap.ArenaAllocator.init(pipeline.allocator);
+            var arena_initialized = true;
+            errdefer if (arena_initialized) arena.deinit();
+
+            const stmt = try sql_mod.parser.parseSelect(arena.allocator(), sql_cfg.query);
+
+            var program = try sql_mod.runtime.compile(pipeline.worker_allocator, stmt, .{
+                .eviction = eviction,
+                .limits = limit_config,
+                .error_policy = runtime_policy,
+                .time = .{
+                    .event_time_field = config_event_time_field,
+                    .event_time_metadata = config_event_time_metadata,
+                    .watermark_lag_ns = config_watermark_lag_ns,
+                    .allowed_lateness_ns = config_allowed_lateness_ns,
+                },
+            });
+            var program_owned = true;
+            errdefer if (program_owned) program.deinit();
+
+            const workers = try pipeline.allocator.alloc(TransformWorker, workers_per_shard);
+            var workers_owned = true;
+            errdefer if (workers_owned) pipeline.allocator.free(workers);
+            for (workers) |*worker| worker.* = .{};
+
+            shards[shard_index] = .{
+                .name = shard_name,
+                .name_owned = shard_name_owned,
+                .channel = channel,
+                .channel_metrics = channel_metrics,
+                .batch_capacity = computeBatchCapacity(exec.queue),
+                .arena = arena,
+                .program = program,
+                .program_mutex = .{},
+                .workers = workers,
+            };
+
+            shard_name_owned = false;
+            channel_owned = false;
+            channel_metrics_owned = false;
+            arena_initialized = false;
+            program_owned = false;
+            workers_owned = false;
+            shards_initialized += 1;
+        }
+
+        var shard_field: ?[]const u8 = null;
+        var shard_metadata: ?config_mod.SqlShardMetadataKey = null;
+        if (sql_cfg.sharding.key) |key| {
+            switch (key) {
+                .field => |name| shard_field = name,
+                .metadata => |meta| shard_metadata = meta,
+            }
+        }
+
+        const runtime = TransformRuntime{
+            .queue = exec.queue,
+            .shards = shards,
+            .sharding = sql_cfg.sharding,
+            .workers_per_shard = workers_per_shard,
+            .config = config,
+            .id = config.id(),
+            .limits = limit_config,
+            .error_policy = runtime_policy,
+            .hash_seed = wyhash.hash(0, config.id()),
+            .shard_field = shard_field,
+            .shard_metadata = shard_metadata,
+        };
+        return runtime;
+    }
+
+    fn spawn(self: *TransformRuntime, pipeline: *Pipeline, node_index: usize) Error!void {
+        for (self.shards, 0..) |*shard, shard_index| {
+            for (shard.workers) |*worker| {
+                const context = try pipeline.allocator.create(TransformWorkerContext);
+                errdefer pipeline.allocator.destroy(context);
+                context.* = try TransformWorkerContext.init(pipeline, self, shard, shard_index, node_index);
+                errdefer context.deinit();
+                worker.context = context;
+                worker.thread = try std.Thread.spawn(.{}, transformWorkerMain, .{context});
+            }
+        }
+    }
+
+    fn enqueue(self: *TransformRuntime, pipeline: *Pipeline, message: *EventMessage) void {
+        var local = message.*;
+        const selection = self.selectShard(local.event);
+        if (selection.index) |shard_index| {
+            if (selection.used_fallback) {
+                pipeline.metrics.recordTransformError(self.id, "missing_shard_key_route", 1);
+            }
+            const shard = &self.shards[shard_index];
+            retryPushEvent(&shard.channel, pipeline, &local);
+        } else {
+            pipeline.metrics.recordTransformError(self.id, "missing_shard_key_drop", 1);
+            local.context.releaseSuccess();
+        }
+    }
+
+    fn stop(self: *TransformRuntime) void {
+        for (self.shards) |*shard| {
+            shard.channel.clearObserver();
+            shard.channel.close();
+        }
+    }
+
+    fn join(self: *TransformRuntime, pipeline: *Pipeline) void {
+        for (self.shards) |*shard| {
+            for (shard.workers) |*worker| {
+                if (worker.thread) |thread| thread.join();
+                worker.thread = null;
+                if (worker.context) |context| {
+                    context.deinit();
+                    pipeline.allocator.destroy(context);
+                    worker.context = null;
+                }
+            }
+        }
+    }
+
+    fn deinit(self: *TransformRuntime, pipeline: *Pipeline) void {
+        for (self.shards) |*shard| {
+            shard.deinit(pipeline);
+        }
+        pipeline.allocator.free(self.shards);
     }
 
     fn attachObserver(self: *TransformRuntime) void {
-        self.channel.setObserver(self.channel_metrics.observer());
+        for (self.shards) |*shard| {
+            shard.channel.setObserver(shard.channel_metrics.observer());
+        }
+    }
+
+    const ShardSelection = struct {
+        index: ?usize,
+        used_fallback: bool,
+    };
+
+    fn selectShard(self: *TransformRuntime, event: *const event_mod.Event) ShardSelection {
+        const shard_total = self.shards.len;
+        if (shard_total <= 1) return ShardSelection{ .index = 0, .used_fallback = false };
+
+        var storage: [16]u8 = undefined;
+        var key_bytes: []const u8 = &[_]u8{};
+        var have_key = false;
+
+        if (self.shard_field) |field_name| {
+            if (event.payload == .log) {
+                const log_event = event.payload.log;
+                for (log_event.fields) |field| {
+                    if (!std.mem.eql(u8, field.name, field_name)) continue;
+                    switch (field.value) {
+                        .string => |value| {
+                            key_bytes = value;
+                            have_key = true;
+                        },
+                        .integer => |value| {
+                            std.mem.writeInt(i64, storage[0..8], value, .little);
+                            key_bytes = storage[0..8];
+                            have_key = true;
+                        },
+                        .float => |value| {
+                            const bits = @as(u64, @bitCast(value));
+                            std.mem.writeInt(u64, storage[0..8], bits, .little);
+                            key_bytes = storage[0..8];
+                            have_key = true;
+                        },
+                        .boolean => |value| {
+                            storage[0] = if (value) 1 else 0;
+                            key_bytes = storage[0..1];
+                            have_key = true;
+                        },
+                        .null => {},
+                    }
+                    break;
+                }
+            }
+        } else if (self.shard_metadata) |meta| {
+            switch (meta) {
+                .source_id => {
+                    if (event.metadata.source_id) |source_id| {
+                        key_bytes = source_id;
+                        have_key = true;
+                    }
+                },
+            }
+        } else {
+            if (event.metadata.source_id) |source_id| {
+                key_bytes = source_id;
+                have_key = true;
+            }
+        }
+
+        if (!have_key) {
+            return self.handleMissingShardKey();
+        }
+
+        const hash = wyhash.hash(self.hash_seed, key_bytes);
+        const shard_index: usize = @intCast(hash % shard_total);
+        return ShardSelection{ .index = shard_index, .used_fallback = false };
+    }
+
+    fn handleMissingShardKey(self: *TransformRuntime) ShardSelection {
+        return switch (self.sharding.fallback) {
+            .route_first => ShardSelection{
+                .index = if (self.shards.len != 0) 0 else null,
+                .used_fallback = true,
+            },
+            .drop => ShardSelection{ .index = null, .used_fallback = true },
+        };
+    }
+
+    const ShardName = struct {
+        value: []const u8,
+        owned: bool,
+    };
+
+    fn makeShardName(
+        allocator: std.mem.Allocator,
+        base: []const u8,
+        index: usize,
+        total: usize,
+    ) !ShardName {
+        if (total == 1) {
+            return ShardName{ .value = base, .owned = false };
+        }
+        const name = try std.fmt.allocPrint(allocator, "{s}_shard_{d}", .{ base, index });
+        return ShardName{ .value = name, .owned = true };
     }
 };
 
@@ -467,17 +779,26 @@ const TransformWorker = struct {
 
 const TransformWorkerContext = struct {
     pipeline: *Pipeline,
-    node_index: usize,
     runtime: *TransformRuntime,
+    shard: *TransformShardRuntime,
+    shard_index: usize,
+    node_index: usize,
     batch_buffer: []EventMessage,
 
-    fn init(pipeline: *Pipeline, node_index: usize, runtime: *TransformRuntime) !TransformWorkerContext {
-        const capacity = runtime.batch_capacity;
-        const buffer = try pipeline.allocator.alloc(EventMessage, capacity);
+    fn init(
+        pipeline: *Pipeline,
+        runtime: *TransformRuntime,
+        shard: *TransformShardRuntime,
+        shard_index: usize,
+        node_index: usize,
+    ) !TransformWorkerContext {
+        const buffer = try pipeline.allocator.alloc(EventMessage, shard.batch_capacity);
         return TransformWorkerContext{
             .pipeline = pipeline,
-            .node_index = node_index,
             .runtime = runtime,
+            .shard = shard,
+            .shard_index = shard_index,
+            .node_index = node_index,
             .batch_buffer = buffer,
         };
     }
@@ -489,7 +810,7 @@ const TransformWorkerContext = struct {
 
 fn transformWorkerMain(context: *TransformWorkerContext) void {
     while (true) {
-        const count = context.runtime.channel.popBatch(context.batch_buffer);
+        const count = context.shard.channel.popBatch(context.batch_buffer);
         if (count == 0) break;
         for (context.batch_buffer[0..count]) |message| {
             handleTransformMessage(context, message);
@@ -500,12 +821,114 @@ fn transformWorkerMain(context: *TransformWorkerContext) void {
 fn handleTransformMessage(context: *TransformWorkerContext, message: EventMessage) void {
     const pipeline = context.pipeline;
     const runtime = context.runtime;
+    const shard = context.shard;
     const node_index = context.node_index;
 
-    const produced = runtime.program.execute(message.context.batchAllocator(), message.event) catch {
-        message.context.releaseFailure();
+    var produced: ?sql_mod.runtime.Row = null;
+    var exec_error: ?sql_mod.runtime.Error = null;
+    var executed = false;
+    const OptionalEvictionStats = @TypeOf(shard.program.takeEvictions());
+    const RowAdjustment = @TypeOf(shard.program.takeRowAdjustment());
+    var eviction_stats: OptionalEvictionStats = null;
+    var state_bytes: usize = 0;
+    var group_count: usize = 0;
+    var row_adjustment: RowAdjustment = .none;
+    var metrics_ready = false;
+    var locked_for_execution = false;
+
+    if (runtime.limits.late_event_threshold_ns) |threshold_ns| {
+        if (message.event.metadata.received_at) |received_at| {
+            const now_wall = std.time.nanoTimestamp();
+            var age = now_wall - received_at;
+            if (age < 0) age = 0;
+            const threshold_i128: i128 = @intCast(threshold_ns);
+            if (age > threshold_i128) {
+                exec_error = sql_mod.runtime.Error.LateEvent;
+            }
+        }
+    }
+
+    var duration_ns: u64 = 0;
+
+    if (exec_error == null) execution: {
+        locked_for_execution = true;
+        shard.program_mutex.lock();
+        defer shard.program_mutex.unlock();
+        defer {
+            if (executed) {
+                eviction_stats = shard.program.takeEvictions();
+                state_bytes = shard.program.stateBytes();
+                group_count = shard.program.groupCount();
+                metrics_ready = true;
+            }
+            row_adjustment = shard.program.takeRowAdjustment();
+        }
+
+        const now_ns = MonotonicClock.now();
+        const exec_start = std.time.nanoTimestamp();
+        executed = true;
+        produced = shard.program.executeTracked(
+            message.context.batchAllocator(),
+            message.event,
+            now_ns,
+            exec_start,
+            &duration_ns,
+        ) catch |err| {
+            exec_error = err;
+            produced = null;
+            break :execution;
+        };
+    }
+
+    if (metrics_ready) {
+        if (eviction_stats) |stats| {
+            if (stats.ttl != 0) {
+                const delta: u64 = @intCast(stats.ttl);
+                pipeline.metrics.recordTransformEviction(shard.name, "ttl", delta);
+            }
+            if (stats.max_groups != 0) {
+                const delta: u64 = @intCast(stats.max_groups);
+                pipeline.metrics.recordTransformEviction(shard.name, "max_groups", delta);
+            }
+            if (stats.state_bytes != 0) {
+                const delta: u64 = @intCast(stats.state_bytes);
+                pipeline.metrics.recordTransformEviction(shard.name, "state_bytes", delta);
+            }
+        }
+        pipeline.metrics.recordTransformState(shard.name, state_bytes);
+        pipeline.metrics.recordTransformGroupCount(shard.name, group_count);
+    }
+
+    if (!locked_for_execution) {
+        shard.program_mutex.lock();
+        defer shard.program_mutex.unlock();
+        row_adjustment = shard.program.takeRowAdjustment();
+    }
+
+    switch (row_adjustment) {
+        .none => {},
+        .clamped => {
+            pipeline.metrics.recordTransformTruncate(shard.name, "row", 1);
+            pipeline.metrics.recordTransformError(shard.name, "clamp", 1);
+        },
+        .nullified => {
+            pipeline.metrics.recordTransformError(shard.name, "null", 1);
+        },
+    }
+
+    pipeline.metrics.recordTransformProcessed(shard.name, 1);
+    if (duration_ns != 0) {
+        pipeline.metrics.recordTransformExecTime(shard.name, duration_ns);
+    }
+
+    if (exec_error) |err| {
+        if (isLimitViolation(err)) {
+            handleLimitViolation(runtime, shard, pipeline, &message, err);
+        } else {
+            message.context.releaseFailure();
+        }
         return;
-    };
+    }
 
     if (produced) |row| {
         var owned_row = row;
@@ -523,8 +946,6 @@ fn handleTransformMessage(context: *TransformWorkerContext, message: EventMessag
             pipeline.forwardEventToTransforms(node_index, new_event, message.context);
         }
 
-        // Row fan-out only targets sink nodes. Downstream transforms consume the
-        // synthesised event built above.
         pipeline.sendRowFromTransform(node_index, owned_row, message.context) catch {
             message.context.releaseFailure();
             return;
@@ -534,6 +955,41 @@ fn handleTransformMessage(context: *TransformWorkerContext, message: EventMessag
     message.context.releaseSuccess();
 }
 
+fn isLimitViolation(err: sql_mod.runtime.Error) bool {
+    return switch (err) {
+        sql_mod.runtime.Error.RowTooLarge, sql_mod.runtime.Error.GroupStateTooLarge, sql_mod.runtime.Error.StateBudgetExceeded, sql_mod.runtime.Error.CpuBudgetExceeded, sql_mod.runtime.Error.LateEvent => true,
+        else => false,
+    };
+}
+
+fn handleLimitViolation(
+    runtime: *TransformRuntime,
+    shard: *TransformShardRuntime,
+    pipeline: *Pipeline,
+    message: *const EventMessage,
+    violation: sql_mod.runtime.Error,
+) void {
+    if (violation == sql_mod.runtime.Error.LateEvent) {
+        pipeline.metrics.recordTransformLateEvent(shard.name, 1);
+    }
+
+    const policy_label = switch (runtime.error_policy) {
+        .skip_event => "skip_event",
+        .null => "null",
+        .clamp => "clamp",
+        .propagate => "error",
+    };
+    pipeline.metrics.recordTransformError(shard.name, policy_label, 1);
+
+    switch (runtime.error_policy) {
+        .skip_event, .null, .clamp => {
+            message.context.releaseSuccess();
+        },
+        .propagate => {
+            message.context.releaseFailure();
+        },
+    }
+}
 const SinkRuntime = struct {
     channel: SinkChannel,
     queue: config_mod.QueueConfig,
@@ -541,6 +997,7 @@ const SinkRuntime = struct {
     batch_capacity: usize,
     config: *const config_mod.SinkNode,
     channel_metrics: metrics_mod.ChannelMetrics,
+    id: []const u8,
 
     fn init(pipeline: *Pipeline, config: *const config_mod.SinkNode) Error!SinkRuntime {
         const exec = config.executionSettings();
@@ -566,6 +1023,7 @@ const SinkRuntime = struct {
             .batch_capacity = computeBatchCapacity(exec.queue),
             .config = config,
             .channel_metrics = channel_metrics,
+            .id = config.id(),
         };
         channel_owned = false;
         channel_metrics_owned = false;
@@ -632,6 +1090,7 @@ const SinkWorker = struct {
 const SinkWorkerContext = struct {
     pipeline: *Pipeline,
     node_index: usize,
+    node_name: []const u8,
     sink: sink_mod.Sink,
     batch_buffer: []SinkMessage,
     row_view: []sql_mod.runtime.Row,
@@ -648,6 +1107,7 @@ const SinkWorkerContext = struct {
         return SinkWorkerContext{
             .pipeline = pipeline,
             .node_index = 0,
+            .node_name = config.id(),
             .sink = sink_instance,
             .batch_buffer = buffer,
             .row_view = row_view,
@@ -687,6 +1147,7 @@ fn sinkWorkerMain(context: *SinkWorkerContext) void {
             var success_row = message.row;
             success_row.deinit();
             message.context.releaseSuccess();
+            context.pipeline.metrics.recordSinkEmitted(runtime.id, 1);
         }
     }
 }
@@ -756,12 +1217,14 @@ const BatchContext = struct {
     failed: std.atomic.Value(bool),
     metrics: *const metrics_mod.PipelineMetrics,
     start_time: i128,
+    source_name: []const u8,
 
     fn create(
         allocator: std.mem.Allocator,
         metrics: *const metrics_mod.PipelineMetrics,
         ack: event_mod.AckToken,
         total_events: usize,
+        source_name: []const u8,
     ) !*BatchContext {
         const arena = try allocator.create(std.heap.ArenaAllocator);
         errdefer allocator.destroy(arena);
@@ -783,6 +1246,7 @@ const BatchContext = struct {
             .failed = std.atomic.Value(bool).init(false),
             .metrics = metrics,
             .start_time = std.time.nanoTimestamp(),
+            .source_name = source_name,
         };
         return ctx;
     }
@@ -816,6 +1280,7 @@ const BatchContext = struct {
                 @intCast(-raw_latency);
             self.metrics.recordAck(final_status);
             self.metrics.recordAckLatency(latency_u64);
+            self.metrics.recordPipelineLatency(self.source_name, latency_u64);
             self.destroy();
         }
     }
@@ -884,10 +1349,39 @@ const EventContext = struct {
 
 fn cloneRow(allocator: std.mem.Allocator, source: sql_mod.runtime.Row) !sql_mod.runtime.Row {
     var entries = try allocator.alloc(sql_mod.runtime.ValueEntry, source.values.len);
-    for (source.values, 0..) |value, idx| {
-        entries[idx] = value;
+    var copied: usize = 0;
+    var success = false;
+    errdefer {
+        if (!success) {
+            if (source.owns_strings) {
+                var idx = copied;
+                while (idx > 0) {
+                    idx -= 1;
+                    const entry = entries[idx];
+                    if (entry.value == .string) {
+                        allocator.free(entry.value.string);
+                    }
+                }
+            }
+            allocator.free(entries);
+        }
     }
-    return sql_mod.runtime.Row{ .allocator = allocator, .values = entries };
+
+    while (copied < source.values.len) : (copied += 1) {
+        var entry = source.values[copied];
+        if (source.owns_strings and entry.value == .string) {
+            const buffer = try copyBytes(allocator, entry.value.string);
+            entry.value = .{ .string = buffer };
+        }
+        entries[copied] = entry;
+    }
+
+    success = true;
+    return sql_mod.runtime.Row{
+        .allocator = allocator,
+        .values = entries,
+        .owns_strings = source.owns_strings,
+    };
 }
 
 fn copyBytes(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
@@ -1041,6 +1535,35 @@ test "rowToEvent clones row data" {
     try testing.expectEqualStrings("payload", payload.fields[0].value.string);
 }
 
+test "cloneRow deep copies string values" {
+    const allocator = testing.allocator;
+
+    var entries = try allocator.alloc(sql_mod.runtime.ValueEntry, 1);
+    entries[0] = .{ .name = "message", .value = .{ .string = try copyBytes(allocator, "hello") } };
+
+    var original = sql_mod.runtime.Row{
+        .allocator = allocator,
+        .values = entries,
+        .owns_strings = true,
+    };
+    var original_deinited = false;
+    defer if (!original_deinited) original.deinit();
+
+    const original_ptr = original.values[0].value.string.ptr;
+
+    var clone = try cloneRow(allocator, original);
+    defer clone.deinit();
+
+    try testing.expect(clone.owns_strings);
+    try testing.expect(clone.values[0].value == .string);
+    try testing.expect(clone.values[0].value.string.ptr != original_ptr);
+
+    original.deinit();
+    original_deinited = true;
+
+    try testing.expectEqualStrings("hello", clone.values[0].value.string);
+}
+
 fn defaultSinkBuilder(allocator: std.mem.Allocator, node: config_mod.SinkNode) sink_mod.Error!sink_mod.Sink {
     return switch (node) {
         .console => |cfg| console_sink.build(allocator, cfg),
@@ -1054,14 +1577,14 @@ const TestSink = struct {
         allocator: std.mem.Allocator,
         mutex: std.Thread.Mutex = .{},
         seen: bool = false,
-        severity: ?i64 = null,
+        count: ?i64 = null,
         message: ?[]const u8 = null,
         message_storage: ?[]u8 = null,
     };
 
     const Snapshot = struct {
         seen: bool,
-        severity: ?i64,
+        count: ?i64,
         message: ?[]const u8,
     };
 
@@ -1073,7 +1596,7 @@ const TestSink = struct {
             .allocator = allocator,
             .mutex = .{},
             .seen = false,
-            .severity = null,
+            .count = null,
             .message = null,
             .message_storage = null,
         };
@@ -1086,22 +1609,20 @@ const TestSink = struct {
         ctx.mutex.lock();
         defer ctx.mutex.unlock();
         ctx.seen = true;
-        if (row.values.len > 0 and row.values[0].value == .integer) {
-            ctx.severity = row.values[0].value.integer;
-        }
-        if (row.values.len > 1 and row.values[1].value == .string) {
+        if (row.values.len > 0 and row.values[0].value == .string) {
             if (ctx.message_storage) |existing| {
                 ctx.allocator.free(existing);
                 ctx.message_storage = null;
                 ctx.message = null;
             }
-            const slice = row.values[1].value.string;
+            const slice = row.values[0].value.string;
             const copy = try ctx.allocator.alloc(u8, slice.len);
-            if (slice.len != 0) {
-                std.mem.copyForwards(u8, copy, slice);
-            }
+            if (slice.len != 0) std.mem.copyForwards(u8, copy, slice);
             ctx.message_storage = copy;
             ctx.message = copy;
+        }
+        if (row.values.len > 1 and row.values[1].value == .integer) {
+            ctx.count = row.values[1].value.integer;
         }
     }
 
@@ -1118,9 +1639,9 @@ const TestSink = struct {
     }
 
     fn snapshot() Snapshot {
-        const ctx = shared_context orelse return Snapshot{ .seen = false, .severity = null, .message = null };
+        const ctx = shared_context orelse return Snapshot{ .seen = false, .count = null, .message = null };
         ctx.mutex.lock();
-        const snap = Snapshot{ .seen = ctx.seen, .severity = ctx.severity, .message = ctx.message };
+        const snap = Snapshot{ .seen = ctx.seen, .count = ctx.count, .message = ctx.message };
         ctx.mutex.unlock();
         return snap;
     }
@@ -1252,7 +1773,7 @@ test "pipeline applies sql transform and emits to sink" {
                 .id = "sql",
                 .inputs = &[_][]const u8{"test_source"},
                 .outputs = &[_][]const u8{"sink"},
-                .query = "SELECT syslog_severity, message FROM logs WHERE syslog_severity <= 4",
+                .query = "SELECT message, COUNT(*) AS total FROM logs GROUP BY message",
             } },
         },
         .sinks = &[_]config_mod.SinkNode{
@@ -1274,7 +1795,7 @@ test "pipeline applies sql transform and emits to sink" {
     while (attempts < 100) : (attempts += 1) {
         const snapshot = TestSink.snapshot();
         if (snapshot.seen) {
-            try testing.expectEqual(@as(?i64, 4), snapshot.severity);
+            try testing.expectEqual(@as(?i64, 1), snapshot.count);
             try testing.expectEqualStrings("hello", snapshot.message orelse "");
             break;
         }
@@ -1305,13 +1826,13 @@ test "pipeline composes sql transforms" {
                 .id = "sql_primary",
                 .inputs = &[_][]const u8{"test_source"},
                 .outputs = &[_][]const u8{"sql_secondary"},
-                .query = "SELECT syslog_severity AS severity, message FROM logs WHERE syslog_severity <= 4",
+                .query = "SELECT message, COUNT(*) AS total FROM logs GROUP BY message",
             } },
             .{ .sql = .{
                 .id = "sql_secondary",
                 .inputs = &[_][]const u8{"sql_primary"},
                 .outputs = &[_][]const u8{"sink"},
-                .query = "SELECT severity, message FROM logs WHERE severity = 4 AND source_id = 'test_source'",
+                .query = "SELECT message, SUM(total) AS total_events FROM logs GROUP BY message",
             } },
         },
         .sinks = &[_]config_mod.SinkNode{
@@ -1333,7 +1854,7 @@ test "pipeline composes sql transforms" {
     while (attempts < 100) : (attempts += 1) {
         const snapshot = TestSink.snapshot();
         if (snapshot.seen) {
-            try testing.expectEqual(@as(?i64, 4), snapshot.severity);
+            try testing.expectEqual(@as(?i64, 1), snapshot.count);
             try testing.expectEqualStrings("hello", snapshot.message orelse "");
             break;
         }
@@ -1385,6 +1906,131 @@ test "pipeline fan-out to multiple sinks" {
     CountingSink.reset();
 }
 
+test "transform sharding uses metadata source id" {
+    const allocator = testing.allocator;
+
+    const source_config = source_cfg.SourceConfig{
+        .id = "meta_source",
+        .payload = .{ .syslog = .{ .address = "udp://127.0.0.1:0" } },
+    };
+
+    const transform = config_mod.SqlTransform{
+        .id = "sql_meta",
+        .inputs = &[_][]const u8{"meta_source"},
+        .outputs = &[_][]const u8{"sink"},
+        .query = "SELECT message, COUNT(*) AS total FROM logs GROUP BY message",
+        .sharding = .{
+            .shard_count = 4,
+            .key = .{ .metadata = .source_id },
+        },
+    };
+
+    const pipeline_cfg = config_mod.PipelineConfig{
+        .sources = &[_]config_mod.SourceNode{
+            .{ .id = "meta_source", .config = source_config, .outputs = &[_][]const u8{"sql_meta"} },
+        },
+        .transforms = &[_]config_mod.TransformNode{.{ .sql = transform }},
+        .sinks = &[_]config_mod.SinkNode{
+            .{ .console = .{ .id = "sink", .inputs = &[_][]const u8{"sql_meta"} } },
+        },
+    };
+
+    const registry = source_mod.Registry{ .factories = &[_]source_mod.SourceFactory{TestSource.factory()} };
+
+    var pipeline = try Pipeline.init(allocator, &pipeline_cfg, .{ .collector = .{ .registry = registry } });
+    defer pipeline.deinit();
+
+    var transform_index: ?usize = null;
+    for (pipeline.graph.nodes, 0..) |node, idx| {
+        if (node.kind == .transform) {
+            transform_index = idx;
+            break;
+        }
+    }
+    const idx = transform_index orelse unreachable;
+    const runtime = &pipeline.nodes[idx].data.transform;
+
+    const log_fields = [_]event_mod.Field{};
+    const event = event_mod.Event{
+        .metadata = .{ .source_id = "meta_source" },
+        .payload = .{ .log = .{ .message = "hello", .fields = &log_fields } },
+    };
+
+    const selection = runtime.selectShard(&event);
+    try testing.expect(!selection.used_fallback);
+    const shard_index = selection.index orelse unreachable;
+    try testing.expect(shard_index < runtime.shards.len);
+}
+
+test "transform sharding drops missing key when configured" {
+    const allocator = testing.allocator;
+
+    const source_config = source_cfg.SourceConfig{
+        .id = "drop_source",
+        .payload = .{ .syslog = .{ .address = "udp://127.0.0.1:0" } },
+    };
+
+    const transform = config_mod.SqlTransform{
+        .id = "sql_drop",
+        .inputs = &[_][]const u8{"drop_source"},
+        .outputs = &[_][]const u8{"sink"},
+        .query = "SELECT message, COUNT(*) AS total FROM logs GROUP BY message",
+        .sharding = .{
+            .shard_count = 2,
+            .key = .{ .field = "hostname" },
+            .fallback = .drop,
+        },
+    };
+
+    const pipeline_cfg = config_mod.PipelineConfig{
+        .sources = &[_]config_mod.SourceNode{
+            .{ .id = "drop_source", .config = source_config, .outputs = &[_][]const u8{"sql_drop"} },
+        },
+        .transforms = &[_]config_mod.TransformNode{.{ .sql = transform }},
+        .sinks = &[_]config_mod.SinkNode{
+            .{ .console = .{ .id = "sink", .inputs = &[_][]const u8{"sql_drop"} } },
+        },
+    };
+
+    const registry = source_mod.Registry{ .factories = &[_]source_mod.SourceFactory{TestSource.factory()} };
+
+    var pipeline = try Pipeline.init(allocator, &pipeline_cfg, .{ .collector = .{ .registry = registry } });
+    defer pipeline.deinit();
+
+    var transform_index: ?usize = null;
+    for (pipeline.graph.nodes, 0..) |node, idx| {
+        if (node.kind == .transform) {
+            transform_index = idx;
+            break;
+        }
+    }
+    const idx = transform_index orelse unreachable;
+    const runtime = &pipeline.nodes[idx].data.transform;
+
+    const no_hostname_fields = [_]event_mod.Field{};
+    const event_missing = event_mod.Event{
+        .metadata = .{ .source_id = "drop_source" },
+        .payload = .{ .log = .{ .message = "hello", .fields = &no_hostname_fields } },
+    };
+
+    const selection_missing = runtime.selectShard(&event_missing);
+    try testing.expect(selection_missing.used_fallback);
+    try testing.expect(selection_missing.index == null);
+
+    const hostname_fields = [_]event_mod.Field{
+        .{ .name = "hostname", .value = .{ .string = "node-a" } },
+    };
+    const event_present = event_mod.Event{
+        .metadata = .{ .source_id = "drop_source" },
+        .payload = .{ .log = .{ .message = "hello", .fields = &hostname_fields } },
+    };
+
+    const selection_present = runtime.selectShard(&event_present);
+    try testing.expect(!selection_present.used_fallback);
+    const shard_index = selection_present.index orelse unreachable;
+    try testing.expect(shard_index < runtime.shards.len);
+}
+
 test "forwardEventToNode surfaces allocation failure without double release" {
     const allocator = testing.allocator;
 
@@ -1426,7 +2072,7 @@ test "forwardEventToNode surfaces allocation failure without double release" {
     var handle = event_mod.AckHandle.init(&recorder, Recorder.complete);
     const token = event_mod.AckToken.init(&handle);
 
-    var batch_ctx = try BatchContext.create(pipeline.worker_allocator, &pipeline.metrics, token, 1);
+    var batch_ctx = try BatchContext.create(pipeline.worker_allocator, &pipeline.metrics, token, 1, "test");
     errdefer batch_ctx.forceRelease();
 
     var fail_storage: [1]u8 = undefined;
@@ -1485,7 +2131,7 @@ test "retryPushEvent treats drop_oldest as stored" {
     var handle = event_mod.AckHandle.init(&recorder, Recorder.complete);
     const token = event_mod.AckToken.init(&handle);
 
-    var batch_ctx = try BatchContext.create(allocator, &pipeline.metrics, token, 2);
+    var batch_ctx = try BatchContext.create(allocator, &pipeline.metrics, token, 2, "test");
     errdefer batch_ctx.forceRelease();
 
     const ctx_old = try EventContext.create(allocator, batch_ctx);
@@ -1556,7 +2202,7 @@ test "retryPushEvent releases evicted context" {
     var handle = event_mod.AckHandle.init(&recorder, Recorder.complete);
     const token = event_mod.AckToken.init(&handle);
 
-    var batch_ctx = try BatchContext.create(allocator, &pipeline.metrics, token, 1);
+    var batch_ctx = try BatchContext.create(allocator, &pipeline.metrics, token, 1, "test");
     defer if (recorder_alive) batch_ctx.forceRelease();
 
     const ctx_old = try EventContext.create(allocator, batch_ctx);
@@ -1570,7 +2216,7 @@ test "retryPushEvent releases evicted context" {
     retryPushEvent(&channel, &pipeline, &message_old);
 
     var batch_ctx_new_alive = true;
-    var batch_ctx_new = try BatchContext.create(allocator, &pipeline.metrics, event_mod.AckToken.none(), 1);
+    var batch_ctx_new = try BatchContext.create(allocator, &pipeline.metrics, event_mod.AckToken.none(), 1, "test");
     defer if (batch_ctx_new_alive) batch_ctx_new.forceRelease();
 
     const ctx_new = try EventContext.create(allocator, batch_ctx_new);
@@ -1630,11 +2276,11 @@ test "batch context records ack metrics" {
 
     var pipeline_metrics = metrics_mod.PipelineMetrics.init(&metrics_sink);
 
-    var success_ctx = try BatchContext.create(allocator, &pipeline_metrics, event_mod.AckToken.none(), 1);
+    var success_ctx = try BatchContext.create(allocator, &pipeline_metrics, event_mod.AckToken.none(), 1, "test");
     std.Thread.sleep(1 * std.time.ns_per_ms);
     success_ctx.complete(true);
 
-    var failure_ctx = try BatchContext.create(allocator, &pipeline_metrics, event_mod.AckToken.none(), 1);
+    var failure_ctx = try BatchContext.create(allocator, &pipeline_metrics, event_mod.AckToken.none(), 1, "test");
     std.Thread.sleep(1 * std.time.ns_per_ms);
     failure_ctx.complete(false);
 
