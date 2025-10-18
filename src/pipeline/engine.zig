@@ -497,6 +497,23 @@ const TransformRuntime = struct {
                 null,
         };
 
+        const config_event_time_field = sql_cfg.event_time_field;
+        const config_event_time_metadata: ?sql_mod.runtime.EventMetadataSource =
+            if (sql_cfg.event_time_metadata) |metadata_source|
+                switch (metadata_source) {
+                    .received_at => sql_mod.runtime.EventMetadataSource.received_at,
+                }
+            else
+                null;
+        const config_watermark_lag_ns = if (sql_cfg.watermark_lag_seconds) |secs|
+            secondsToNanoseconds(secs)
+        else
+            null;
+        const config_allowed_lateness_ns = if (sql_cfg.allowed_lateness_seconds) |secs|
+            secondsToNanoseconds(secs)
+        else
+            null;
+
         const runtime_policy: sql_mod.runtime.ErrorPolicy = switch (sql_cfg.error_policy) {
             .skip_event => .skip_event,
             .null => .null,
@@ -534,6 +551,12 @@ const TransformRuntime = struct {
                 .eviction = eviction,
                 .limits = limit_config,
                 .error_policy = runtime_policy,
+                .time = .{
+                    .event_time_field = config_event_time_field,
+                    .event_time_metadata = config_event_time_metadata,
+                    .watermark_lag_ns = config_watermark_lag_ns,
+                    .allowed_lateness_ns = config_allowed_lateness_ns,
+                },
             });
             var program_owned = true;
             errdefer if (program_owned) program.deinit();
@@ -934,11 +957,7 @@ fn handleTransformMessage(context: *TransformWorkerContext, message: EventMessag
 
 fn isLimitViolation(err: sql_mod.runtime.Error) bool {
     return switch (err) {
-        sql_mod.runtime.Error.RowTooLarge,
-        sql_mod.runtime.Error.GroupStateTooLarge,
-        sql_mod.runtime.Error.StateBudgetExceeded,
-        sql_mod.runtime.Error.CpuBudgetExceeded,
-        sql_mod.runtime.Error.LateEvent => true,
+        sql_mod.runtime.Error.RowTooLarge, sql_mod.runtime.Error.GroupStateTooLarge, sql_mod.runtime.Error.StateBudgetExceeded, sql_mod.runtime.Error.CpuBudgetExceeded, sql_mod.runtime.Error.LateEvent => true,
         else => false,
     };
 }

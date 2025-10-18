@@ -31,6 +31,16 @@ pub const Keyword = enum {
     True,
     False,
     Null,
+    Window,
+    Tumbling,
+    Hopping,
+    Session,
+    Size,
+    Slide,
+    Gap,
+    Watermark,
+    Allowed,
+    Lateness,
 };
 
 pub const Symbol = enum {
@@ -191,7 +201,7 @@ pub const Lexer = struct {
             '"' => {
                 return self.consumeQuotedIdentifier(start);
             },
-            else => {}
+            else => {},
         }
 
         return makeErrorToken(self, .invalid_character, start, start + 1);
@@ -384,6 +394,7 @@ fn keywordFromSlice(slice: []const u8) ?Keyword {
                 if (matchKeyword(slice, "AND")) return .And;
                 if (matchKeyword(slice, "ASC")) return .Asc;
             },
+            'G' => if (matchKeyword(slice, "GAP")) return .Gap,
             'N' => if (matchKeyword(slice, "NOT")) return .Not,
             else => {},
         },
@@ -393,6 +404,7 @@ fn keywordFromSlice(slice: []const u8) ?Keyword {
             'J' => if (matchKeyword(slice, "JOIN")) return .Join,
             'L' => if (matchKeyword(slice, "LEFT")) return .Left,
             'N' => if (matchKeyword(slice, "NULL")) return .Null,
+            'S' => if (matchKeyword(slice, "SIZE")) return .Size,
             'T' => if (matchKeyword(slice, "TRUE")) return .True,
             'W' => if (matchKeyword(slice, "WITH")) return .With,
             else => {},
@@ -405,6 +417,7 @@ fn keywordFromSlice(slice: []const u8) ?Keyword {
                 if (matchKeyword(slice, "ORDER")) return .Order;
                 if (matchKeyword(slice, "OUTER")) return .Outer;
             },
+            'S' => if (matchKeyword(slice, "SLIDE")) return .Slide,
             'U' => if (matchKeyword(slice, "USING")) return .Using,
             'W' => if (matchKeyword(slice, "WHERE")) return .Where,
             else => {},
@@ -412,10 +425,26 @@ fn keywordFromSlice(slice: []const u8) ?Keyword {
         6 => switch (first) {
             'H' => if (matchKeyword(slice, "HAVING")) return .Having,
             'S' => if (matchKeyword(slice, "SELECT")) return .Select,
+            'W' => if (matchKeyword(slice, "WINDOW")) return .Window,
             else => {},
         },
-        8 => if (matchKeyword(slice, "DISTINCT")) return .Distinct,
-        9 => if (matchKeyword(slice, "RECURSIVE")) return .Recursive,
+        7 => switch (first) {
+            'A' => if (matchKeyword(slice, "ALLOWED")) return .Allowed,
+            'H' => if (matchKeyword(slice, "HOPPING")) return .Hopping,
+            'S' => if (matchKeyword(slice, "SESSION")) return .Session,
+            else => {},
+        },
+        8 => switch (first) {
+            'D' => if (matchKeyword(slice, "DISTINCT")) return .Distinct,
+            'L' => if (matchKeyword(slice, "LATENESS")) return .Lateness,
+            'T' => if (matchKeyword(slice, "TUMBLING")) return .Tumbling,
+            else => {},
+        },
+        9 => switch (first) {
+            'R' => if (matchKeyword(slice, "RECURSIVE")) return .Recursive,
+            'W' => if (matchKeyword(slice, "WATERMARK")) return .Watermark,
+            else => {},
+        },
         else => {},
     }
     return null;

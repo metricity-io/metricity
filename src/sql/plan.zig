@@ -31,9 +31,17 @@ pub const HavingStage = struct {
     predicate: *const ast.Expression,
 };
 
-/// Placeholder for future event/processing-time window semantics.
+pub const WindowKind = ast.WindowKind;
+
 pub const WindowStage = struct {
-    enabled: bool = false,
+    kind: WindowKind,
+    timestamp: *const ast.Expression,
+    size: ?*const ast.Expression = null,
+    slide: ?*const ast.Expression = null,
+    gap: ?*const ast.Expression = null,
+    watermark: ?*const ast.Expression = null,
+    allowed_lateness: ?*const ast.Expression = null,
+    span: ast.Span,
 };
 
 /// Optional routing information used by downstream distribution.

@@ -1,9 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const ast = @import("ast.zig");
 const source_mod = @import("source");
 const plan = @import("plan.zig");
 const event_mod = source_mod.event;
 const expr_ir = @import("expr_ir.zig");
+const parser = @import("parser.zig");
 
 const ascii = std.ascii;
 const math = std.math;
@@ -259,7 +261,7 @@ const AggregateStringPool = struct {
     const invalid_bucket: u32 = 0xFFFF_FFFF;
     const bucket_sizes = [_]usize{ 16, 32, 64, 128, 256, 512, 1024 };
 
-    pools: [bucket_sizes.len]std.ArrayListUnmanaged([]u8) = [_]std.ArrayListUnmanaged([]u8){.{}, .{}, .{}, .{}, .{}, .{}, .{}},
+    pools: [bucket_sizes.len]std.ArrayListUnmanaged([]u8) = [_]std.ArrayListUnmanaged([]u8){ .{}, .{}, .{}, .{}, .{}, .{}, .{} },
 
     fn bucketIndex(len: usize) ?usize {
         for (bucket_sizes, 0..) |size, idx| {
@@ -1119,7 +1121,6 @@ fn entryFootprint(entry: *const GroupEntry) usize {
     return total;
 }
 
-
 const ProjectedKeys = struct {
     allocator: std.mem.Allocator,
     values: []event_mod.Value,
@@ -1299,6 +1300,17 @@ pub const LimitConfig = struct {
     late_event_threshold_ns: ?u64 = null,
 };
 
+pub const EventMetadataSource = enum {
+    received_at,
+};
+
+pub const TimeConfig = struct {
+    event_time_field: ?[]const u8 = null,
+    event_time_metadata: ?EventMetadataSource = null,
+    watermark_lag_ns: ?u64 = null,
+    allowed_lateness_ns: ?u64 = null,
+};
+
 pub const ErrorPolicy = enum {
     skip_event,
     null,
@@ -1341,6 +1353,26 @@ pub const CompileOptions = struct {
     eviction: EvictionConfig = .{},
     limits: LimitConfig = .{},
     error_policy: ErrorPolicy = .skip_event,
+    time: TimeConfig = .{},
+};
+
+const WatermarkState = struct {
+    max_event_time_ns: ?i128 = null,
+    watermark_ns: ?i128 = null,
+};
+
+const EventTimeSource = enum {
+    sql_override,
+    config_field,
+    config_metadata,
+    metadata_received_at,
+    metadata_field,
+    processing_time,
+};
+
+const EventTimeResolution = struct {
+    timestamp_ns: i128,
+    source: EventTimeSource,
 };
 
 /// Compiled representation of a SQL `SELECT` statement that can be executed
@@ -1363,6 +1395,15 @@ pub const Program = struct {
     aggregate_layout: AggregateLayout = .{},
     aggregate_pools: AggregatePools = .{},
     aggregate_string_pool: AggregateStringPool = .{},
+    event_time_program: ?expr_ir.Program = null,
+    config_event_time_field: ?[]const u8 = null,
+    config_event_time_metadata: ?EventMetadataSource = null,
+    resolved_watermark_lag_ns: ?u64 = null,
+    resolved_allowed_lateness_ns: ?u64 = null,
+    watermark_state: WatermarkState = .{},
+    last_event_time_ns: ?i128 = null,
+    last_event_time_source: EventTimeSource = .processing_time,
+    processing_time_warning_emitted: bool = false,
 
     /// Releases memory allocated for the program metadata and accumulated state.
     pub fn deinit(self: *Program) void {
@@ -1373,6 +1414,9 @@ pub const Program = struct {
         }
         if (self.having_program) |program| {
             program.deinit(self.allocator);
+        }
+        if (self.event_time_program) |*program_ptr| {
+            program_ptr.deinit(self.allocator);
         }
         for (self.aggregate_argument_programs) |maybe_program| {
             if (maybe_program) |program| {
@@ -1406,6 +1450,10 @@ pub const Program = struct {
         self.cpu_tracker.window_start_ns = 0;
         self.cpu_tracker.used_ns = 0;
         self.row_adjustment = .none;
+        self.watermark_state = .{};
+        self.last_event_time_ns = null;
+        self.last_event_time_source = .processing_time;
+        self.processing_time_warning_emitted = false;
     }
 
     pub fn consumeCpuBudget(self: *Program, now_ns: i128, cost_ns: u64) bool {
@@ -1432,6 +1480,84 @@ pub const Program = struct {
         const result = self.row_adjustment;
         self.row_adjustment = .none;
         return result;
+    }
+
+    fn resolveEventTime(self: *Program, event: *const event_mod.Event, now_ns: u64) Error!EventTimeResolution {
+        if (self.event_time_program) |*program_ptr| {
+            var event_ctx = EventAccessorContext{ .event = event };
+            const exec_ctx = expr_ir.ExecutionContext{
+                .event_accessor = expr_ir.EventAccessor{
+                    .context = @ptrCast(@constCast(&event_ctx)),
+                    .load_fn = loadEventValue,
+                },
+            };
+            const value = try expr_ir.execute(program_ptr, exec_ctx);
+            if (convertValueToTimestamp(value)) |timestamp_ns| {
+                return EventTimeResolution{ .timestamp_ns = timestamp_ns, .source = .sql_override };
+            }
+            return Error.TypeMismatch;
+        }
+
+        if (self.config_event_time_field) |field_name| {
+            if (findEventFieldValue(event, field_name)) |value| {
+                if (convertValueToTimestamp(value)) |timestamp_ns| {
+                    return EventTimeResolution{ .timestamp_ns = timestamp_ns, .source = .config_field };
+                }
+            }
+        }
+
+        if (self.config_event_time_metadata) |metadata_source| {
+            switch (metadata_source) {
+                .received_at => {
+                    if (event.metadata.received_at) |ts| {
+                        return EventTimeResolution{ .timestamp_ns = ts, .source = .config_metadata };
+                    }
+                },
+            }
+        }
+
+        if (event.metadata.received_at) |ts| {
+            return EventTimeResolution{ .timestamp_ns = ts, .source = .metadata_received_at };
+        }
+
+        if (findEventFieldValue(event, "@timestamp")) |value| {
+            if (convertValueToTimestamp(value)) |timestamp_ns| {
+                return EventTimeResolution{ .timestamp_ns = timestamp_ns, .source = .metadata_field };
+            }
+        }
+
+        const fallback = @as(i128, @intCast(now_ns));
+        if (!self.processing_time_warning_emitted) {
+            if (!builtin.is_test) {
+                std.log.warn("sql runtime falling back to processing time for event-time resolution", .{});
+            }
+            self.processing_time_warning_emitted = true;
+        }
+        return EventTimeResolution{ .timestamp_ns = fallback, .source = .processing_time };
+    }
+
+    fn updateWatermark(self: *Program, timestamp_ns: i128) void {
+        if (self.watermark_state.max_event_time_ns) |current| {
+            if (timestamp_ns > current) {
+                self.watermark_state.max_event_time_ns = timestamp_ns;
+            }
+        } else {
+            self.watermark_state.max_event_time_ns = timestamp_ns;
+        }
+
+        const lag_ns: i128 = if (self.resolved_watermark_lag_ns) |lag| @as(i128, @intCast(lag)) else 0;
+        const candidate = timestamp_ns - lag_ns;
+        if (self.watermark_state.watermark_ns) |previous| {
+            if (candidate > previous) {
+                self.watermark_state.watermark_ns = candidate;
+            }
+        } else {
+            self.watermark_state.watermark_ns = candidate;
+        }
+    }
+
+    pub fn currentWatermark(self: *const Program) ?i128 {
+        return self.watermark_state.watermark_ns;
     }
 
     fn finalizeGroup(self: *Program, index: usize, now_ns: u64) Error!void {
@@ -1485,6 +1611,11 @@ pub const Program = struct {
     ) Error!?Row {
         if (duration_out) |ptr| ptr.* = 0;
         self.group_store.maybeSweep(now_ns);
+
+        const event_time = try self.resolveEventTime(event, now_ns);
+        self.last_event_time_ns = event_time.timestamp_ns;
+        self.last_event_time_source = event_time.source;
+        self.updateWatermark(event_time.timestamp_ns);
 
         var event_accessor_ctx = EventAccessorContext{ .event = event };
 
@@ -1543,34 +1674,38 @@ pub const Program = struct {
         const project_stage = self.plan.project;
         const aggregate_stage = self.plan.group_aggregate;
         const total_columns = project_stage.projections.len;
-        var values = try allocator.alloc(ValueEntry, total_columns);
-        var idx: usize = 0;
-        errdefer allocator.free(values);
+        var row = row_init: {
+            var values = try allocator.alloc(ValueEntry, total_columns);
+            errdefer allocator.free(values);
+            var idx: usize = 0;
 
-        for (project_stage.projections) |proj| {
-            switch (proj) {
-                .group => |group_proj| {
-                    values[idx] = .{
-                        .name = group_proj.label,
-                        .value = try cloneRowValue(allocator, group_ptr.key_values[group_proj.column_index]),
-                    };
-                    idx += 1;
-                },
-                .aggregate => |agg_proj| {
-                    const spec = &aggregate_stage.aggregates[agg_proj.aggregate_index];
-                    const layout_entry = self.aggregate_layout.entry(agg_proj.aggregate_index);
-                    const value = try aggregateResultValue(&group_ptr.aggregates, layout_entry, spec);
-                    values[idx] = .{
-                        .name = agg_proj.label,
-                        .value = try cloneRowValue(allocator, value),
-                    };
-                    idx += 1;
-                },
+            for (project_stage.projections) |proj| {
+                switch (proj) {
+                    .group => |group_proj| {
+                        values[idx] = .{
+                            .name = group_proj.label,
+                            .value = try cloneRowValue(allocator, group_ptr.key_values[group_proj.column_index]),
+                        };
+                        idx += 1;
+                    },
+                    .aggregate => |agg_proj| {
+                        const spec = &aggregate_stage.aggregates[agg_proj.aggregate_index];
+                        const layout_entry = self.aggregate_layout.entry(agg_proj.aggregate_index);
+                        const value = try aggregateResultValue(&group_ptr.aggregates, layout_entry, spec);
+                        values[idx] = .{
+                            .name = agg_proj.label,
+                            .value = try cloneRowValue(allocator, value),
+                        };
+                        idx += 1;
+                    },
+                }
             }
-        }
 
-        std.debug.assert(idx == total_columns);
-        var row = Row{ .allocator = allocator, .values = values, .owns_strings = true };
+            std.debug.assert(idx == total_columns);
+            break :row_init Row{ .allocator = allocator, .values = values, .owns_strings = true };
+        };
+        var row_consumed = false;
+        errdefer if (!row_consumed) row.deinit();
         var drop_row = false;
 
         self.row_adjustment = .none;
@@ -1580,22 +1715,26 @@ pub const Program = struct {
                 switch (self.error_policy) {
                     .clamp => {
                         if (!try row.clampToBytes(self.limits.max_row_bytes)) {
+                            row_consumed = true;
                             row.deinit();
                             return Error.RowTooLarge;
                         }
                         row_bytes = row.footprint();
                         if (row_bytes > self.limits.max_row_bytes) {
+                            row_consumed = true;
                             row.deinit();
                             return Error.RowTooLarge;
                         }
                         self.row_adjustment = .clamped;
                     },
                     .null => {
+                        row_consumed = true;
                         row.deinit();
                         self.row_adjustment = .nullified;
                         drop_row = true;
                     },
                     .skip_event, .propagate => {
+                        row_consumed = true;
                         row.deinit();
                         return Error.RowTooLarge;
                     },
@@ -1620,7 +1759,11 @@ pub const Program = struct {
         }
 
         if (self.plan.window) |window_stage| {
-            try self.runWindowStage(window_stage, &row, now_ns);
+            self.runWindowStage(window_stage, &row, now_ns) catch |err| {
+                row_consumed = true;
+                row.deinit();
+                return err;
+            };
         }
 
         if (self.plan.route) |route_stage| {
@@ -1643,6 +1786,7 @@ pub const Program = struct {
         group_ptr = &entry.state;
         group_ptr.key_hash = projected_keys.hash;
 
+        row_consumed = true;
         return row;
     }
 
@@ -1686,9 +1830,10 @@ pub const Program = struct {
 
     fn runWindowStage(self: *Program, stage: plan.WindowStage, row: *Row, now_ns: u64) Error!void {
         _ = self;
-        _ = now_ns;
-        if (!stage.enabled) return;
+        _ = stage;
         _ = row;
+        _ = now_ns;
+        return Error.UnsupportedFeature;
     }
 
     fn runRouteStage(self: *Program, stage: plan.RouteStage, row: *Row) Error!void {
@@ -1857,7 +2002,6 @@ pub const Program = struct {
             },
         };
     }
-
 };
 
 const RowAdjustment = enum { none, clamped, nullified };
@@ -1960,11 +2104,198 @@ test "row setAllNull releases owned strings" {
     row.deinit();
 }
 
+test "resolve event time uses sql override" {
+    const allocator = std.testing.allocator;
+    var arena_inst = std.heap.ArenaAllocator.init(allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try parser.parseSelect(arena, "SELECT message, COUNT(*) AS total FROM logs GROUP BY message WINDOW TUMBLING (ON ts, SIZE 1)");
+    var program = try compile(allocator, stmt, .{});
+    defer program.deinit();
+
+    var fields = try allocator.alloc(event_mod.Field, 1);
+    defer allocator.free(fields);
+    fields[0] = .{ .name = "ts", .value = .{ .integer = 12345 } };
+
+    var event = event_mod.Event{
+        .metadata = .{},
+        .payload = .{
+            .log = .{
+                .message = "hello",
+                .fields = fields,
+            },
+        },
+    };
+
+    const execution = program.execute(allocator, &event, 100);
+    try testing.expectError(Error.UnsupportedFeature, execution);
+
+    try testing.expect(program.last_event_time_ns != null);
+    try testing.expectEqual(@as(i128, 12345), program.last_event_time_ns.?);
+    try testing.expect(program.last_event_time_source == .sql_override);
+    try testing.expect(program.currentWatermark() != null);
+    try testing.expectEqual(@as(i128, 12345), program.currentWatermark().?);
+}
+
+test "resolve event time uses config field fallback" {
+    const allocator = std.testing.allocator;
+    var arena_inst = std.heap.ArenaAllocator.init(allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try parser.parseSelect(arena, "SELECT message, COUNT(*) AS total FROM logs GROUP BY message");
+    var program = try compile(allocator, stmt, .{
+        .time = .{
+            .event_time_field = "ts",
+        },
+    });
+    defer program.deinit();
+
+    var fields = try allocator.alloc(event_mod.Field, 1);
+    defer allocator.free(fields);
+    fields[0] = .{ .name = "ts", .value = .{ .integer = 999 } };
+
+    var event = event_mod.Event{
+        .metadata = .{},
+        .payload = .{
+            .log = .{
+                .message = "hello",
+                .fields = fields,
+            },
+        },
+    };
+
+    if (try program.execute(allocator, &event, 200)) |row| {
+        defer row.deinit();
+    }
+
+    try testing.expect(program.last_event_time_ns != null);
+    try testing.expectEqual(@as(i128, 999), program.last_event_time_ns.?);
+    try testing.expect(program.last_event_time_source == .config_field);
+    try testing.expect(program.currentWatermark() != null);
+    try testing.expectEqual(@as(i128, 999), program.currentWatermark().?);
+}
+
+test "resolve event time falls back to metadata when config field missing" {
+    const allocator = std.testing.allocator;
+    var arena_inst = std.heap.ArenaAllocator.init(allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try parser.parseSelect(arena, "SELECT message, COUNT(*) AS total FROM logs GROUP BY message");
+    var program = try compile(allocator, stmt, .{
+        .time = .{
+            .event_time_field = "ts",
+        },
+    });
+    defer program.deinit();
+
+    var event = event_mod.Event{
+        .metadata = .{ .received_at = 555 },
+        .payload = .{
+            .log = .{
+                .message = "hello",
+            },
+        },
+    };
+
+    if (try program.execute(allocator, &event, 42)) |row| {
+        defer row.deinit();
+    }
+
+    try testing.expect(program.last_event_time_ns != null);
+    try testing.expectEqual(@as(i128, 555), program.last_event_time_ns.?);
+    try testing.expect(program.last_event_time_source == .metadata_received_at);
+}
+
+test "resolve event time falls back to @timestamp when config field type mismatches" {
+    const allocator = std.testing.allocator;
+    var arena_inst = std.heap.ArenaAllocator.init(allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try parser.parseSelect(arena, "SELECT message, COUNT(*) AS total FROM logs GROUP BY message");
+    var program = try compile(allocator, stmt, .{
+        .time = .{
+            .event_time_field = "ts",
+        },
+    });
+    defer program.deinit();
+
+    var fields = try allocator.alloc(event_mod.Field, 2);
+    defer allocator.free(fields);
+    fields[0] = .{ .name = "ts", .value = .{ .string = "not-a-timestamp" } };
+    fields[1] = .{ .name = "@timestamp", .value = .{ .integer = 777 } };
+
+    var event = event_mod.Event{
+        .metadata = .{},
+        .payload = .{
+            .log = .{
+                .message = "hello",
+                .fields = fields,
+            },
+        },
+    };
+
+    if (try program.execute(allocator, &event, 1234)) |row| {
+        defer row.deinit();
+    }
+
+    try testing.expect(program.last_event_time_ns != null);
+    try testing.expectEqual(@as(i128, 777), program.last_event_time_ns.?);
+    try testing.expect(program.last_event_time_source == .metadata_field);
+}
+
+test "resolve event time falls back to processing time when configured field unavailable" {
+    const allocator = std.testing.allocator;
+    var arena_inst = std.heap.ArenaAllocator.init(allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stmt = try parser.parseSelect(arena, "SELECT message, COUNT(*) AS total FROM logs GROUP BY message");
+    var program = try compile(allocator, stmt, .{
+        .time = .{
+            .event_time_field = "ts",
+        },
+    });
+    defer program.deinit();
+
+    var event = event_mod.Event{
+        .metadata = .{},
+        .payload = .{
+            .log = .{
+                .message = "hello",
+            },
+        },
+    };
+
+    const now_ns: u64 = 2048;
+    if (try program.execute(allocator, &event, now_ns)) |row| {
+        defer row.deinit();
+    }
+
+    try testing.expect(program.last_event_time_ns != null);
+    try testing.expectEqual(@as(i128, @intCast(now_ns)), program.last_event_time_ns.?);
+    try testing.expect(program.last_event_time_source == .processing_time);
+    try testing.expect(program.processing_time_warning_emitted);
+}
+
 /// Named value produced by SQL execution.
 pub const ValueEntry = struct {
     name: []const u8,
     value: event_mod.Value,
 };
+
+fn parseDurationLiteral(expr: *const ast.Expression) Error!u64 {
+    return switch (expr.*) {
+        .literal => |lit| switch (lit.value) {
+            .integer => |value| std.math.cast(u64, value) orelse return Error.UnsupportedFeature,
+            else => Error.UnsupportedFeature,
+        },
+        else => Error.UnsupportedFeature,
+    };
+}
 
 pub fn compile(allocator: std.mem.Allocator, stmt: *const ast.SelectStatement, options: CompileOptions) Error!Program {
     clearFeatureGateDiagnostic();
@@ -2082,6 +2413,45 @@ pub fn compile(allocator: std.mem.Allocator, stmt: *const ast.SelectStatement, o
         .aggregates = aggregates,
     };
 
+    var resolved_watermark_lag_ns = options.time.watermark_lag_ns;
+    var resolved_allowed_lateness_ns = options.time.allowed_lateness_ns;
+
+    var event_time_program_opt: ?expr_ir.Program = null;
+    var window_stage: ?plan.WindowStage = null;
+    if (stmt.window) |clause| {
+        const stage = plan.WindowStage{
+            .kind = clause.kind,
+            .timestamp = clause.timestamp,
+            .size = clause.size,
+            .slide = clause.slide,
+            .gap = clause.gap,
+            .watermark = clause.watermark,
+            .allowed_lateness = clause.allowed_lateness,
+            .span = clause.span,
+        };
+
+        var event_ctx = EventResolverContext{ .table_binding = table_binding };
+        const env = expr_ir.Environment{
+            .event_resolver = expr_ir.EventResolver{
+                .context = @ptrCast(@constCast(&event_ctx)),
+                .resolve_fn = resolveEventBinding,
+            },
+        };
+        const event_time_options = expr_ir.CompileOptions{
+            .allow_event_columns = true,
+        };
+        event_time_program_opt = try expr_ir.compileExpression(allocator, clause.timestamp, event_time_options, env);
+
+        if (clause.watermark) |expr| {
+            resolved_watermark_lag_ns = try parseDurationLiteral(expr);
+        }
+        if (clause.allowed_lateness) |expr| {
+            resolved_allowed_lateness_ns = try parseDurationLiteral(expr);
+        }
+
+        window_stage = stage;
+    }
+
     var filter_program_opt: ?expr_ir.Program = null;
     var having_program_opt: ?expr_ir.Program = null;
     var aggregate_argument_programs: []?expr_ir.Program = &.{};
@@ -2089,6 +2459,7 @@ pub fn compile(allocator: std.mem.Allocator, stmt: *const ast.SelectStatement, o
     errdefer {
         if (filter_program_opt) |program| program.deinit(allocator);
         if (having_program_opt) |program| program.deinit(allocator);
+        if (event_time_program_opt) |program| program.deinit(allocator);
         if (aggregate_argument_programs.len != 0) {
             for (aggregate_argument_programs) |maybe_program| {
                 if (maybe_program) |program| program.deinit(allocator);
@@ -2176,7 +2547,7 @@ pub fn compile(allocator: std.mem.Allocator, stmt: *const ast.SelectStatement, o
         .project = project_stage,
         .group_aggregate = aggregate_stage,
         .having = having_stage,
-        .window = null,
+        .window = window_stage,
         .route = null,
     };
 
@@ -2205,7 +2576,13 @@ pub fn compile(allocator: std.mem.Allocator, stmt: *const ast.SelectStatement, o
         .aggregate_argument_programs = aggregate_argument_programs,
         .group_key_bindings = group_key_bindings,
         .aggregate_layout = layout,
+        .event_time_program = event_time_program_opt,
+        .config_event_time_field = options.time.event_time_field,
+        .config_event_time_metadata = options.time.event_time_metadata,
+        .resolved_watermark_lag_ns = resolved_watermark_lag_ns,
+        .resolved_allowed_lateness_ns = resolved_allowed_lateness_ns,
     };
+    event_time_program_opt = null;
 
     if (aggregate_stage.aggregates.len != 0) {
         try program.aggregate_journal.ensureTotalCapacity(allocator, aggregate_stage.aggregates.len);
@@ -2395,8 +2772,8 @@ fn encodeGroupValue(
 
 const AggregateInput = union(enum) {
     count_all,
-   value: event_mod.Value,
-   skip,
+    value: event_mod.Value,
+    skip,
 };
 
 fn copyAggregateValue(program: *Program, value: event_mod.Value) std.mem.Allocator.Error!event_mod.Value {
@@ -2892,16 +3269,32 @@ fn loadAggregateValue(context_ptr: *anyopaque, aggregate_index: usize) expr_ir.E
     const spec = &context.program.plan.group_aggregate.aggregates[aggregate_index];
     const layout_entry = context.program.aggregate_layout.entry(aggregate_index);
     return aggregateResultValue(&context.group.aggregates, layout_entry, spec) catch |err| switch (err) {
-        Error.RowTooLarge,
-        Error.GroupStateTooLarge,
-        Error.StateBudgetExceeded,
-        Error.CpuBudgetExceeded,
-        Error.LateEvent => unreachable,
+        Error.RowTooLarge, Error.GroupStateTooLarge, Error.StateBudgetExceeded, Error.CpuBudgetExceeded, Error.LateEvent => unreachable,
         else => |other| return other,
     };
 }
 
 const testing = std.testing;
+
+fn findEventFieldValue(event: *const event_mod.Event, name: []const u8) ?event_mod.Value {
+    switch (event.payload) {
+        .log => |log_event| {
+            for (log_event.fields) |field| {
+                if (ascii.eqlIgnoreCase(field.name, name)) {
+                    return field.value;
+                }
+            }
+        },
+    }
+    return null;
+}
+
+fn convertValueToTimestamp(value: event_mod.Value) ?i128 {
+    return switch (value) {
+        .integer => |int_value| @as(i128, int_value),
+        else => null,
+    };
+}
 
 fn createEventWithSeverity(
     allocator: std.mem.Allocator,

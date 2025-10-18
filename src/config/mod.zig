@@ -122,6 +122,10 @@ pub const SqlShardMetadataKey = enum {
     source_id,
 };
 
+pub const SqlEventTimeMetadata = enum {
+    received_at,
+};
+
 pub const SqlShardKey = union(enum) {
     field: []const u8,
     metadata: SqlShardMetadataKey,
@@ -144,6 +148,10 @@ pub const SqlTransform = struct {
     limits: SqlLimitConfig = .{},
     error_policy: SqlErrorPolicy = .skip_event,
     sharding: SqlShardingConfig = .{},
+    event_time_field: ?[]const u8 = null,
+    event_time_metadata: ?SqlEventTimeMetadata = null,
+    watermark_lag_seconds: ?u64 = null,
+    allowed_lateness_seconds: ?u64 = null,
 };
 
 pub const TransformNode = union(TransformType) {

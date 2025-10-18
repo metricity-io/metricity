@@ -121,6 +121,15 @@ pub fn analyzeSelect(allocator: std.mem.Allocator, stmt: *const ast.SelectStatem
         try collectExpr(&ctx, expr);
     }
 
+    if (stmt.window) |window_clause| {
+        try collectExpr(&ctx, window_clause.timestamp);
+        if (window_clause.size) |expr| try collectExpr(&ctx, expr);
+        if (window_clause.slide) |expr| try collectExpr(&ctx, expr);
+        if (window_clause.gap) |expr| try collectExpr(&ctx, expr);
+        if (window_clause.watermark) |expr| try collectExpr(&ctx, expr);
+        if (window_clause.allowed_lateness) |expr| try collectExpr(&ctx, expr);
+    }
+
     for (stmt.order_by) |item| {
         try collectExpr(&ctx, item.expr);
     }

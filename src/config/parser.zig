@@ -60,6 +60,10 @@ const TransformDraft = struct {
     sharding_key_field: ?[]const u8 = null,
     sharding_key_metadata: ?cfg.SqlShardMetadataKey = null,
     sharding_fallback: ?cfg.SqlShardFallback = null,
+    event_time_field: ?[]const u8 = null,
+    event_time_metadata: ?cfg.SqlEventTimeMetadata = null,
+    watermark_lag_seconds: ?usize = null,
+    allowed_lateness_seconds: ?usize = null,
 };
 
 const SinkDraft = struct {
@@ -195,8 +199,8 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !cfg.OwnedPipelin
         switch (kind) {
             .sql => {
                 const query = draft.query orelse return ParseError.MissingQuery;
-    const default_queue = cfg.QueueConfig{};
-    const default_limits = cfg.SqlLimitConfig{};
+                const default_queue = cfg.QueueConfig{};
+                const default_limits = cfg.SqlLimitConfig{};
                 if (draft.sharding_key_field != null and draft.sharding_key_metadata != null) {
                     return ParseError.InvalidValue;
                 }
@@ -237,6 +241,10 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !cfg.OwnedPipelin
                         },
                         .error_policy = draft.error_policy orelse .skip_event,
                         .sharding = sharding_config,
+                        .event_time_field = draft.event_time_field,
+                        .event_time_metadata = draft.event_time_metadata,
+                        .watermark_lag_seconds = if (draft.watermark_lag_seconds) |secs| @intCast(secs) else null,
+                        .allowed_lateness_seconds = if (draft.allowed_lateness_seconds) |secs| @intCast(secs) else null,
                     },
                 });
             },
@@ -359,6 +367,30 @@ fn applyTransformKV(arena: std.mem.Allocator, draft: *TransformDraft, key: []con
     if (std.mem.eql(u8, key, "eviction_sweep_seconds")) {
         if (draft.eviction_sweep_seconds != null) return ParseError.DuplicateKey;
         draft.eviction_sweep_seconds = try parseNonNegativeInt(value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "event_time_field")) {
+        if (draft.event_time_field != null) return ParseError.DuplicateKey;
+        draft.event_time_field = try parseStringValue(arena, value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "event_time_metadata")) {
+        if (draft.event_time_metadata != null) return ParseError.DuplicateKey;
+        draft.event_time_metadata = try parseEventTimeMetadata(arena, value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "watermark_lag_seconds")) {
+        if (draft.watermark_lag_seconds != null) return ParseError.DuplicateKey;
+        draft.watermark_lag_seconds = try parseNonNegativeInt(value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "allowed_lateness_seconds")) {
+        if (draft.allowed_lateness_seconds != null) return ParseError.DuplicateKey;
+        draft.allowed_lateness_seconds = try parseNonNegativeInt(value);
         return;
     }
 
@@ -642,6 +674,12 @@ fn parseShardFallback(arena: std.mem.Allocator, raw: []const u8) !cfg.SqlShardFa
 fn parseShardMetadataKey(arena: std.mem.Allocator, raw: []const u8) !cfg.SqlShardMetadataKey {
     const literal = try parseLiteralSlice(arena, raw);
     if (ascii.eqlIgnoreCase(literal, "source_id")) return .source_id;
+    return ParseError.InvalidValue;
+}
+
+fn parseEventTimeMetadata(arena: std.mem.Allocator, raw: []const u8) !cfg.SqlEventTimeMetadata {
+    const literal = try parseLiteralSlice(arena, raw);
+    if (ascii.eqlIgnoreCase(literal, "received_at")) return .received_at;
     return ParseError.InvalidValue;
 }
 

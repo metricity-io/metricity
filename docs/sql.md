@@ -46,10 +46,84 @@ The table below summarizes the dialect:
 ## Streaming Semantics
 
 Aggregation is incremental: every event updates the state of its group and immediately emits a row
-with the latest aggregate values. There is no windowing or tumbling semantics yet. This means, for
-example, that a query such as `HAVING COUNT(*) > 10` will begin emitting rows only after the eleventh
-matching event arrives for the group. State can be cleared programatically via `metricity check
---once` (which reinitializes the transform) or, in tests, by calling `Program.reset()`.
+with the latest aggregate values. Windowing semantics are being introduced to support tumbling,
+hopping, and session windows; until the feature flag is enabled the runtime behaves as an
+unbounded aggregate. State can be cleared programatically via `metricity check --once` (which
+reinitializes the transform) or, in tests, by calling `Program.reset()`.
+
+### Event-Time and Watermarks
+
+Event timestamps are resolved in four stages:
+
+1. **SQL override** — window clauses may provide an explicit `ON <expression>` and
+   `WATERMARK(delay, allowed_lateness)` specification. This takes precedence over all other
+   sources.
+2. **Transform configuration** — each SQL transform can supply defaults through
+   `event_time_field`, `watermark_lag`, and `allowed_lateness`.
+3. **Source metadata fallback** — if neither SQL nor configuration resolves an event-time
+   column, the runtime inspects source metadata (for example `Event.metadata.received_at` or
+   `@timestamp` fields).
+4. **Processing-time fallback** — when no event timestamp can be derived, the runtime uses
+   processing time, emits a warning (once per transform), and increments a dedicated metric.
+
+Watermarks advance monotonically per shard. A global coordinator computes the minimum
+watermark and closes windows when it exceeds `window_end + allowed_lateness`. Watermark lag
+is exported via metrics for SLA enforcement.
+
+### Window Types
+
+- **TUMBLING** windows define fixed-size, non-overlapping intervals.
+- **HOPPING** windows define size/slide pairs that can overlap.
+- **SESSION** windows merge events that arrive within a configurable inactivity gap.
+
+Windows are internally identified by `(group_key, window_start_ns)` and a stable `window_id =
+hash(plan_id, window_start_ns, window_end_ns)`. Each window maintains its own aggregate state
+and respects the configured `allowed_lateness`.
+
+> Примечание: параметры `SIZE`, `SLIDE`, `GAP`, `WATERMARK` и `ALLOWED LATENESS` на данном
+> этапе задаются целыми числами, интерпретированными как наносекунды.
+
+Global (non-grouped) windows rely on aggregate merge semantics: shards emit partial results,
+the coordinator performs associative merges, and a single final row is emitted once per
+window.
+
+### Side Output
+
+Exceptional events are routed through side output with a unified schema:
+
+```json
+{
+  "kind": "late|evicted|error|duplicate",
+  "reason": "allowed_lateness_exceeded|max_groups|division_by_zero|...",
+  "event_time": "...",
+  "processing_time": "...",
+  "watermark": "...",
+  "window": { "start": "...", "end": "..." },
+  "group_key": { ... },
+  "original_event": { ... },
+  "error_detail": "stack/diag",
+  "plan_id": "hash/sql",
+  "shard": 3
+}
+```
+
+Routing is configured per kind:
+
+```toml
+[transforms.sql.side_output]
+late.sink = "dlq_kafka"          # or "reinject", "metrics_only"
+late.include_original = true
+evicted.sink = "metrics_only"
+error.sink = "dlq_kafka"
+duplicate.sink = "metrics_only"
+```
+
+- `metrics_only` — increments counters without emitting payloads.
+- `dlq_*` — delivers to dead-letter sinks with backpressure protection; excess traffic is
+  dropped and measured.
+- `reinject` — re-enqueues into a configured input; discouraged for `late` events.
+
+Side-output traffic is rate-limited to avoid backpressure on the primary pipeline.
 
 ## Execution Plan
 

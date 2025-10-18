@@ -214,6 +214,15 @@ pub const Parser = struct {
             stmt_start = min(stmt_start, having_start);
         }
 
+        var window_clause: ?ast.WindowClause = null;
+        if (self.isKeyword(.Window)) {
+            const window_start = self.current.span.start;
+            const clause = try self.parseWindowClause(window_start);
+            window_clause = clause;
+            last_end = max(last_end, clause.span.end);
+            stmt_start = min(stmt_start, window_start);
+        }
+
         var order_items: []const ast.OrderByItem = &[_]ast.OrderByItem{};
         var order_clause_span: ?lexmod.Span = null;
         if (self.isKeyword(.Order)) {
@@ -236,6 +245,7 @@ pub const Parser = struct {
             .selection = selection,
             .group_by = group_by_exprs,
             .having = having_expr,
+            .window = window_clause,
             .order_by = order_items,
             .order_by_span = order_clause_span,
             .span = spanFrom(stmt_start, last_end),
@@ -482,6 +492,130 @@ pub const Parser = struct {
         }
 
         return try self.copySlice(*const ast.Expression, expr_builder.items);
+    }
+
+    fn parseWindowClause(self: *Parser, window_start: usize) ParseError!ast.WindowClause {
+        try self.expectKeyword(.Window);
+
+        const kind_keyword = switch (self.current.kind) {
+            .keyword => |kw| kw,
+            .lex_error => return ParseError.LexError,
+            else => return ParseError.ExpectedToken,
+        };
+
+        var kind: ast.WindowKind = undefined;
+        switch (kind_keyword) {
+            .Tumbling => kind = .tumbling,
+            .Hopping => kind = .hopping,
+            .Session => kind = .session,
+            else => return ParseError.ExpectedToken,
+        }
+        var clause_end = max(window_start, self.current.span.end);
+        try self.advance();
+
+        if (!(self.current.kind == .symbol and self.current.kind.symbol == .l_paren)) {
+            return ParseError.ExpectedToken;
+        }
+        clause_end = max(clause_end, self.current.span.end);
+        try self.advance();
+
+        var timestamp_expr: ?*const ast.Expression = null;
+        var size_expr: ?*const ast.Expression = null;
+        var slide_expr: ?*const ast.Expression = null;
+        var gap_expr: ?*const ast.Expression = null;
+        var watermark_expr: ?*const ast.Expression = null;
+        var allowed_lateness_expr: ?*const ast.Expression = null;
+        var saw_parameter = false;
+
+        while (true) {
+            if (self.current.kind == .symbol and self.current.kind.symbol == .r_paren) break;
+
+            if (self.isKeyword(.On)) {
+                if (timestamp_expr != null) return ParseError.ExpectedToken;
+                try self.advance();
+                const expr = try self.parseExpression(0);
+                timestamp_expr = expr;
+                clause_end = max(clause_end, ast.expressionSpan(expr).end);
+            } else if (self.isKeyword(.Size)) {
+                if (size_expr != null) return ParseError.ExpectedToken;
+                try self.advance();
+                const expr = try self.parseExpression(0);
+                size_expr = expr;
+                clause_end = max(clause_end, ast.expressionSpan(expr).end);
+            } else if (self.isKeyword(.Slide)) {
+                if (slide_expr != null) return ParseError.ExpectedToken;
+                try self.advance();
+                const expr = try self.parseExpression(0);
+                slide_expr = expr;
+                clause_end = max(clause_end, ast.expressionSpan(expr).end);
+            } else if (self.isKeyword(.Gap)) {
+                if (gap_expr != null) return ParseError.ExpectedToken;
+                try self.advance();
+                const expr = try self.parseExpression(0);
+                gap_expr = expr;
+                clause_end = max(clause_end, ast.expressionSpan(expr).end);
+            } else if (self.isKeyword(.Watermark)) {
+                if (watermark_expr != null) return ParseError.ExpectedToken;
+                try self.advance();
+                const expr = try self.parseExpression(0);
+                watermark_expr = expr;
+                clause_end = max(clause_end, ast.expressionSpan(expr).end);
+            } else if (self.isKeyword(.Allowed)) {
+                if (allowed_lateness_expr != null) return ParseError.ExpectedToken;
+                try self.advance();
+                if (!self.isKeyword(.Lateness)) return ParseError.ExpectedToken;
+                try self.advance();
+                const expr = try self.parseExpression(0);
+                allowed_lateness_expr = expr;
+                clause_end = max(clause_end, ast.expressionSpan(expr).end);
+            } else {
+                return ParseError.ExpectedToken;
+            }
+
+            saw_parameter = true;
+
+            if (self.current.kind == .symbol and self.current.kind.symbol == .comma) {
+                clause_end = max(clause_end, self.current.span.end);
+                try self.advance();
+                continue;
+            }
+        }
+
+        if (!(self.current.kind == .symbol and self.current.kind.symbol == .r_paren)) {
+            return ParseError.ExpectedToken;
+        }
+        clause_end = max(clause_end, self.current.span.end);
+        try self.advance();
+
+        if (!saw_parameter or timestamp_expr == null) {
+            return ParseError.ExpectedToken;
+        }
+
+        switch (kind) {
+            .tumbling => {
+                if (size_expr == null) return ParseError.ExpectedToken;
+                if (slide_expr != null or gap_expr != null) return ParseError.ExpectedToken;
+            },
+            .hopping => {
+                if (size_expr == null or slide_expr == null) return ParseError.ExpectedToken;
+                if (gap_expr != null) return ParseError.ExpectedToken;
+            },
+            .session => {
+                if (gap_expr == null) return ParseError.ExpectedToken;
+                if (size_expr != null or slide_expr != null) return ParseError.ExpectedToken;
+            },
+        }
+
+        return ast.WindowClause{
+            .kind = kind,
+            .timestamp = timestamp_expr.?,
+            .size = size_expr,
+            .slide = slide_expr,
+            .gap = gap_expr,
+            .watermark = watermark_expr,
+            .allowed_lateness = allowed_lateness_expr,
+            .span = spanFrom(window_start, clause_end),
+        };
     }
 
     fn parseOrderByClause(self: *Parser) ParseError![]const ast.OrderByItem {
